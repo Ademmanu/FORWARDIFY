@@ -5,61 +5,50 @@ from datetime import datetime
 from typing import List, Dict, Optional
 
 """
-Improved SQLite helper for FORWARDERIFY
+Improved SQLite helper for FORWARDERIFY (fix for timestamp conversion error)
 
-Changes:
-- Connections created with a higher timeout and check_same_thread=False to be usable
-  from asyncio/threads without immediate "SQLite objects created in a thread can only be used in that same thread" errors.
-- PRAGMA statements set to use WAL mode, NORMAL synchronous and in-memory temp store to improve concurrency and performance.
-- PRAGMAs are applied per-connection in get_connection to ensure new conns have the same settings.
-- A small lock (conn_init_lock) protects one-time DB initialization steps where needed.
-- init_db still creates tables. It also sets WAL mode on the DB file to improve concurrent reads/writes.
-- No functional behavior changes to the public methods (get_user, save_user, forwarding task APIs) — only safer/more performant connection handling.
+Notes on this update:
+- Removed sqlite3.PARSE_DECLTYPES from get_connection to avoid sqlite's automatic
+  timestamp conversion which fails when stored timestamps are inconsistent
+  (e.g. 'YYYY-MM-DD' without time causes convert_timestamp to raise).
+- Keep check_same_thread=False and timeout to improve concurrency.
+- Use a simple connection.row_factory = None (default row tuples) to preserve
+  current behaviour of the code that indexes rows by integer positions.
+- All other behavior and public methods unchanged.
+- If you prefer automatic datetime conversion, add a robust converter (not done here)
+  or normalize existing timestamp strings in the DB to include time.
 """
 
-# Small lock to protect init/first-time operations
 _conn_init_lock = threading.Lock()
 
 class Database:
     def __init__(self, db_path='bot_data.db'):
         self.db_path = db_path
-        # make sure DB directory exists? keep simple as before
         self.init_db()
 
     def _apply_pragmas(self, conn: sqlite3.Connection):
-        """
-        Apply per-connection PRAGMAs that improve concurrency for SQLite.
-        Called on every new connection returned by get_connection.
-        """
         try:
-            # Use WAL for better concurrent read/write behavior
             conn.execute("PRAGMA journal_mode=WAL;")
-            # Reduce fsync pressure while remaining reasonably safe
             conn.execute("PRAGMA synchronous=NORMAL;")
-            # Store temporary tables in memory (faster)
             conn.execute("PRAGMA temp_store=MEMORY;")
-            # Increase cache size a bit (negative means KB)
-            conn.execute("PRAGMA cache_size=-20000;")  # ~20MB
+            conn.execute("PRAGMA cache_size=-20000;")
         except Exception:
-            # Best-effort: do not fail if pragmas can't be applied
             pass
 
     def get_connection(self) -> sqlite3.Connection:
         """
         Return a new sqlite3.Connection configured for concurrent use.
-        - timeout: wait up to 30s for locked DB (avoid immediate SQLITE_BUSY)
-        - check_same_thread=False: allows using connections from other threads if necessary;
-          we still create a fresh connection per call which is the safest pattern.
+        Important change: DO NOT use detect_types=sqlite3.PARSE_DECLTYPES to avoid
+        sqlite's automatic timestamp conversion that crashed when timestamps
+        contained only a date (no time part).
         """
-        conn = sqlite3.connect(self.db_path, timeout=30, check_same_thread=False, detect_types=sqlite3.PARSE_DECLTYPES)
-        # useful row factory for callers if needed (not required by existing code)
+        conn = sqlite3.connect(self.db_path, timeout=30, check_same_thread=False)
+        # keep default row type (tuple) as existing code expects indexes
         conn.row_factory = None
-        # Apply PRAGMA settings for this connection
         self._apply_pragmas(conn)
         return conn
 
     def init_db(self):
-        # Protect init with a lock so concurrent processes/threads don't race this step
         with _conn_init_lock:
             conn = self.get_connection()
             cursor = conn.cursor()
@@ -111,6 +100,7 @@ class Database:
         conn.close()
 
         if row:
+            # created_at and updated_at are returned as strings (no automatic datetime conversion)
             return {
                 'user_id': row[0],
                 'phone': row[1],
