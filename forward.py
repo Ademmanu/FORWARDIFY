@@ -552,6 +552,141 @@ async def getallid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await show_chat_categories(user_id, update.message.chat.id, None, context)
 
+# ---------- Admin commands that were missing (implemented) ----------
+async def adduser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin-only: add a user (optionally as admin)."""
+    user_id = update.effective_user.id
+
+    if not await check_authorization(update, context):
+        return
+
+    if not db.is_user_admin(user_id):
+        await update.message.reply_text("❌ **Admin Only**\n\nThis command is only available to admins.", parse_mode="Markdown")
+        return
+
+    text = update.message.text.strip()
+    parts = text.split()
+
+    if len(parts) < 2:
+        await update.message.reply_text(
+            "❌ **Invalid format!**\n\n"
+            "**Usage:**\n"
+            "`/adduser [USER_ID]` - Add regular user\n"
+            "`/adduser [USER_ID] admin` - Add admin user",
+            parse_mode="Markdown",
+        )
+        return
+
+    try:
+        new_user_id = int(parts[1])
+        is_admin = len(parts) > 2 and parts[2].lower() == "admin"
+
+        if db.add_allowed_user(new_user_id, is_admin=is_admin, added_by=user_id):
+            role = "👑 Admin" if is_admin else "👤 User"
+            await update.message.reply_text(
+                f"✅ **User added!**\n\nID: `{new_user_id}`\nRole: {role}",
+                parse_mode="Markdown",
+            )
+            # notify the added user (best-effort)
+            try:
+                await context.bot.send_message(new_user_id, "✅ You have been added. Send /start to begin.", parse_mode="Markdown")
+            except Exception:
+                logger.exception("Could not notify new allowed user %s", new_user_id)
+        else:
+            await update.message.reply_text(f"❌ **User `{new_user_id}` already exists!**", parse_mode="Markdown")
+    except ValueError:
+        await update.message.reply_text("❌ **Invalid user ID!**\n\nUser ID must be a number.", parse_mode="Markdown")
+
+async def removeuser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin-only: remove a user and stop their forwarding permanently in this process."""
+    user_id = update.effective_user.id
+
+    if not await check_authorization(update, context):
+        return
+
+    if not db.is_user_admin(user_id):
+        await update.message.reply_text("❌ **Admin Only**\n\nThis command is only available to admins.", parse_mode="Markdown")
+        return
+
+    text = update.message.text.strip()
+    parts = text.split()
+
+    if len(parts) < 2:
+        await update.message.reply_text("❌ **Invalid format!**\n\n**Usage:** `/removeuser [USER_ID]`", parse_mode="Markdown")
+        return
+
+    try:
+        remove_user_id = int(parts[1])
+
+        if db.remove_allowed_user(remove_user_id):
+            # Best-effort: disconnect user's Telethon client and clear in-memory state
+            if remove_user_id in user_clients:
+                try:
+                    client = user_clients[remove_user_id]
+                    await client.disconnect()
+                except Exception:
+                    logger.exception("Error disconnecting client for removed user %s", remove_user_id)
+                finally:
+                    user_clients.pop(remove_user_id, None)
+
+            # mark as logged out in users table and clear caches
+            try:
+                db.save_user(remove_user_id, is_logged_in=False)
+            except Exception:
+                logger.exception("Error saving user logged_out state for %s", remove_user_id)
+
+            tasks_cache.pop(remove_user_id, None)
+            target_entity_cache.pop(remove_user_id, None)
+            handler_registered.pop(remove_user_id, None)
+
+            await update.message.reply_text(f"✅ **User `{remove_user_id}` removed!**", parse_mode="Markdown")
+
+            # Notify removed user (best-effort)
+            try:
+                await context.bot.send_message(remove_user_id, "❌ You have been removed. Contact the owner to regain access.", parse_mode="Markdown")
+            except Exception:
+                logger.exception("Could not notify removed user %s", remove_user_id)
+        else:
+            await update.message.reply_text(f"❌ **User `{remove_user_id}` not found!**", parse_mode="Markdown")
+    except ValueError:
+        await update.message.reply_text("❌ **Invalid user ID!**\n\nUser ID must be a number.", parse_mode="Markdown")
+
+async def listusers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin-only: list allowed users."""
+    user_id = update.effective_user.id
+
+    if not await check_authorization(update, context):
+        return
+
+    if not db.is_user_admin(user_id):
+        await update.message.reply_text("❌ **Admin Only**\n\nThis command is only available to admins.", parse_mode="Markdown")
+        return
+
+    users = db.get_all_allowed_users()
+
+    if not users:
+        await update.message.reply_text("📋 **No Allowed Users**\n\nThe allowed users list is empty.", parse_mode="Markdown")
+        return
+
+    user_list = "👥 **Allowed Users**\n\n"
+    user_list += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+
+    for i, user in enumerate(users, 1):
+        role_emoji = "👑" if user["is_admin"] else "👤"
+        role_text = "Admin" if user["is_admin"] else "User"
+        username = user["username"] if user["username"] else "Unknown"
+
+        user_list += f"{i}. {role_emoji} **{role_text}**\n"
+        user_list += f"   ID: `{user['user_id']}`\n"
+        if user["username"]:
+            user_list += f"   Username: {username}\n"
+        user_list += "\n"
+
+    user_list += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    user_list += f"Total: **{len(users)} user(s)**"
+
+    await update.message.reply_text(user_list, parse_mode="Markdown")
+
 # ---------- Chat listing functions kept (unchanged) ----------
 async def show_chat_categories(user_id: int, chat_id: int, message_id: int, context: ContextTypes.DEFAULT_TYPE):
     if user_id not in user_clients:
