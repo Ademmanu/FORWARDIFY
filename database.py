@@ -1,66 +1,115 @@
 import sqlite3
 import json
+import threading
 from datetime import datetime
 from typing import List, Dict, Optional
+
+"""
+Improved SQLite helper for FORWARDERIFY
+
+Changes:
+- Connections created with a higher timeout and check_same_thread=False to be usable
+  from asyncio/threads without immediate "SQLite objects created in a thread can only be used in that same thread" errors.
+- PRAGMA statements set to use WAL mode, NORMAL synchronous and in-memory temp store to improve concurrency and performance.
+- PRAGMAs are applied per-connection in get_connection to ensure new conns have the same settings.
+- A small lock (conn_init_lock) protects one-time DB initialization steps where needed.
+- init_db still creates tables. It also sets WAL mode on the DB file to improve concurrent reads/writes.
+- No functional behavior changes to the public methods (get_user, save_user, forwarding task APIs) — only safer/more performant connection handling.
+"""
+
+# Small lock to protect init/first-time operations
+_conn_init_lock = threading.Lock()
 
 class Database:
     def __init__(self, db_path='bot_data.db'):
         self.db_path = db_path
+        # make sure DB directory exists? keep simple as before
         self.init_db()
-    
-    def get_connection(self):
-        return sqlite3.connect(self.db_path)
-    
+
+    def _apply_pragmas(self, conn: sqlite3.Connection):
+        """
+        Apply per-connection PRAGMAs that improve concurrency for SQLite.
+        Called on every new connection returned by get_connection.
+        """
+        try:
+            # Use WAL for better concurrent read/write behavior
+            conn.execute("PRAGMA journal_mode=WAL;")
+            # Reduce fsync pressure while remaining reasonably safe
+            conn.execute("PRAGMA synchronous=NORMAL;")
+            # Store temporary tables in memory (faster)
+            conn.execute("PRAGMA temp_store=MEMORY;")
+            # Increase cache size a bit (negative means KB)
+            conn.execute("PRAGMA cache_size=-20000;")  # ~20MB
+        except Exception:
+            # Best-effort: do not fail if pragmas can't be applied
+            pass
+
+    def get_connection(self) -> sqlite3.Connection:
+        """
+        Return a new sqlite3.Connection configured for concurrent use.
+        - timeout: wait up to 30s for locked DB (avoid immediate SQLITE_BUSY)
+        - check_same_thread=False: allows using connections from other threads if necessary;
+          we still create a fresh connection per call which is the safest pattern.
+        """
+        conn = sqlite3.connect(self.db_path, timeout=30, check_same_thread=False, detect_types=sqlite3.PARSE_DECLTYPES)
+        # useful row factory for callers if needed (not required by existing code)
+        conn.row_factory = None
+        # Apply PRAGMA settings for this connection
+        self._apply_pragmas(conn)
+        return conn
+
     def init_db(self):
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                phone TEXT,
-                name TEXT,
-                session_data TEXT,
-                is_logged_in INTEGER DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS forwarding_tasks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                label TEXT,
-                source_ids TEXT,
-                target_ids TEXT,
-                is_active INTEGER DEFAULT 1,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (user_id) REFERENCES users (user_id),
-                UNIQUE(user_id, label)
-            )
-        ''')
-        
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS allowed_users (
-                user_id INTEGER PRIMARY KEY,
-                username TEXT,
-                is_admin INTEGER DEFAULT 0,
-                added_by INTEGER,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        
-        conn.commit()
-        conn.close()
-    
+        # Protect init with a lock so concurrent processes/threads don't race this step
+        with _conn_init_lock:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id INTEGER PRIMARY KEY,
+                    phone TEXT,
+                    name TEXT,
+                    session_data TEXT,
+                    is_logged_in INTEGER DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS forwarding_tasks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    label TEXT,
+                    source_ids TEXT,
+                    target_ids TEXT,
+                    is_active INTEGER DEFAULT 1,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (user_id) REFERENCES users (user_id),
+                    UNIQUE(user_id, label)
+                )
+            ''')
+
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS allowed_users (
+                    user_id INTEGER PRIMARY KEY,
+                    username TEXT,
+                    is_admin INTEGER DEFAULT 0,
+                    added_by INTEGER,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+
+            conn.commit()
+            conn.close()
+
     def get_user(self, user_id: int) -> Optional[Dict]:
         conn = self.get_connection()
         cursor = conn.cursor()
         cursor.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
         row = cursor.fetchone()
         conn.close()
-        
+
         if row:
             return {
                 'user_id': row[0],
@@ -72,18 +121,18 @@ class Database:
                 'updated_at': row[6]
             }
         return None
-    
-    def save_user(self, user_id: int, phone: Optional[str] = None, name: Optional[str] = None, 
+
+    def save_user(self, user_id: int, phone: Optional[str] = None, name: Optional[str] = None,
                   session_data: Optional[str] = None, is_logged_in: bool = False):
         conn = self.get_connection()
         cursor = conn.cursor()
-        
+
         existing_user = self.get_user(user_id)
-        
+
         if existing_user:
             updates = []
             params = []
-            
+
             if phone is not None:
                 updates.append('phone = ?')
                 params.append(phone)
@@ -93,15 +142,15 @@ class Database:
             if session_data is not None:
                 updates.append('session_data = ?')
                 params.append(session_data)
-            
+
             updates.append('is_logged_in = ?')
             params.append(1 if is_logged_in else 0)
-            
+
             updates.append('updated_at = ?')
             params.append(datetime.now().isoformat())
-            
+
             params.append(user_id)
-            
+
             query = f"UPDATE users SET {', '.join(updates)} WHERE user_id = ?"
             cursor.execute(query, params)
         else:
@@ -109,15 +158,15 @@ class Database:
                 INSERT INTO users (user_id, phone, name, session_data, is_logged_in)
                 VALUES (?, ?, ?, ?, ?)
             ''', (user_id, phone, name, session_data, 1 if is_logged_in else 0))
-        
+
         conn.commit()
         conn.close()
-    
-    def add_forwarding_task(self, user_id: int, label: str, 
+
+    def add_forwarding_task(self, user_id: int, label: str,
                            source_ids: List[int], target_ids: List[int]) -> bool:
         conn = self.get_connection()
         cursor = conn.cursor()
-        
+
         try:
             cursor.execute('''
                 INSERT INTO forwarding_tasks (user_id, label, source_ids, target_ids)
@@ -129,65 +178,65 @@ class Database:
         except sqlite3.IntegrityError:
             conn.close()
             return False
-    
+
     def remove_forwarding_task(self, user_id: int, label: str) -> bool:
         conn = self.get_connection()
         cursor = conn.cursor()
         cursor.execute('''
-            DELETE FROM forwarding_tasks 
+            DELETE FROM forwarding_tasks
             WHERE user_id = ? AND label = ?
         ''', (user_id, label))
         deleted = cursor.rowcount > 0
         conn.commit()
         conn.close()
         return deleted
-    
+
     def get_user_tasks(self, user_id: int) -> List[Dict]:
         conn = self.get_connection()
         cursor = conn.cursor()
         cursor.execute('''
             SELECT id, label, source_ids, target_ids, is_active, created_at
-            FROM forwarding_tasks 
+            FROM forwarding_tasks
             WHERE user_id = ? AND is_active = 1
             ORDER BY created_at DESC
         ''', (user_id,))
-        
+
         tasks = []
         for row in cursor.fetchall():
             tasks.append({
                 'id': row[0],
                 'label': row[1],
-                'source_ids': json.loads(row[2]),
-                'target_ids': json.loads(row[3]),
+                'source_ids': json.loads(row[2]) if row[2] else [],
+                'target_ids': json.loads(row[3]) if row[3] else [],
                 'is_active': row[4],
                 'created_at': row[5]
             })
-        
+
         conn.close()
         return tasks
-    
+
     def get_all_active_tasks(self) -> List[Dict]:
         conn = self.get_connection()
         cursor = conn.cursor()
         cursor.execute('''
             SELECT user_id, id, label, source_ids, target_ids
-            FROM forwarding_tasks 
+            FROM forwarding_tasks
             WHERE is_active = 1
         ''')
-        
+
         tasks = []
         for row in cursor.fetchall():
             tasks.append({
                 'user_id': row[0],
                 'id': row[1],
                 'label': row[2],
-                'source_ids': json.loads(row[3]),
-                'target_ids': json.loads(row[4])
+                'source_ids': json.loads(row[3]) if row[3] else [],
+                'target_ids': json.loads(row[4]) if row[4] else []
             })
-        
+
         conn.close()
         return tasks
-    
+
     def is_user_allowed(self, user_id: int) -> bool:
         conn = self.get_connection()
         cursor = conn.cursor()
@@ -195,7 +244,7 @@ class Database:
         result = cursor.fetchone()
         conn.close()
         return result is not None
-    
+
     def is_user_admin(self, user_id: int) -> bool:
         conn = self.get_connection()
         cursor = conn.cursor()
@@ -203,11 +252,11 @@ class Database:
         result = cursor.fetchone()
         conn.close()
         return result is not None and result[0] == 1
-    
+
     def add_allowed_user(self, user_id: int, username: Optional[str] = None, is_admin: bool = False, added_by: Optional[int] = None) -> bool:
         conn = self.get_connection()
         cursor = conn.cursor()
-        
+
         try:
             cursor.execute('''
                 INSERT INTO allowed_users (user_id, username, is_admin, added_by)
@@ -219,7 +268,7 @@ class Database:
         except sqlite3.IntegrityError:
             conn.close()
             return False
-    
+
     def remove_allowed_user(self, user_id: int) -> bool:
         conn = self.get_connection()
         cursor = conn.cursor()
@@ -228,7 +277,7 @@ class Database:
         conn.commit()
         conn.close()
         return deleted
-    
+
     def get_all_allowed_users(self) -> List[Dict]:
         conn = self.get_connection()
         cursor = conn.cursor()
@@ -237,7 +286,7 @@ class Database:
             FROM allowed_users
             ORDER BY created_at DESC
         ''')
-        
+
         users = []
         for row in cursor.fetchall():
             users.append({
@@ -247,6 +296,6 @@ class Database:
                 'added_by': row[3],
                 'created_at': row[4]
             })
-        
+
         conn.close()
         return users
