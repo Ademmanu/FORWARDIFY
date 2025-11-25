@@ -2,6 +2,7 @@ from flask import Flask, request, jsonify
 import threading
 import time
 import os
+import logging
 
 # resource is available on Unix; wrap in try for portability
 try:
@@ -15,6 +16,8 @@ try:
 except Exception:
     psutil = None
 
+logger = logging.getLogger("webserver")
+
 app = Flask(__name__)
 
 START_TIME = time.time()
@@ -24,6 +27,22 @@ DEFAULT_CONTAINER_MAX_RAM_MB = int(os.getenv("CONTAINER_MAX_RAM_MB", "512"))
 
 # Cache the detected container limit to avoid repeated sysfs reads
 _cached_container_limit_mb = None
+
+# Monitoring callback set by forward.py; should be a callable returning serializable dict
+_monitor_callback = None
+
+
+def register_monitoring(callback):
+    """
+    Register a callable that will be used by the /metrics endpoint to report
+    runtime metrics from the forwarding subsystem.
+
+    The callback should be fast and return a JSON-serializable dict. It will be
+    called in the Flask thread (so it must handle cross-thread reads safely).
+    """
+    global _monitor_callback
+    _monitor_callback = callback
+    logger.info("Monitoring callback registered")
 
 
 def _mb_from_bytes(n_bytes: int) -> float:
@@ -140,6 +159,7 @@ def home():
               <li>/mem — process memory usage (MB)</li>
               <li>/sysmem — system & container memory (MB)</li>
               <li>/webhook — simple webhook endpoint</li>
+              <li>/metrics — forwarding subsystem metrics (if registered)</li>
             </ul>
             <div class="stats">
               <strong>Container memory limit (detected):</strong> {container_limit} MB
@@ -267,6 +287,23 @@ def sysmem():
             return jsonify({"status": "error", "error": str(e)}), 500
 
     return jsonify({"status": "unavailable", "reason": "platform-specific meminfo not available and psutil not installed"}), 200
+
+
+@app.route("/metrics", methods=["GET"])
+def metrics():
+    """
+    Returns forwarding subsystem metrics if a callback has been registered by the forward process.
+    The callback runs in the Flask thread; it must handle cross-thread reads safely.
+    """
+    if _monitor_callback is None:
+        return jsonify({"status": "unavailable", "reason": "no monitor registered"}), 200
+
+    try:
+        data = _monitor_callback()
+        return jsonify({"status": "ok", "metrics": data}), 200
+    except Exception as e:
+        logger.exception("Monitoring callback failed")
+        return jsonify({"status": "error", "error": str(e)}), 500
 
 
 def run_server():
