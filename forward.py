@@ -2,7 +2,7 @@
 import os
 import asyncio
 import logging
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Set
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.errors import SessionPasswordNeededError, FloodWaitError
@@ -25,7 +25,32 @@ logger = logging.getLogger("forward")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
-ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0"))
+
+# New: support multiple owners / admins via OWNER_IDS (comma-separated)
+OWNER_IDS: Set[int] = set()
+owner_env = os.getenv("OWNER_IDS", "").strip()
+if owner_env:
+    for part in owner_env.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            OWNER_IDS.add(int(part))
+        except ValueError:
+            logger.warning("Invalid OWNER_IDS value skipped: %s", part)
+
+# New: support additional allowed users via ALLOWED_USERS (comma-separated)
+ALLOWED_USERS: Set[int] = set()
+allowed_env = os.getenv("ALLOWED_USERS", "").strip()
+if allowed_env:
+    for part in allowed_env.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            ALLOWED_USERS.add(int(part))
+        except ValueError:
+            logger.warning("Invalid ALLOWED_USERS value skipped: %s", part)
 
 # Tuning parameters (env override possible)
 SEND_WORKER_COUNT = int(os.getenv("SEND_WORKER_COUNT", "20"))         # concurrent send workers
@@ -56,11 +81,15 @@ Or
 🗨️ **Message Developer:** [HEMMY](https://t.me/justmemmy)
 """
 
-# ---------- Authorization helpers (unchanged logic) ----------
+# ---------- Authorization helpers (updated to respect ALLOWED_USERS and OWNER_IDS) ----------
 async def check_authorization(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     user_id = update.effective_user.id
 
-    if not db.is_user_allowed(user_id):
+    # Allow if user present in DB allowed list OR configured via env lists (ALLOWED_USERS or OWNER_IDS)
+    is_allowed_db = db.is_user_allowed(user_id)
+    is_allowed_env = (user_id in ALLOWED_USERS) or (user_id in OWNER_IDS)
+
+    if not (is_allowed_db or is_allowed_env):
         if update.message:
             await update.message.reply_text(
                 UNAUTHORIZED_MESSAGE,
@@ -961,15 +990,25 @@ async def post_init(application: Application):
     await application.bot.delete_webhook(drop_pending_updates=True)
     logger.info("🧹 Cleared webhooks")
 
-    admin_user_id = os.getenv("ADMIN_USER_ID")
-    if admin_user_id:
-        try:
-            admin_id = int(admin_user_id)
-            if not db.is_user_allowed(admin_id):
-                db.add_allowed_user(admin_id, is_admin=True)
-                logger.info("✅ Added admin: %s", admin_id)
-        except ValueError:
-            logger.warning("⚠️ Invalid ADMIN_USER_ID")
+    # Ensure configured OWNER_IDS are present in DB as admin users
+    if OWNER_IDS:
+        for oid in OWNER_IDS:
+            try:
+                if not db.is_user_admin(oid):
+                    db.add_allowed_user(oid, is_admin=True)
+                    logger.info("✅ Added owner/admin from env: %s", oid)
+            except Exception:
+                logger.exception("Error adding owner/admin %s from env", oid)
+
+    # Ensure configured ALLOWED_USERS are present in DB as allowed users (non-admin)
+    if ALLOWED_USERS:
+        for au in ALLOWED_USERS:
+            try:
+                # add as regular allowed users (is_admin=False), added_by=None
+                db.add_allowed_user(au, is_admin=False)
+                logger.info("✅ Added allowed user from env: %s", au)
+            except Exception:
+                logger.exception("Error adding allowed user %s from env", au)
 
     # start send workers and restore sessions
     await start_send_workers()
