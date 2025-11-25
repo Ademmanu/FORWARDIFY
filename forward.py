@@ -2,7 +2,7 @@
 import os
 import asyncio
 import logging
-from typing import Dict, List, Optional, Tuple, Set
+from typing import Dict, List, Optional, Tuple, Set, Callable
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.errors import SessionPasswordNeededError, FloodWaitError
@@ -26,7 +26,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 
-# New: support multiple owners / admins via OWNER_IDS (comma-separated)
+# Support multiple owners / admins via OWNER_IDS (comma-separated)
 OWNER_IDS: Set[int] = set()
 owner_env = os.getenv("OWNER_IDS", "").strip()
 if owner_env:
@@ -39,7 +39,7 @@ if owner_env:
         except ValueError:
             logger.warning("Invalid OWNER_IDS value skipped: %s", part)
 
-# New: support additional allowed users via ALLOWED_USERS (comma-separated)
+# Support additional allowed users via ALLOWED_USERS (comma-separated)
 ALLOWED_USERS: Set[int] = set()
 allowed_env = os.getenv("ALLOWED_USERS", "").strip()
 if allowed_env:
@@ -53,8 +53,8 @@ if allowed_env:
             logger.warning("Invalid ALLOWED_USERS value skipped: %s", part)
 
 # Tuning parameters (env override possible)
-SEND_WORKER_COUNT = int(os.getenv("SEND_WORKER_COUNT", "20"))         # concurrent send workers
-SEND_QUEUE_MAXSIZE = int(os.getenv("SEND_QUEUE_MAXSIZE", "20000"))    # max queued forward jobs
+SEND_WORKER_COUNT = int(os.getenv("SEND_WORKER_COUNT", "20"))  # concurrent send workers
+SEND_QUEUE_MAXSIZE = int(os.getenv("SEND_QUEUE_MAXSIZE", "20000"))  # max queued forward jobs
 TARGET_RESOLVE_RETRY_SECONDS = int(os.getenv("TARGET_RESOLVE_RETRY_SECONDS", "60"))
 
 db = Database()
@@ -63,9 +63,10 @@ login_states: Dict[int, Dict] = {}
 logout_states: Dict[int, Dict] = {}
 
 # Hot-path caches to avoid DB access per message
-tasks_cache: Dict[int, List[Dict]] = {}            # user_id -> list of task dicts
+tasks_cache: Dict[int, List[Dict]] = {}  # user_id -> list of task dicts
 target_entity_cache: Dict[int, Dict[int, object]] = {}  # user_id -> {target_id: resolved_entity}
-handler_registered: Dict[int, bool] = {}           # user_id -> True if NewMessage handler attached
+# handler_registered maps user_id -> handler callable (so we can remove it)
+handler_registered: Dict[int, Callable] = {}
 
 # Global send queue (decouples sending from event handler)
 send_queue: "asyncio.Queue[Tuple[int, TelegramClient, int, str]]" = asyncio.Queue(maxsize=SEND_QUEUE_MAXSIZE)
@@ -81,7 +82,11 @@ Or
 🗨️ **Message Developer:** [HEMMY](https://t.me/justmemmy)
 """
 
-# ---------- Authorization helpers (updated to respect ALLOWED_USERS and OWNER_IDS) ----------
+# Ensure send workers spawned once
+_send_workers_started = False
+
+
+# ---------- Authorization helpers ----------
 async def check_authorization(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     user_id = update.effective_user.id
 
@@ -106,6 +111,7 @@ async def check_authorization(update: Update, context: ContextTypes.DEFAULT_TYPE
         return False
 
     return True
+
 
 # ---------- Simple UI handlers (left mostly unchanged) ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -170,11 +176,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         keyboard.append([InlineKeyboardButton("🟢 Connect Account", callback_data="login")])
 
+    # safe: update.message is present for /start
     await update.message.reply_text(
         message_text,
         reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
         parse_mode="Markdown",
     )
+
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -203,7 +211,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             page = int(parts[2])
             await show_categorized_chats(user_id, query.message.chat.id, query.message.message_id, category, page, context)
 
-# ---------- Login/logout and task commands (mostly unchanged except cache updates) ----------
+
+# ---------- Login/logout and task commands ----------
 async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id if update.effective_user else update.callback_query.from_user.id
 
@@ -223,6 +232,7 @@ async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "⚠️ Make sure to include the + sign!",
         parse_mode="Markdown",
     )
+
 
 async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -383,6 +393,7 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
         if user_id in login_states:
             del login_states[user_id]
 
+
 async def logout_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id if update.effective_user else update.callback_query.from_user.id
 
@@ -408,6 +419,7 @@ async def logout_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
     )
 
+
 async def handle_logout_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     user_id = update.effective_user.id
 
@@ -427,17 +439,31 @@ async def handle_logout_confirmation(update: Update, context: ContextTypes.DEFAU
         )
         return True
 
+    # Disconnect client's telethon session (if present)
     if user_id in user_clients:
         client = user_clients[user_id]
-        await client.disconnect()
-        del user_clients[user_id]
+        try:
+            # remove handler if present
+            handler = handler_registered.get(user_id)
+            if handler:
+                try:
+                    client.remove_event_handler(handler)
+                except Exception:
+                    logger.exception("Error removing event handler during logout for user %s", user_id)
+                handler_registered.pop(user_id, None)
 
+            await client.disconnect()
+        except Exception:
+            logger.exception("Error disconnecting client for user %s", user_id)
+        finally:
+            user_clients.pop(user_id, None)
+
+    # mark as logged out in DB
     db.save_user(user_id, is_logged_in=False)
     # clear caches for this user
     tasks_cache.pop(user_id, None)
     target_entity_cache.pop(user_id, None)
-    handler_registered.pop(user_id, None)
-    del logout_states[user_id]
+    logout_states.pop(user_id, None)
 
     await update.message.reply_text(
         "👋 **Account disconnected successfully!**\n\n"
@@ -446,6 +472,7 @@ async def handle_logout_confirmation(update: Update, context: ContextTypes.DEFAU
         parse_mode="Markdown",
     )
     return True
+
 
 async def forwadd_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -510,6 +537,7 @@ async def forwadd_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown",
         )
 
+
 async def foremove_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
@@ -534,6 +562,7 @@ async def foremove_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ **Task '{label}' removed!**", parse_mode="Markdown")
     else:
         await update.message.reply_text(f"❌ **Task '{label}' not found!**", parse_mode="Markdown")
+
 
 async def fortasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id if update.effective_user else update.callback_query.from_user.id
@@ -566,6 +595,7 @@ async def fortasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await message.reply_text(task_list, parse_mode="Markdown")
 
+
 async def getallid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
@@ -581,7 +611,8 @@ async def getallid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await show_chat_categories(user_id, update.message.chat.id, None, context)
 
-# ---------- Admin commands that were missing (implemented) ----------
+
+# ---------- Admin commands ----------
 async def adduser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin-only: add a user (optionally as admin)."""
     user_id = update.effective_user.id
@@ -626,6 +657,7 @@ async def adduser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("❌ **Invalid user ID!**\n\nUser ID must be a number.", parse_mode="Markdown")
 
+
 async def removeuser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin-only: remove a user and stop their forwarding permanently in this process."""
     user_id = update.effective_user.id
@@ -652,6 +684,15 @@ async def removeuser_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             if remove_user_id in user_clients:
                 try:
                     client = user_clients[remove_user_id]
+                    # remove event handler if present
+                    handler = handler_registered.get(remove_user_id)
+                    if handler:
+                        try:
+                            client.remove_event_handler(handler)
+                        except Exception:
+                            logger.exception("Error removing event handler for removed user %s", remove_user_id)
+                        handler_registered.pop(remove_user_id, None)
+
                     await client.disconnect()
                 except Exception:
                     logger.exception("Error disconnecting client for removed user %s", remove_user_id)
@@ -679,6 +720,7 @@ async def removeuser_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await update.message.reply_text(f"❌ **User `{remove_user_id}` not found!**", parse_mode="Markdown")
     except ValueError:
         await update.message.reply_text("❌ **Invalid user ID!**\n\nUser ID must be a number.", parse_mode="Markdown")
+
 
 async def listusers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin-only: list allowed users."""
@@ -716,7 +758,8 @@ async def listusers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(user_list, parse_mode="Markdown")
 
-# ---------- Chat listing functions kept (unchanged) ----------
+
+# ---------- Chat listing functions ----------
 async def show_chat_categories(user_id: int, chat_id: int, message_id: int, context: ContextTypes.DEFAULT_TYPE):
     if user_id not in user_clients:
         return
@@ -743,6 +786,7 @@ async def show_chat_categories(user_id: int, chat_id: int, message_id: int, cont
     else:
         await context.bot.send_message(chat_id=chat_id, text=message_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
+
 async def show_categorized_chats(user_id: int, chat_id: int, message_id: int, category: str, page: int, context: ContextTypes.DEFAULT_TYPE):
     from telethon.tl.types import User, Channel, Chat
 
@@ -759,10 +803,10 @@ async def show_categorized_chats(user_id: int, chat_id: int, message_id: int, ca
             if isinstance(entity, User) and entity.bot:
                 categorized_dialogs.append(dialog)
         elif category == "channels":
-            if isinstance(entity, Channel) and entity.broadcast:
+            if isinstance(entity, Channel) and getattr(entity, "broadcast", False):
                 categorized_dialogs.append(dialog)
         elif category == "groups":
-            if isinstance(entity, (Channel, Chat)) and not (isinstance(entity, Channel) and entity.broadcast):
+            if isinstance(entity, (Channel, Chat)) and not (isinstance(entity, Channel) and getattr(entity, "broadcast", False)):
                 categorized_dialogs.append(dialog)
         elif category == "private":
             if isinstance(entity, User) and not entity.bot:
@@ -775,7 +819,6 @@ async def show_categorized_chats(user_id: int, chat_id: int, message_id: int, ca
     page_dialogs = categorized_dialogs[start:end]
 
     category_emoji = {"bots": "🤖", "channels": "📢", "groups": "👥", "private": "👤"}
-
     category_name = {"bots": "Bots", "channels": "Channels", "groups": "Groups", "private": "Private Chats"}
 
     emoji = category_emoji.get(category, "💬")
@@ -813,44 +856,40 @@ async def show_categorized_chats(user_id: int, chat_id: int, message_id: int, ca
 
     await context.bot.edit_message_text(chat_list, chat_id=chat_id, message_id=message_id, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
-# ---------- Forwarding core: handler registration, message handler, send worker, resolver ----------
 
+# ---------- Forwarding core: handler registration, message handler, send worker, resolver ----------
 def ensure_handler_registered_for_user(user_id: int, client: TelegramClient):
-    """Attach a NewMessage handler once per client/user to avoid duplicates."""
+    """Attach a NewMessage handler once per client/user to avoid duplicates and store the handler (so it can be removed)."""
     if handler_registered.get(user_id):
         return
 
-    # Define the handler function (non-blocking; hot-path minimal work)
-    @client.on(events.NewMessage())
     async def _hot_message_handler(event):
         try:
-            # Only handle numeric-only messages
-            message_text = event.message.message
+            # Prefer raw_text for Telethon messages, fallback to message.message
+            message_text = getattr(event, "raw_text", None) or getattr(getattr(event, "message", None), "message", None)
             if not message_text or not message_text.strip().isdigit():
                 return
 
             chat_id = event.chat_id
-            # Read tasks from in-memory cache (very fast)
             user_tasks = tasks_cache.get(user_id)
             if not user_tasks:
                 return
 
-            # For every matching task, enqueue forward jobs for each target.
             for task in user_tasks:
-                # small optimization: source_ids might be short lists
                 if chat_id in task.get("source_ids", []):
                     for target_id in task.get("target_ids", []):
-                        # Attempt to enqueue send job without resolving entity here.
                         try:
                             await send_queue.put((user_id, client, int(target_id), message_text))
                         except asyncio.QueueFull:
                             logger.warning("Send queue full, dropping forward job for user=%s target=%s", user_id, target_id)
-
         except Exception:
-            logger.exception("❌ Error in hot message handler for user %s", user_id)
+            logger.exception("Error in hot message handler for user %s", user_id)
 
-    handler_registered[user_id] = True
+    # register and store handler so it can be removed later
+    client.add_event_handler(_hot_message_handler, events.NewMessage())
+    handler_registered[user_id] = _hot_message_handler
     logger.info("Registered NewMessage handler for user %s", user_id)
+
 
 async def resolve_target_entity_once(user_id: int, client: TelegramClient, target_id: int) -> Optional[object]:
     """Try to resolve a target entity and cache it. Returns entity or None."""
@@ -865,9 +904,9 @@ async def resolve_target_entity_once(user_id: int, client: TelegramClient, targe
         target_entity_cache[user_id][target_id] = entity
         return entity
     except Exception:
-        # Do not block hot path; resolution can be retried later
         logger.debug("Could not resolve target %s for user %s now", target_id, user_id)
         return None
+
 
 async def resolve_targets_for_user(user_id: int, target_ids: List[int]):
     """Background resolver that attempts to resolve targets for a user."""
@@ -875,7 +914,6 @@ async def resolve_targets_for_user(user_id: int, target_ids: List[int]):
     if not client:
         return
     for tid in target_ids:
-        # try a few times with delay
         for attempt in range(3):
             ent = await resolve_target_entity_once(user_id, client, tid)
             if ent:
@@ -883,24 +921,22 @@ async def resolve_targets_for_user(user_id: int, target_ids: List[int]):
                 break
             await asyncio.sleep(TARGET_RESOLVE_RETRY_SECONDS)
 
+
 async def send_worker_loop(worker_id: int):
-    """Worker that consumes send_queue and performs client.send_message with simple backoff on FloodWait."""
+    """Worker that consumes send_queue and performs client.send_message with backoff on FloodWait."""
     logger.info("Send worker %d started", worker_id)
     while True:
         user_id, client, target_id, message_text = await send_queue.get()
         try:
-            # Ensure we have an entity cached; try resolve once synchronously (cheap)
             entity = None
             if user_id in target_entity_cache:
                 entity = target_entity_cache[user_id].get(target_id)
             if not entity:
                 entity = await resolve_target_entity_once(user_id, client, target_id)
             if not entity:
-                # Skip if unresolved to avoid expensive fallback per message
                 logger.debug("Skipping send: target %s unresolved for user %s", target_id, user_id)
                 continue
 
-            # Attempt send with handling for FloodWaitError
             try:
                 await client.send_message(entity, message_text)
                 logger.debug("Forwarded message for user %s to %s", user_id, target_id)
@@ -908,7 +944,6 @@ async def send_worker_loop(worker_id: int):
                 wait = int(getattr(fwe, "seconds", 10))
                 logger.warning("FloodWait for %s seconds. Pausing worker %d", wait, worker_id)
                 await asyncio.sleep(wait + 1)
-                # re-enqueue once after wait
                 try:
                     await send_queue.put((user_id, client, target_id, message_text))
                 except asyncio.QueueFull:
@@ -921,11 +956,16 @@ async def send_worker_loop(worker_id: int):
         finally:
             send_queue.task_done()
 
+
 async def start_send_workers():
-    # spawn background send workers
+    global _send_workers_started
+    if _send_workers_started:
+        return
     for i in range(SEND_WORKER_COUNT):
         asyncio.create_task(send_worker_loop(i + 1))
+    _send_workers_started = True
     logger.info("Spawned %d send workers", SEND_WORKER_COUNT)
+
 
 async def start_forwarding_for_user(user_id: int):
     """Ensure client exists, register handler (once), and ensure caches created."""
@@ -938,6 +978,7 @@ async def start_forwarding_for_user(user_id: int):
 
     ensure_handler_registered_for_user(user_id, client)
 
+
 # ---------- Session restore and initialization ----------
 async def restore_sessions():
     logger.info("🔄 Restoring sessions...")
@@ -945,18 +986,15 @@ async def restore_sessions():
     cursor = conn.cursor()
     cursor.execute("SELECT user_id, session_data FROM users WHERE is_logged_in = 1")
     users = cursor.fetchall()
-    conn.close()
-
-    logger.info("📊 Found %d logged in user(s)", len(users))
-
     # Preload tasks cache from DB (single DB call)
     all_active = db.get_all_active_tasks()
-    # Rebuild tasks_cache grouped by user_id
     tasks_cache.clear()
     for t in all_active:
         uid = t["user_id"]
         tasks_cache.setdefault(uid, [])
         tasks_cache[uid].append({"id": t["id"], "label": t["label"], "source_ids": t["source_ids"], "target_ids": t["target_ids"], "is_active": 1})
+
+    logger.info("📊 Found %d logged in user(s)", len(users))
 
     for user_id, session_data in users:
         if session_data:
@@ -983,6 +1021,7 @@ async def restore_sessions():
                 logger.exception("❌ Failed to restore session for user %s: %s", user_id, e)
                 db.save_user(user_id, is_logged_in=False)
 
+
 # ---------- Application post_init: start send workers and restore sessions ----------
 async def post_init(application: Application):
     logger.info("🔧 Initializing bot...")
@@ -1004,7 +1043,6 @@ async def post_init(application: Application):
     if ALLOWED_USERS:
         for au in ALLOWED_USERS:
             try:
-                # add as regular allowed users (is_admin=False), added_by=None
                 db.add_allowed_user(au, is_admin=False)
                 logger.info("✅ Added allowed user from env: %s", au)
             except Exception:
@@ -1014,6 +1052,7 @@ async def post_init(application: Application):
     await start_send_workers()
     await restore_sessions()
     logger.info("✅ Bot initialized!")
+
 
 # ---------- Main -----------
 def main():
@@ -1046,6 +1085,7 @@ def main():
 
     logger.info("✅ Bot ready!")
     application.run_polling(drop_pending_updates=True)
+
 
 if __name__ == "__main__":
     main()
