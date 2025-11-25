@@ -1,7 +1,23 @@
-from flask import Flask
+from flask import Flask, request
 import threading
+import time
+import os
+
+# resource is available on Unix; wrap in try for portability
+try:
+    import resource
+except Exception:
+    resource = None
+
+# optional fallback for system memory on non-Linux platforms
+try:
+    import psutil
+except Exception:
+    psutil = None
 
 app = Flask(__name__)
+
+START_TIME = time.time()
 
 @app.route('/')
 def home():
@@ -43,13 +59,99 @@ def home():
     </html>
     """
 
-@app.route('/ping')
-def ping():
-    return {'status': 'ok', 'message': 'Bot is alive!'}, 200
-
-@app.route('/health')
+# Removed /ping as /health is now used for monitoring
+@app.route('/health', methods=['GET'])
 def health():
-    return {'status': 'healthy'}, 200
+    """Health endpoint for monitoring systems. Returns basic status and uptime."""
+    uptime = int(time.time() - START_TIME)
+    return {'status': 'healthy', 'uptime_seconds': uptime}, 200
+
+@app.route('/webhook', methods=['GET', 'POST'])
+def webhook():
+    """Simple webhook endpoint for monitoring or external hooks."""
+    now = int(time.time())
+    if request.method == 'POST':
+        data = request.get_json(silent=True)
+        return {'status': 'ok', 'received': True, 'timestamp': now, 'data': data}, 200
+    else:
+        return {'status': 'ok', 'method': 'GET', 'timestamp': now}, 200
+
+@app.route('/mem', methods=['GET'])
+def mem():
+    """
+    Process memory usage (RSS).
+    Uses resource.getrusage when available. Values returned in kilobytes and bytes.
+    """
+    if resource is None:
+        return {'status': 'unavailable', 'reason': 'resource module not available on this platform'}, 200
+
+    try:
+        r = resource.getrusage(resource.RUSAGE_SELF)
+        # ru_maxrss is in kilobytes on Linux; multiply to bytes for convenience
+        rss_kb = int(getattr(r, 'ru_maxrss', 0))
+        rss_bytes = rss_kb * 1024
+        return {
+            'status': 'ok',
+            'rss_kb': rss_kb,
+            'rss_bytes': rss_bytes
+        }, 200
+    except Exception as e:
+        return {'status': 'error', 'error': str(e)}, 500
+
+@app.route('/sysmem', methods=['GET'])
+def sysmem():
+    """
+    System memory statistics. Prefer /proc/meminfo on Linux; fallback to psutil if available.
+    Returns total, available, used, and percent.
+    """
+    # Try /proc/meminfo (Linux)
+    meminfo_path = '/proc/meminfo'
+    if os.path.exists(meminfo_path):
+        try:
+            meminfo = {}
+            with open(meminfo_path, 'r') as f:
+                for line in f:
+                    parts = line.split(':')
+                    if len(parts) < 2:
+                        continue
+                    key = parts[0].strip()
+                    val = parts[1].strip().split()[0]
+                    meminfo[key] = int(val)  # values are in kB
+
+            total_kb = meminfo.get('MemTotal', 0)
+            avail_kb = meminfo.get('MemAvailable', meminfo.get('MemFree', 0))
+            used_kb = total_kb - avail_kb
+            percent = round((used_kb / total_kb) * 100, 2) if total_kb else 0.0
+
+            return {
+                'status': 'ok',
+                'total_kb': total_kb,
+                'available_kb': avail_kb,
+                'used_kb': used_kb,
+                'used_percent': percent
+            }, 200
+        except Exception as e:
+            return {'status': 'error', 'error': f'failed to read /proc/meminfo: {e}'}, 500
+
+    # Fallback to psutil if available
+    if psutil is not None:
+        try:
+            vm = psutil.virtual_memory()
+            total = vm.total
+            available = vm.available
+            used = total - available
+            percent = vm.percent
+            return {
+                'status': 'ok',
+                'total_bytes': total,
+                'available_bytes': available,
+                'used_bytes': used,
+                'used_percent': percent
+            }, 200
+        except Exception as e:
+            return {'status': 'error', 'error': str(e)}, 500
+
+    return {'status': 'unavailable', 'reason': 'platform-specific meminfo not available and psutil not installed'}, 200
 
 def run_server():
     app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
