@@ -3,6 +3,10 @@ import json
 import threading
 from datetime import datetime
 from typing import List, Dict, Optional
+import os
+import logging
+
+logger = logging.getLogger("database")
 
 """
 Improved SQLite helper for FORWARDIFY
@@ -23,7 +27,10 @@ class Database:
     def __init__(self, db_path: str = "bot_data.db"):
         self.db_path = db_path
         # initialize DB schema
-        self.init_db()
+        try:
+            self.init_db()
+        except Exception:
+            logger.exception("Failed initializing DB")
 
     def _apply_pragmas(self, conn: sqlite3.Connection):
         try:
@@ -61,8 +68,12 @@ class Database:
                     pass
                 _thread_local.conn = None
 
-        _thread_local.conn = self._create_connection()
-        return _thread_local.conn
+        try:
+            _thread_local.conn = self._create_connection()
+            return _thread_local.conn
+        except Exception as e:
+            logger.exception("Failed to create DB connection: %s", e)
+            raise
 
     def close_connection(self):
         conn = getattr(_thread_local, "conn", None)
@@ -70,7 +81,7 @@ class Database:
             try:
                 conn.close()
             except Exception:
-                pass
+                logger.exception("Failed to close DB connection")
             _thread_local.conn = None
 
     def init_db(self):
@@ -319,6 +330,62 @@ class Database:
                 }
             )
         return users
+
+    def get_db_status(self) -> Dict:
+        """
+        Return a small health/status snapshot for the DB:
+        - path
+        - exists
+        - size_bytes
+        - user_version (PRAGMA)
+        - row counts for key tables
+        """
+        status = {"path": self.db_path, "exists": False, "size_bytes": None, "user_version": None, "counts": {}}
+        try:
+            status["exists"] = os.path.exists(self.db_path)
+            if status["exists"]:
+                status["size_bytes"] = os.path.getsize(self.db_path)
+        except Exception:
+            logger.exception("Error reading DB file info")
+
+        try:
+            conn = self.get_connection()
+            cur = conn.cursor()
+            try:
+                cur.execute("PRAGMA user_version;")
+                row = cur.fetchone()
+                # row can be a tuple or sqlite3.Row depending on driver
+                if row:
+                    try:
+                        status["user_version"] = int(row[0])
+                    except Exception:
+                        try:
+                            # fallback if row is a mapping
+                            status["user_version"] = int(row["user_version"])
+                        except Exception:
+                            status["user_version"] = None
+            except Exception:
+                # ignore if PRAGMA unsupported
+                status["user_version"] = None
+
+            for table in ("users", "forwarding_tasks", "allowed_users"):
+                try:
+                    cur.execute(f"SELECT COUNT(1) as c FROM {table}")
+                    crow = cur.fetchone()
+                    if crow:
+                        try:
+                            cnt = crow["c"]
+                        except Exception:
+                            cnt = crow[0]
+                        status["counts"][table] = int(cnt)
+                    else:
+                        status["counts"][table] = 0
+                except Exception:
+                    status["counts"][table] = None
+        except Exception:
+            logger.exception("Error querying DB status")
+
+        return status
 
     def __del__(self):
         try:
