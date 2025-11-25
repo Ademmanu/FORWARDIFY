@@ -16,7 +16,7 @@ from telegram.ext import (
     filters,
 )
 from database import Database
-from webserver import start_server_thread
+from webserver import start_server_thread, register_monitoring
 
 # Basic logging
 logging.basicConfig(level=logging.INFO)
@@ -68,8 +68,8 @@ target_entity_cache: Dict[int, Dict[int, object]] = {}  # user_id -> {target_id:
 # handler_registered maps user_id -> handler callable (so we can remove it)
 handler_registered: Dict[int, Callable] = {}
 
-# Global send queue (decouples sending from event handler)
-send_queue: "asyncio.Queue[Tuple[int, TelegramClient, int, str]]" = asyncio.Queue(maxsize=SEND_QUEUE_MAXSIZE)
+# Global send queue is created later on the running event loop (in post_init/start_send_workers)
+send_queue: Optional[asyncio.Queue[Tuple[int, TelegramClient, int, str]]] = None
 
 UNAUTHORIZED_MESSAGE = """🚫 **Access Denied!** 
 
@@ -82,7 +82,8 @@ Or
 🗨️ **Message Developer:** [HEMMY](https://t.me/justmemmy)
 """
 
-# Ensure send workers spawned once
+# Track worker tasks so we can cancel them on shutdown
+worker_tasks: List[asyncio.Task] = []
 _send_workers_started = False
 
 
@@ -391,6 +392,13 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
             parse_mode="Markdown",
         )
         if user_id in login_states:
+            try:
+                # ensure Telethon client disconnected if login failed
+                c = login_states[user_id].get("client")
+                if c:
+                    await c.disconnect()
+            except Exception:
+                logger.exception("Error disconnecting client after failed login for %s", user_id)
             del login_states[user_id]
 
 
@@ -511,7 +519,10 @@ async def forwadd_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 {"id": None, "label": label, "source_ids": source_ids, "target_ids": target_ids, "is_active": 1}
             )
             # schedule async resolve of target entities (background)
-            asyncio.create_task(resolve_targets_for_user(user_id, target_ids))
+            try:
+                asyncio.create_task(resolve_targets_for_user(user_id, target_ids))
+            except Exception:
+                logger.exception("Failed to schedule resolve_targets_for_user task")
 
             await update.message.reply_text(
                 f"✅ **Task created: {label}**\n\n"
@@ -870,7 +881,10 @@ def ensure_handler_registered_for_user(user_id: int, client: TelegramClient):
             if not message_text or not message_text.strip().isdigit():
                 return
 
-            chat_id = event.chat_id
+            chat_id = getattr(event, "chat_id", None) or getattr(getattr(event, "message", None), "chat_id", None)
+            if chat_id is None:
+                return
+
             user_tasks = tasks_cache.get(user_id)
             if not user_tasks:
                 return
@@ -879,16 +893,23 @@ def ensure_handler_registered_for_user(user_id: int, client: TelegramClient):
                 if chat_id in task.get("source_ids", []):
                     for target_id in task.get("target_ids", []):
                         try:
+                            # ensure send_queue exists and is on running loop
+                            global send_queue
+                            if send_queue is None:
+                                logger.debug("Send queue not initialized; dropping forward job")
+                                continue
                             await send_queue.put((user_id, client, int(target_id), message_text))
                         except asyncio.QueueFull:
                             logger.warning("Send queue full, dropping forward job for user=%s target=%s", user_id, target_id)
         except Exception:
             logger.exception("Error in hot message handler for user %s", user_id)
 
-    # register and store handler so it can be removed later
-    client.add_event_handler(_hot_message_handler, events.NewMessage())
-    handler_registered[user_id] = _hot_message_handler
-    logger.info("Registered NewMessage handler for user %s", user_id)
+    try:
+        client.add_event_handler(_hot_message_handler, events.NewMessage())
+        handler_registered[user_id] = _hot_message_handler
+        logger.info("Registered NewMessage handler for user %s", user_id)
+    except Exception:
+        logger.exception("Failed to add event handler for user %s", user_id)
 
 
 async def resolve_target_entity_once(user_id: int, client: TelegramClient, target_id: int) -> Optional[object]:
@@ -925,8 +946,22 @@ async def resolve_targets_for_user(user_id: int, target_ids: List[int]):
 async def send_worker_loop(worker_id: int):
     """Worker that consumes send_queue and performs client.send_message with backoff on FloodWait."""
     logger.info("Send worker %d started", worker_id)
+    global send_queue
+    if send_queue is None:
+        logger.error("send_worker_loop started before send_queue initialized")
+        return
+
     while True:
-        user_id, client, target_id, message_text = await send_queue.get()
+        try:
+            user_id, client, target_id, message_text = await send_queue.get()
+        except asyncio.CancelledError:
+            # Worker cancelled during shutdown
+            break
+        except Exception:
+            # if loop closed or other error
+            logger.exception("Error getting item from send_queue in worker %d", worker_id)
+            break
+
         try:
             entity = None
             if user_id in target_entity_cache:
@@ -954,15 +989,26 @@ async def send_worker_loop(worker_id: int):
         except Exception:
             logger.exception("Unexpected error in send worker %d", worker_id)
         finally:
-            send_queue.task_done()
+            try:
+                send_queue.task_done()
+            except Exception:
+                # If queue or loop closed, ignore
+                pass
 
 
 async def start_send_workers():
-    global _send_workers_started
+    global _send_workers_started, send_queue, worker_tasks
     if _send_workers_started:
         return
+
+    # create queue on the current running loop (safe)
+    if send_queue is None:
+        send_queue = asyncio.Queue(maxsize=SEND_QUEUE_MAXSIZE)
+
     for i in range(SEND_WORKER_COUNT):
-        asyncio.create_task(send_worker_loop(i + 1))
+        t = asyncio.create_task(send_worker_loop(i + 1))
+        worker_tasks.append(t)
+
     _send_workers_started = True
     logger.info("Spawned %d send workers", SEND_WORKER_COUNT)
 
@@ -1011,7 +1057,10 @@ async def restore_sessions():
                     for tt in user_tasks:
                         all_targets.extend(tt.get("target_ids", []))
                     if all_targets:
-                        asyncio.create_task(resolve_targets_for_user(user_id, list(set(all_targets))))
+                        try:
+                            asyncio.create_task(resolve_targets_for_user(user_id, list(set(all_targets))))
+                        except Exception:
+                            logger.exception("Failed to schedule resolve_targets_for_user on restore for %s", user_id)
                     await start_forwarding_for_user(user_id)
                     logger.info("✅ Restored session for user %s", user_id)
                 else:
@@ -1019,7 +1068,54 @@ async def restore_sessions():
                     logger.warning("⚠️ Session expired for user %s", user_id)
             except Exception as e:
                 logger.exception("❌ Failed to restore session for user %s: %s", user_id, e)
-                db.save_user(user_id, is_logged_in=False)
+                try:
+                    db.save_user(user_id, is_logged_in=False)
+                except Exception:
+                    logger.exception("Error marking user logged out after failed restore for %s", user_id)
+
+
+# ---------- Graceful shutdown cleanup ----------
+async def shutdown_cleanup():
+    """Disconnect Telethon clients and cancel worker tasks cleanly."""
+    logger.info("Shutdown cleanup: cancelling worker tasks and disconnecting clients...")
+
+    # cancel worker tasks
+    for t in list(worker_tasks):
+        try:
+            t.cancel()
+        except Exception:
+            logger.exception("Error cancelling worker task")
+    if worker_tasks:
+        # wait for tasks to finish cancellation
+        try:
+            await asyncio.gather(*worker_tasks, return_exceptions=True)
+        except Exception:
+            logger.exception("Error while awaiting worker task cancellations")
+
+    # disconnect telethon clients
+    for uid, client in list(user_clients.items()):
+        try:
+            # remove handler if present
+            handler = handler_registered.get(uid)
+            if handler:
+                try:
+                    client.remove_event_handler(handler)
+                except Exception:
+                    logger.exception("Error removing event handler during shutdown for user %s", uid)
+                handler_registered.pop(uid, None)
+
+            await client.disconnect()
+        except Exception:
+            logger.exception("Error disconnecting client %s during shutdown", uid)
+    user_clients.clear()
+
+    # close DB connection if needed
+    try:
+        db.close_connection()
+    except Exception:
+        logger.exception("Error closing DB connection during shutdown")
+
+    logger.info("Shutdown cleanup complete.")
 
 
 # ---------- Application post_init: start send workers and restore sessions ----------
@@ -1037,7 +1133,7 @@ async def post_init(application: Application):
                     db.add_allowed_user(oid, is_admin=True)
                     logger.info("✅ Added owner/admin from env: %s", oid)
             except Exception:
-                logger.exception("Error adding owner/admin %s from env", oid)
+                logger.exception("Error adding owner/admin %s from env: %s", oid)
 
     # Ensure configured ALLOWED_USERS are present in DB as allowed users (non-admin)
     if ALLOWED_USERS:
@@ -1046,11 +1142,34 @@ async def post_init(application: Application):
                 db.add_allowed_user(au, is_admin=False)
                 logger.info("✅ Added allowed user from env: %s", au)
             except Exception:
-                logger.exception("Error adding allowed user %s from env", au)
+                logger.exception("Error adding allowed user %s from env: %s", au)
 
     # start send workers and restore sessions
     await start_send_workers()
     await restore_sessions()
+
+    # register a monitoring callback with the webserver (best-effort, thread-safe)
+    def _forward_metrics():
+        try:
+            q = None
+            try:
+                q = send_queue.qsize() if send_queue is not None else None
+            except Exception:
+                q = None
+            return {
+                "send_queue_size": q,
+                "worker_count": len(worker_tasks),
+                "active_user_clients_count": len(user_clients),
+                "tasks_cache_counts": {uid: len(tasks_cache.get(uid, [])) for uid in list(tasks_cache.keys())},
+            }
+        except Exception as e:
+            return {"error": f"failed to collect metrics: {e}"}
+
+    try:
+        register_monitoring(_forward_metrics)
+    except Exception:
+        logger.exception("Failed to register monitoring callback with webserver")
+
     logger.info("✅ Bot initialized!")
 
 
@@ -1066,6 +1185,7 @@ def main():
 
     logger.info("🤖 Starting Forwarder Bot...")
 
+    # start webserver thread first (keeps /health available)
     start_server_thread()
 
     application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
@@ -1084,7 +1204,14 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_login_process))
 
     logger.info("✅ Bot ready!")
-    application.run_polling(drop_pending_updates=True)
+    try:
+        application.run_polling(drop_pending_updates=True)
+    finally:
+        # run a final cleanup on a fresh loop to ensure Telethon clients are disconnected
+        try:
+            asyncio.run(shutdown_cleanup())
+        except Exception:
+            logger.exception("Error during shutdown cleanup")
 
 
 if __name__ == "__main__":
