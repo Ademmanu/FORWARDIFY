@@ -19,6 +19,11 @@ app = Flask(__name__)
 
 START_TIME = time.time()
 
+# Container limit (in MB). Default 512 MB as requested.
+CONTAINER_MAX_RAM_MB = int(os.getenv("CONTAINER_MAX_RAM_MB", "512"))
+CONTAINER_TOTAL_BYTES = CONTAINER_MAX_RAM_MB * 1024 * 1024
+CONTAINER_TOTAL_KB = CONTAINER_MAX_RAM_MB * 1024  # for use with kB units from /proc/meminfo
+
 @app.route('/')
 def home():
     return """
@@ -81,6 +86,7 @@ def mem():
     """
     Process memory usage (RSS).
     Uses resource.getrusage when available. Values returned in kilobytes and bytes.
+    Also reports usage relative to CONTAINER_MAX_RAM_MB.
     """
     if resource is None:
         return {'status': 'unavailable', 'reason': 'resource module not available on this platform'}, 200
@@ -90,10 +96,14 @@ def mem():
         # ru_maxrss is in kilobytes on Linux; multiply to bytes for convenience
         rss_kb = int(getattr(r, 'ru_maxrss', 0))
         rss_bytes = rss_kb * 1024
+        container_total_bytes = CONTAINER_TOTAL_BYTES
+        rss_percent_of_container = round((rss_bytes / container_total_bytes) * 100, 2) if container_total_bytes else 0.0
         return {
             'status': 'ok',
             'rss_kb': rss_kb,
-            'rss_bytes': rss_bytes
+            'rss_bytes': rss_bytes,
+            'container_total_mb': CONTAINER_MAX_RAM_MB,
+            'rss_percent_of_container': rss_percent_of_container
         }, 200
     except Exception as e:
         return {'status': 'error', 'error': str(e)}, 500
@@ -102,7 +112,7 @@ def mem():
 def sysmem():
     """
     System memory statistics. Prefer /proc/meminfo on Linux; fallback to psutil if available.
-    Returns total, available, used, and percent.
+    Returns total, available, used, and percent. Also includes container-limited totals (CONTAINER_MAX_RAM_MB).
     """
     # Try /proc/meminfo (Linux)
     meminfo_path = '/proc/meminfo'
@@ -123,12 +133,18 @@ def sysmem():
             used_kb = total_kb - avail_kb
             percent = round((used_kb / total_kb) * 100, 2) if total_kb else 0.0
 
+            # compute percent relative to container limit (container reported in kB)
+            container_total_kb = CONTAINER_TOTAL_KB
+            used_percent_of_container = round((used_kb / container_total_kb) * 100, 2) if container_total_kb else 0.0
+
             return {
                 'status': 'ok',
                 'total_kb': total_kb,
                 'available_kb': avail_kb,
                 'used_kb': used_kb,
-                'used_percent': percent
+                'used_percent': percent,
+                'container_total_mb': CONTAINER_MAX_RAM_MB,
+                'used_percent_of_container': used_percent_of_container
             }, 200
         except Exception as e:
             return {'status': 'error', 'error': f'failed to read /proc/meminfo: {e}'}, 500
@@ -141,12 +157,16 @@ def sysmem():
             available = vm.available
             used = total - available
             percent = vm.percent
+            container_total_bytes = CONTAINER_TOTAL_BYTES
+            used_percent_of_container = round((used / container_total_bytes) * 100, 2) if container_total_bytes else 0.0
             return {
                 'status': 'ok',
                 'total_bytes': total,
                 'available_bytes': available,
                 'used_bytes': used,
-                'used_percent': percent
+                'used_percent': percent,
+                'container_total_mb': CONTAINER_MAX_RAM_MB,
+                'used_percent_of_container': used_percent_of_container
             }, 200
         except Exception as e:
             return {'status': 'error', 'error': str(e)}, 500
