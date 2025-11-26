@@ -2,6 +2,7 @@
 import os
 import asyncio
 import logging
+import functools
 from typing import Dict, List, Optional, Tuple, Set, Callable
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
@@ -86,13 +87,26 @@ Or
 worker_tasks: List[asyncio.Task] = []
 _send_workers_started = False
 
+# MAIN loop reference for cross-thread metrics collection
+MAIN_LOOP: Optional[asyncio.AbstractEventLoop] = None
+
+
+# Generic helper to run DB calls in a thread so the event loop isn't blocked
+async def db_call(func, *args, **kwargs):
+    return await asyncio.to_thread(functools.partial(func, *args, **kwargs))
+
 
 # ---------- Authorization helpers ----------
 async def check_authorization(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     user_id = update.effective_user.id
 
     # Allow if user present in DB allowed list OR configured via env lists (ALLOWED_USERS or OWNER_IDS)
-    is_allowed_db = db.is_user_allowed(user_id)
+    try:
+        is_allowed_db = await db_call(db.is_user_allowed, user_id)
+    except Exception:
+        logger.exception("Error checking DB allowed users for %s", user_id)
+        is_allowed_db = False
+
     is_allowed_env = (user_id in ALLOWED_USERS) or (user_id in OWNER_IDS)
 
     if not (is_allowed_db or is_allowed_env):
@@ -121,7 +135,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_authorization(update, context):
         return
 
-    user = db.get_user(user_id)
+    user = await db_call(db.get_user, user_id)
 
     user_name = update.effective_user.first_name or "User"
     user_phone = user["phone"] if user and user["phone"] else "Not connected"
@@ -306,7 +320,7 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
                 me = await client.get_me()
                 session_string = client.session.save()
 
-                db.save_user(user_id=user_id, phone=state["phone"], name=me.first_name, session_data=session_string, is_logged_in=True)
+                await db_call(db.save_user, user_id, state["phone"], me.first_name, session_string, True)
 
                 user_clients[user_id] = client
                 # ensure caches exist
@@ -368,7 +382,7 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
             me = await client.get_me()
             session_string = client.session.save()
 
-            db.save_user(user_id=user_id, phone=state["phone"], name=me.first_name, session_data=session_string, is_logged_in=True)
+            await db_call(db.save_user, user_id, state["phone"], me.first_name, session_string, True)
 
             user_clients[user_id] = client
             tasks_cache.setdefault(user_id, [])
@@ -410,7 +424,7 @@ async def logout_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     message = update.message if update.message else update.callback_query.message
 
-    user = db.get_user(user_id)
+    user = await db_call(db.get_user, user_id)
     if not user or not user["is_logged_in"]:
         await message.reply_text(
             "❌ **You're not connected!**\n\n" "Use /login to connect your account.", parse_mode="Markdown"
@@ -467,7 +481,10 @@ async def handle_logout_confirmation(update: Update, context: ContextTypes.DEFAU
             user_clients.pop(user_id, None)
 
     # mark as logged out in DB
-    db.save_user(user_id, is_logged_in=False)
+    try:
+        await db_call(db.save_user, user_id, None, None, None, False)
+    except Exception:
+        logger.exception("Error saving user logout state for %s", user_id)
     # clear caches for this user
     tasks_cache.pop(user_id, None)
     target_entity_cache.pop(user_id, None)
@@ -488,7 +505,7 @@ async def forwadd_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_authorization(update, context):
         return
 
-    user = db.get_user(user_id)
+    user = await db_call(db.get_user, user_id)
     if not user or not user["is_logged_in"]:
         await update.message.reply_text(
             "❌ **You need to connect your account first!**\n\n" "Use /login to connect your Telegram account.", parse_mode="Markdown"
@@ -512,7 +529,8 @@ async def forwadd_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         source_ids = [int(x) for x in label_parts[1:]]
         target_ids = [int(x.strip()) for x in target_part.split()]
 
-        if db.add_forwarding_task(user_id, label, source_ids, target_ids):
+        added = await db_call(db.add_forwarding_task, user_id, label, source_ids, target_ids)
+        if added:
             # Update in-memory cache immediately (hot path)
             tasks_cache.setdefault(user_id, [])
             tasks_cache[user_id].append(
@@ -566,7 +584,8 @@ async def foremove_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     label = parts[1]
 
-    if db.remove_forwarding_task(user_id, label):
+    deleted = await db_call(db.remove_forwarding_task, user_id, label)
+    if deleted:
         # Update in-memory cache
         if user_id in tasks_cache:
             tasks_cache[user_id] = [t for t in tasks_cache[user_id] if t.get("label") != label]
@@ -613,7 +632,7 @@ async def getallid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_authorization(update, context):
         return
 
-    user = db.get_user(user_id)
+    user = await db_call(db.get_user, user_id)
     if not user or not user["is_logged_in"]:
         await update.message.reply_text("❌ **You need to connect your account first!**\n\n" "Use /login to connect.", parse_mode="Markdown")
         return
@@ -631,7 +650,8 @@ async def adduser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_authorization(update, context):
         return
 
-    if not db.is_user_admin(user_id):
+    is_admin_caller = await db_call(db.is_user_admin, user_id)
+    if not is_admin_caller:
         await update.message.reply_text("❌ **Admin Only**\n\nThis command is only available to admins.", parse_mode="Markdown")
         return
 
@@ -652,7 +672,8 @@ async def adduser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         new_user_id = int(parts[1])
         is_admin = len(parts) > 2 and parts[2].lower() == "admin"
 
-        if db.add_allowed_user(new_user_id, is_admin=is_admin, added_by=user_id):
+        added = await db_call(db.add_allowed_user, new_user_id, None, is_admin, user_id)
+        if added:
             role = "👑 Admin" if is_admin else "👤 User"
             await update.message.reply_text(
                 f"✅ **User added!**\n\nID: `{new_user_id}`\nRole: {role}",
@@ -676,7 +697,8 @@ async def removeuser_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not await check_authorization(update, context):
         return
 
-    if not db.is_user_admin(user_id):
+    is_admin_caller = await db_call(db.is_user_admin, user_id)
+    if not is_admin_caller:
         await update.message.reply_text("❌ **Admin Only**\n\nThis command is only available to admins.", parse_mode="Markdown")
         return
 
@@ -690,7 +712,8 @@ async def removeuser_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     try:
         remove_user_id = int(parts[1])
 
-        if db.remove_allowed_user(remove_user_id):
+        removed = await db_call(db.remove_allowed_user, remove_user_id)
+        if removed:
             # Best-effort: disconnect user's Telethon client and clear in-memory state
             if remove_user_id in user_clients:
                 try:
@@ -712,7 +735,7 @@ async def removeuser_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
             # mark as logged out in users table and clear caches
             try:
-                db.save_user(remove_user_id, is_logged_in=False)
+                await db_call(db.save_user, remove_user_id, None, None, None, False)
             except Exception:
                 logger.exception("Error saving user logged_out state for %s", remove_user_id)
 
@@ -740,11 +763,12 @@ async def listusers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_authorization(update, context):
         return
 
-    if not db.is_user_admin(user_id):
+    is_admin_caller = await db_call(db.is_user_admin, user_id)
+    if not is_admin_caller:
         await update.message.reply_text("❌ **Admin Only**\n\nThis command is only available to admins.", parse_mode="Markdown")
         return
 
-    users = db.get_all_allowed_users()
+    users = await db_call(db.get_all_allowed_users)
 
     if not users:
         await update.message.reply_text("📋 **No Allowed Users**\n\nThe allowed users list is empty.", parse_mode="Markdown")
@@ -1028,12 +1052,27 @@ async def start_forwarding_for_user(user_id: int):
 # ---------- Session restore and initialization ----------
 async def restore_sessions():
     logger.info("🔄 Restoring sessions...")
-    conn = db.get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT user_id, session_data FROM users WHERE is_logged_in = 1")
-    users = cursor.fetchall()
-    # Preload tasks cache from DB (single DB call)
-    all_active = db.get_all_active_tasks()
+
+    # fetch logged-in users in a thread to avoid blocking the event loop
+    def _fetch_logged_in_users():
+        conn = db.get_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT user_id, session_data FROM users WHERE is_logged_in = 1")
+        return cur.fetchall()
+
+    try:
+        users = await asyncio.to_thread(_fetch_logged_in_users)
+    except Exception:
+        logger.exception("Error fetching logged-in users from DB")
+        users = []
+
+    # Preload tasks cache from DB (single DB call off the loop)
+    try:
+        all_active = await db_call(db.get_all_active_tasks)
+    except Exception:
+        logger.exception("Error fetching active tasks from DB")
+        all_active = []
+
     tasks_cache.clear()
     for t in all_active:
         uid = t["user_id"]
@@ -1042,7 +1081,17 @@ async def restore_sessions():
 
     logger.info("📊 Found %d logged in user(s)", len(users))
 
-    for user_id, session_data in users:
+    for row in users:
+        # row may be sqlite3.Row or tuple
+        try:
+            user_id = row["user_id"] if isinstance(row, dict) or hasattr(row, "keys") else row[0]
+            session_data = row["session_data"] if isinstance(row, dict) or hasattr(row, "keys") else row[1]
+        except Exception:
+            try:
+                user_id, session_data = row[0], row[1]
+            except Exception:
+                continue
+
         if session_data:
             try:
                 client = TelegramClient(StringSession(session_data), API_ID, API_HASH)
@@ -1064,12 +1113,12 @@ async def restore_sessions():
                     await start_forwarding_for_user(user_id)
                     logger.info("✅ Restored session for user %s", user_id)
                 else:
-                    db.save_user(user_id, is_logged_in=False)
+                    await db_call(db.save_user, user_id, None, None, None, False)
                     logger.warning("⚠️ Session expired for user %s", user_id)
             except Exception as e:
                 logger.exception("❌ Failed to restore session for user %s: %s", user_id, e)
                 try:
-                    db.save_user(user_id, is_logged_in=False)
+                    await db_call(db.save_user, user_id, None, None, None, False)
                 except Exception:
                     logger.exception("Error marking user logged out after failed restore for %s", user_id)
 
@@ -1120,6 +1169,9 @@ async def shutdown_cleanup():
 
 # ---------- Application post_init: start send workers and restore sessions ----------
 async def post_init(application: Application):
+    global MAIN_LOOP
+    MAIN_LOOP = asyncio.get_running_loop()
+
     logger.info("🔧 Initializing bot...")
 
     await application.bot.delete_webhook(drop_pending_updates=True)
@@ -1129,17 +1181,18 @@ async def post_init(application: Application):
     if OWNER_IDS:
         for oid in OWNER_IDS:
             try:
-                if not db.is_user_admin(oid):
-                    db.add_allowed_user(oid, is_admin=True)
+                is_admin = await db_call(db.is_user_admin, oid)
+                if not is_admin:
+                    await db_call(db.add_allowed_user, oid, None, True, None)
                     logger.info("✅ Added owner/admin from env: %s", oid)
             except Exception:
-                logger.exception("Error adding owner/admin %s from env: %s", oid)
+                logger.exception("Error adding owner/admin %s from env", oid)
 
     # Ensure configured ALLOWED_USERS are present in DB as allowed users (non-admin)
     if ALLOWED_USERS:
         for au in ALLOWED_USERS:
             try:
-                db.add_allowed_user(au, is_admin=False)
+                await db_call(db.add_allowed_user, au, None, False, None)
                 logger.info("✅ Added allowed user from env: %s", au)
             except Exception:
                 logger.exception("Error adding allowed user %s from env: %s", au)
@@ -1149,7 +1202,10 @@ async def post_init(application: Application):
     await restore_sessions()
 
     # register a monitoring callback with the webserver (best-effort, thread-safe)
-    def _forward_metrics():
+    async def _collect_metrics():
+        """
+        Run inside the bot event loop to safely access asyncio objects and in-memory state.
+        """
         try:
             q = None
             try:
@@ -1163,6 +1219,21 @@ async def post_init(application: Application):
                 "tasks_cache_counts": {uid: len(tasks_cache.get(uid, [])) for uid in list(tasks_cache.keys())},
             }
         except Exception as e:
+            return {"error": f"failed to collect metrics in loop: {e}"}
+
+    def _forward_metrics():
+        """
+        This wrapper runs in the Flask thread; it will call into the bot's event loop to gather data safely.
+        """
+        global MAIN_LOOP
+        if MAIN_LOOP is None:
+            return {"error": "bot main loop not available"}
+
+        try:
+            future = asyncio.run_coroutine_threadsafe(_collect_metrics(), MAIN_LOOP)
+            return future.result(timeout=1.0)
+        except Exception as e:
+            logger.exception("Failed to collect metrics from main loop")
             return {"error": f"failed to collect metrics: {e}"}
 
     try:
