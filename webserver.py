@@ -4,18 +4,6 @@ import time
 import os
 import logging
 
-# resource is available on Unix; wrap in try for portability
-try:
-    import resource
-except Exception:
-    resource = None
-
-# optional fallback for system memory on non-Linux platforms
-try:
-    import psutil
-except Exception:
-    psutil = None
-
 logger = logging.getLogger("webserver")
 
 app = Flask(__name__)
@@ -47,10 +35,6 @@ def register_monitoring(callback):
 
 def _mb_from_bytes(n_bytes: int) -> float:
     return round(n_bytes / (1024 * 1024), 2)
-
-
-def _readable_mb(mb_value: float) -> str:
-    return f"{mb_value:.2f} MB"
 
 
 def _read_cgroup_memory_limit_bytes() -> int:
@@ -156,8 +140,6 @@ def home():
             <p>Bot is running. Use the monitoring endpoints:</p>
             <ul>
               <li>/health — basic uptime</li>
-              <li>/mem — process memory usage (MB)</li>
-              <li>/sysmem — system & container memory (MB)</li>
               <li>/webhook — simple webhook endpoint</li>
               <li>/metrics — forwarding subsystem metrics (if registered)</li>
             </ul>
@@ -185,108 +167,6 @@ def webhook():
         return jsonify({"status": "ok", "received": True, "timestamp": now, "data": data}), 200
     else:
         return jsonify({"status": "ok", "method": "GET", "timestamp": now}), 200
-
-
-@app.route("/mem", methods=["GET"])
-def mem():
-    container_total_mb = get_container_memory_limit_mb()
-
-    if resource is None:
-        return jsonify({"status": "unavailable", "reason": "resource module not available on this platform"}), 200
-
-    try:
-        r = resource.getrusage(resource.RUSAGE_SELF)
-        ru = getattr(r, "ru_maxrss", 0)
-        # ru_maxrss typically in kilobytes on Linux
-        rss_bytes = int(ru) * 1024
-        rss_mb = _mb_from_bytes(rss_bytes)
-
-        rss_percent_of_container = round((rss_mb / container_total_mb) * 100, 2) if container_total_mb else 0.0
-
-        return jsonify(
-            {
-                "status": "ok",
-                "rss_mb": rss_mb,
-                "rss_readable": _readable_mb(rss_mb),
-                "container_total_mb": container_total_mb,
-                "rss_percent_of_container": rss_percent_of_container,
-            }
-        ), 200
-    except Exception as e:
-        return jsonify({"status": "error", "error": str(e)}), 500
-
-
-@app.route("/sysmem", methods=["GET"])
-def sysmem():
-    container_total_mb = get_container_memory_limit_mb()
-    meminfo_path = "/proc/meminfo"
-    if os.path.exists(meminfo_path):
-        try:
-            meminfo = {}
-            with open(meminfo_path, "r") as f:
-                for line in f:
-                    parts = line.split(":")
-                    if len(parts) < 2:
-                        continue
-                    key = parts[0].strip()
-                    val = parts[1].strip().split()[0]
-                    meminfo[key] = int(val)  # values in kB
-
-            total_kb = meminfo.get("MemTotal", 0)
-            avail_kb = meminfo.get("MemAvailable", meminfo.get("MemFree", 0))
-            used_kb = total_kb - avail_kb
-
-            total_mb = round(total_kb / 1024, 2)
-            available_mb = round(avail_kb / 1024, 2)
-            used_mb = round(used_kb / 1024, 2)
-            used_percent = round((used_mb / total_mb) * 100, 2) if total_mb else 0.0
-
-            used_percent_of_container = round((used_mb / container_total_mb) * 100, 2) if container_total_mb else 0.0
-
-            return jsonify(
-                {
-                    "status": "ok",
-                    "total_mb": total_mb,
-                    "available_mb": available_mb,
-                    "used_mb": used_mb,
-                    "total_readable": _readable_mb(total_mb),
-                    "available_readable": _readable_mb(available_mb),
-                    "used_readable": _readable_mb(used_mb),
-                    "used_percent": used_percent,
-                    "container_total_mb": container_total_mb,
-                    "used_percent_of_container": used_percent_of_container,
-                }
-            ), 200
-        except Exception as e:
-            return jsonify({"status": "error", "error": f"failed to read /proc/meminfo: {e}"}), 500
-
-    if psutil is not None:
-        try:
-            vm = psutil.virtual_memory()
-            total_mb = round(vm.total / (1024 * 1024), 2)
-            available_mb = round(vm.available / (1024 * 1024), 2)
-            used_mb = round((vm.total - vm.available) / (1024 * 1024), 2)
-            used_percent = round(vm.percent, 2)
-            used_percent_of_container = round((used_mb / container_total_mb) * 100, 2) if container_total_mb else 0.0
-
-            return jsonify(
-                {
-                    "status": "ok",
-                    "total_mb": total_mb,
-                    "available_mb": available_mb,
-                    "used_mb": used_mb,
-                    "total_readable": _readable_mb(total_mb),
-                    "available_readable": _readable_mb(available_mb),
-                    "used_readable": _readable_mb(used_mb),
-                    "used_percent": used_percent,
-                    "container_total_mb": container_total_mb,
-                    "used_percent_of_container": used_percent_of_container,
-                }
-            ), 200
-        except Exception as e:
-            return jsonify({"status": "error", "error": str(e)}), 500
-
-    return jsonify({"status": "unavailable", "reason": "platform-specific meminfo not available and psutil not installed"}), 200
 
 
 @app.route("/metrics", methods=["GET"])
