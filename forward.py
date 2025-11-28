@@ -342,10 +342,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 📋 **COMMANDS:**
 🔐 /login - Connect Telegram account
 🔓 /logout - Disconnect account
-📨 /forwadd [LABEL] [SOURCE] => [TARGET]
-🗑️ /foremove [LABEL] - Remove task
-📋 /fortasks - List tasks
-🆔 /getallid - Get chat IDs
+
+📨 **Forwarding Tasks:**
+• `/forwadd task1 123456789 => 987654321`
+• `/forwadd alerts -100123456 -> -100987654`
+• `/foremove task1` - Remove task
+• `/fortasks` - List your tasks
+
+🆔 **Utilities:**
+• `/getallid` - Get all your chat IDs
+
+💡 **Supported separators:** `=>` `->` `→`
 """
 
     keyboard = []
@@ -441,51 +448,62 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
 
     try:
         if state["step"] == "waiting_phone":
+            # Validate phone number format
+            if not text.startswith('+'):
+                await update.message.reply_text(
+                    "❌ **Invalid phone number format!**\n\n"
+                    "Please include the country code with a + sign.\n"
+                    "Example: `+1234567890`",
+                    parse_mode="Markdown",
+                )
+                return
+
             processing_msg = await update.message.reply_text(
                 "⏳ **Processing...**\n\n"
                 "Requesting verification code from Telegram...",
                 parse_mode="Markdown",
             )
 
-            result = await client.send_code_request(text)
-            state["phone"] = text
-            state["phone_code_hash"] = result.phone_code_hash
-            state["step"] = "waiting_code"
+            try:
+                result = await client.send_code_request(text)
+                state["phone"] = text
+                state["phone_code_hash"] = result.phone_code_hash
+                state["step"] = "waiting_code"
 
-            await processing_msg.edit_text(
-                "✅ **Code sent!**\n\n"
-                "🔑 **Enter the verification code in this format:**\n\n"
-                "`verify12345`\n\n"
-                "⚠️ Type 'verify' followed immediately by your code (no spaces, no brackets).\n"
-                "Example: If your code is 54321, type: `verify54321`",
-                parse_mode="Markdown",
-            )
-
-        elif state["step"] == "waiting_code":
-            if not text.startswith("verify"):
-                await update.message.reply_text(
-                    "❌ **Invalid format!**\n\n"
-                    "Please use this format:\n"
-                    "`verify12345`\n\n"
-                    "Type 'verify' followed immediately by your code.\n"
-                    "Example: If your code is 54321, type: `verify54321`",
+                await processing_msg.edit_text(
+                    "✅ **Code sent!**\n\n"
+                    "🔑 **Enter the verification code you received:**\n\n"
+                    "You can enter just the code numbers (no need for 'verify' prefix)\n"
+                    "Example: If your code is `12345`, just type: `12345`\n\n"
+                    "Or if you prefer the old format: `verify12345`",
+                    parse_mode="Markdown",
+                )
+            except Exception as e:
+                await processing_msg.edit_text(
+                    f"❌ **Error sending code:** {str(e)}\n\n"
+                    "Please check your phone number and try /login again.",
                     parse_mode="Markdown",
                 )
                 return
 
-            code = text[6:]
-
-            if not code or not code.isdigit():
+        elif state["step"] == "waiting_code":
+            # Handle both formats: just code or verifyCODE
+            code = text
+            if text.startswith("verify"):
+                code = text[6:]
+            
+            # Validate code
+            if not code or not code.isdigit() or len(code) < 4:
                 await update.message.reply_text(
-                    "❌ **Invalid code!**\n\n"
-                    "Please type 'verify' followed by your verification code.\n"
-                    "Example: `verify12345`",
+                    "❌ **Invalid verification code!**\n\n"
+                    "Please enter only the numbers from your Telegram verification code.\n"
+                    "Example: `12345`",
                     parse_mode="Markdown",
                 )
                 return
 
             verifying_msg = await update.message.reply_text(
-                "🔄 **Verifying...**\n\n" "Checking your verification code...",
+                "🔄 **Verifying code...**\n\n" "Please wait...",
                 parse_mode="Markdown",
             )
 
@@ -510,7 +528,7 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
                     f"👤 Name: {me.first_name}\n"
                     f"📱 Phone: {state['phone']}\n\n"
                     "You can now create forwarding tasks with:\n"
-                    "`/forwadd [LABEL] [SOURCE_ID] => [TARGET_ID]`",
+                    "`/forwadd task1 123456789 => 987654321`",
                     parse_mode="Markdown",
                 )
 
@@ -518,67 +536,86 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
                 state["step"] = "waiting_2fa"
                 await verifying_msg.edit_text(
                     "🔐 **2FA Password Required**\n\n"
-                    "**Enter your 2-step verification password in this format:**\n\n"
-                    "`passwordYourPassword123`\n\n"
-                    "⚠️ Type 'password' followed immediately by your 2FA password (no spaces, no brackets).\n"
-                    "Example: If your password is 'mypass123', type: `passwordmypass123`",
+                    "**Enter your 2-step verification password:**\n\n"
+                    "You can enter just your password (no need for 'password' prefix)\n"
+                    "Example: If your password is `mypass123`, just type: `mypass123`\n\n"
+                    "Or if you prefer the old format: `passwordmypass123`",
                     parse_mode="Markdown",
                 )
+            except Exception as e:
+                await verifying_msg.edit_text(
+                    f"❌ **Verification failed:** {str(e)}\n\n"
+                    "Please try /login again with a new code.",
+                    parse_mode="Markdown",
+                )
+                if user_id in login_states:
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
+                    del login_states[user_id]
 
         elif state["step"] == "waiting_2fa":
-            if not text.startswith("password"):
-                await update.message.reply_text(
-                    "❌ **Invalid format!**\n\n"
-                    "Please use this format:\n"
-                    "`passwordYourPassword123`\n\n"
-                    "Type 'password' followed immediately by your 2FA password.\n"
-                    "Example: If your password is 'mypass123', type: `passwordmypass123`",
-                    parse_mode="Markdown",
-                )
-                return
-
-            password = text[8:]
-
+            # Handle both formats: just password or passwordPASSWORD
+            password = text
+            if text.startswith("password"):
+                password = text[8:]
+            
             if not password:
                 await update.message.reply_text(
                     "❌ **No password provided!**\n\n"
-                    "Please type 'password' followed by your 2FA password.\n"
-                    "Example: `passwordmypass123`",
+                    "Please enter your 2FA password.",
                     parse_mode="Markdown",
                 )
                 return
 
             verifying_msg = await update.message.reply_text(
-                "🔄 **Verifying 2FA...**\n\n" "Checking your password...", parse_mode="Markdown"
+                "🔄 **Verifying 2FA password...**\n\n" "Please wait...", 
+                parse_mode="Markdown"
             )
 
-            await client.sign_in(password=password)
+            try:
+                await client.sign_in(password=password)
 
-            me = await client.get_me()
-            session_string = client.session.save()
+                me = await client.get_me()
+                session_string = client.session.save()
 
-            await db_call(db.save_user, user_id, state["phone"], me.first_name, session_string, True)
+                await db_call(db.save_user, user_id, state["phone"], me.first_name, session_string, True)
 
-            user_clients[user_id] = client
-            tasks_cache.setdefault(user_id, [])
-            target_entity_cache.setdefault(user_id, {})
-            user_last_activity[user_id] = time.time()
-            await start_forwarding_for_user(user_id)
+                user_clients[user_id] = client
+                tasks_cache.setdefault(user_id, [])
+                target_entity_cache.setdefault(user_id, {})
+                user_last_activity[user_id] = time.time()
+                await start_forwarding_for_user(user_id)
 
-            del login_states[user_id]
+                del login_states[user_id]
 
-            await verifying_msg.edit_text(
-                "✅ **Successfully connected!**\n\n"
-                f"👤 Name: {me.first_name}\n"
-                f"📱 Phone: {state['phone']}\n\n"
-                "You can now create forwarding tasks!",
-                parse_mode="Markdown",
-            )
+                await verifying_msg.edit_text(
+                    "✅ **Successfully connected!**\n\n"
+                    f"👤 Name: {me.first_name}\n"
+                    f"📱 Phone: {state['phone']}\n\n"
+                    "You can now create forwarding tasks!",
+                    parse_mode="Markdown",
+                )
+
+            except Exception as e:
+                await verifying_msg.edit_text(
+                    f"❌ **2FA verification failed:** {str(e)}\n\n"
+                    "Please check your password and try /login again.",
+                    parse_mode="Markdown",
+                )
+                if user_id in login_states:
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
+                    del login_states[user_id]
 
     except Exception as e:
         logger.exception("Error during login process for %s", user_id)
         await update.message.reply_text(
-            f"❌ **Error:** {str(e)}\n\n" "Please try /login again.",
+            f"❌ **Unexpected error:** {str(e)}\n\n" 
+            "Please try /login again.",
             parse_mode="Markdown",
         )
         if user_id in login_states:
@@ -587,7 +624,7 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
                 if c:
                     await c.disconnect()
             except Exception:
-                logger.exception("Error disconnecting client after failed login for %s", user_id)
+                pass
             del login_states[user_id]
 
 
@@ -687,61 +724,146 @@ async def forwadd_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = await db_call(db.get_user, user_id)
     if not user or not user["is_logged_in"]:
         await update.message.reply_text(
-            "❌ **You need to connect your account first!**\n\n" "Use /login to connect your Telegram account.", parse_mode="Markdown"
+            "❌ **You need to connect your account first!**\n\n" 
+            "Use /login to connect your Telegram account.", 
+            parse_mode="Markdown"
         )
         return
 
     text = update.message.text.strip()
+    
+    # Log the command for debugging
+    logger.info("User %s sent forwadd: %s", user_id, text)
 
     try:
-        parts = text.split(" ", 1)
-        if len(parts) < 2 or "=>" not in parts[1]:
+        # Remove command part and clean up
+        command_text = text.replace('/forwadd', '').strip()
+        if not command_text:
+            raise ValueError("Empty command")
+        
+        # Support multiple separator formats
+        separators = ['=>', '->', '→']
+        separator = None
+        for sep in separators:
+            if sep in command_text:
+                separator = sep
+                break
+        
+        if not separator:
+            raise ValueError("No valid separator found")
+        
+        # Split into label/sources and targets
+        parts = command_text.split(separator, 1)
+        if len(parts) != 2:
             raise ValueError("Invalid format")
+        
+        left_side = parts[0].strip()
+        right_side = parts[1].strip()
+        
+        if not left_side or not right_side:
+            raise ValueError("Missing label, sources, or targets")
+        
+        # Parse left side: label and source IDs
+        left_parts = left_side.split()
+        if len(left_parts) < 2:
+            raise ValueError("Need both label and at least one source ID")
+        
+        label = left_parts[0]
+        
+        # Validate label (no spaces, alphanumeric only)
+        if not label.replace('_', '').isalnum():
+            await update.message.reply_text(
+                "❌ **Invalid label!**\n\n"
+                "Label must contain only letters, numbers, and underscores.\n"
+                "Examples: `task1`, `my_task`, `forward123`",
+                parse_mode="Markdown",
+            )
+            return
+        
+        # Parse source IDs
+        source_ids = []
+        for src in left_parts[1:]:
+            try:
+                # Remove any commas or extra characters
+                clean_src = src.strip().replace(',', '')
+                source_ids.append(int(clean_src))
+            except ValueError:
+                await update.message.reply_text(
+                    f"❌ **Invalid source ID:** `{src}`\n\n"
+                    "Source IDs must be numbers only.",
+                    parse_mode="Markdown",
+                )
+                return
+        
+        # Parse target IDs
+        target_ids = []
+        for tgt in right_side.split():
+            try:
+                # Remove any commas or extra characters
+                clean_tgt = tgt.strip().replace(',', '')
+                target_ids.append(int(clean_tgt))
+            except ValueError:
+                await update.message.reply_text(
+                    f"❌ **Invalid target ID:** `{tgt}`\n\n"
+                    "Target IDs must be numbers only.",
+                    parse_mode="Markdown",
+                )
+                return
 
-        label_and_source, target_part = parts[1].split("=>")
-        label_parts = label_and_source.strip().split()
+        # Validate we have at least one source and one target
+        if not source_ids:
+            raise ValueError("No source IDs provided")
+        if not target_ids:
+            raise ValueError("No target IDs provided")
 
-        if len(label_parts) < 2:
-            raise ValueError("Invalid format")
-
-        label = label_parts[0]
-        source_ids = [int(x) for x in label_parts[1:]]
-        target_ids = [int(x.strip()) for x in target_part.split()]
+        # Log the parsed values for debugging
+        logger.info("User %s parsed - label: %s, sources: %s, targets: %s", 
+                   user_id, label, source_ids, target_ids)
 
         added = await db_call(db.add_forwarding_task, user_id, label, source_ids, target_ids)
         if added:
-            # Update in-memory cache immediately (hot path)
+            # Update in-memory cache
             tasks_cache.setdefault(user_id, [])
             tasks_cache[user_id].append(
                 {"id": None, "label": label, "source_ids": source_ids, "target_ids": target_ids, "is_active": 1}
             )
-            # schedule async resolve of target entities (background)
+            
+            # Schedule async resolve of target entities
             try:
                 asyncio.create_task(resolve_targets_for_user(user_id, target_ids))
             except Exception:
                 logger.exception("Failed to schedule resolve_targets_for_user task")
 
             await update.message.reply_text(
-                f"✅ **Task created: {label}**\n\n"
-                f"📥 Sources: {', '.join(map(str, source_ids))}\n"
-                f"📤 Targets: {', '.join(map(str, target_ids))}\n\n"
-                "Send number-only messages in the source chats to forward them!",
+                f"✅ **Task created successfully!**\n\n"
+                f"📝 **Label:** `{label}`\n"
+                f"📥 **Sources:** {', '.join(f'`{sid}`' for sid in source_ids)}\n"
+                f"📤 **Targets:** {', '.join(f'`{tid}`' for tid in target_ids)}\n\n"
+                "💡 **Now send number-only messages in the source chats to forward them!**",
                 parse_mode="Markdown",
             )
         else:
             await update.message.reply_text(
-                f"❌ **Task '{label}' already exists!**\n\n" "Use /foremove to delete it first.",
+                f"❌ **Task `{label}` already exists!**\n\n" 
+                "Use `/foremove {label}` to delete it first, then create again.",
                 parse_mode="Markdown",
             )
 
     except Exception as e:
-        logger.exception("Error in forwadd: %s", e)
+        logger.exception("Error in forwadd for user %s: %s", user_id, str(e))
         await update.message.reply_text(
             "❌ **Invalid format!**\n\n"
-            "**Usage:**\n"
-            "`/forwadd [LABEL] [SOURCE_ID] => [TARGET_ID]`\n\n"
-            "**Example:**\n"
-            "`/forwadd task1 123456789 => 987654321`",
+            "**Correct Usage:**\n"
+            "`/forwadd LABEL SOURCE_ID => TARGET_ID`\n\n"
+            "**Examples:**\n"
+            "• `/forwadd task1 123456789 => 987654321`\n"
+            "• `/forwadd my_task 123 456 -> 789 101`\n"
+            "• `/forwadd alerts -100123456 → -100987654`\n\n"
+            "**Supported separators:** `=>` `->` `→`\n\n"
+            "💡 **Tips:**\n"
+            "- Label can't contain spaces\n"
+            "- Use `/getallid` to find chat IDs\n"
+            "- Separate multiple IDs with spaces",
             parse_mode="Markdown",
         )
 
@@ -1285,12 +1407,12 @@ async def start_forwarding_for_user(user_id: int):
     ensure_handler_registered_for_user(user_id, client)
 
 
-# ---------- Optimized Session Restoration for 20 Users ----------
+# ---------- Enhanced Session Restoration for 20 Users ----------
 async def restore_sessions():
-    """Optimized session restoration with strict user limits"""
+    """Enhanced session restoration with better error handling"""
     logger.info("🔄 Restoring sessions for up to %d users...", MAX_CONCURRENT_USERS)
 
-    MAX_CONCURRENT_RESTORES = 3  # Further reduced for memory
+    MAX_CONCURRENT_RESTORES = 3
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_RESTORES)
 
     async def restore_single_session(user_id, session_data):
@@ -1303,36 +1425,49 @@ async def restore_sessions():
             if session_data:
                 try:
                     client = TelegramClient(StringSession(session_data), API_ID, API_HASH)
+                    
+                    # Set longer timeout for connection
+                    client.session.set_dc(4, '149.154.167.40', 443)
                     await client.connect()
-
+                    
+                    # Test if session is still valid
                     if await client.is_user_authorized():
-                        user_clients[user_id] = client
-                        target_entity_cache.setdefault(user_id, {})
-                        user_last_activity[user_id] = time.time()
-                        
-                        # Load limited tasks (max 10)
-                        user_tasks = await db_call(db.get_user_tasks_limited, user_id, MAX_CACHED_TASKS_PER_USER)
-                        tasks_cache[user_id] = user_tasks
-                        
-                        # Resolve limited targets (max 5 tasks initially)
-                        all_targets = []
-                        for task in user_tasks[:5]:
-                            all_targets.extend(task.get("target_ids", []))
-                        
-                        if all_targets:
-                            asyncio.create_task(resolve_targets_for_user(user_id, list(set(all_targets))[:15]))
-                        
-                        await start_forwarding_for_user(user_id)
-                        logger.info("✅ Restored session for user %s", user_id)
+                        try:
+                            me = await client.get_me()
+                            user_clients[user_id] = client
+                            target_entity_cache.setdefault(user_id, {})
+                            user_last_activity[user_id] = time.time()
+                            
+                            # Load limited tasks
+                            user_tasks = await db_call(db.get_user_tasks_limited, user_id, MAX_CACHED_TASKS_PER_USER)
+                            tasks_cache[user_id] = user_tasks
+                            
+                            # Resolve targets in background
+                            all_targets = []
+                            for task in user_tasks[:5]:
+                                all_targets.extend(task.get("target_ids", []))
+                            
+                            if all_targets:
+                                asyncio.create_task(resolve_targets_for_user(user_id, list(set(all_targets))[:15]))
+                            
+                            await start_forwarding_for_user(user_id)
+                            logger.info("✅ Restored session for user %s (%s)", user_id, me.first_name)
+                            
+                        except Exception as e:
+                            logger.error("❌ Error during session setup for user %s: %s", user_id, e)
+                            await client.disconnect()
+                            raise
                     else:
-                        await db_call(db.save_user, user_id, None, None, None, False)
                         logger.warning("⚠️ Session expired for user %s", user_id)
+                        await db_call(db.save_user, user_id, None, None, None, False)
+                        await client.disconnect()
+                        
                 except Exception as e:
-                    logger.exception("❌ Failed to restore session for user %s: %s", user_id, e)
+                    logger.error("❌ Failed to restore session for user %s: %s", user_id, e)
                     try:
                         await db_call(db.save_user, user_id, None, None, None, False)
                     except Exception:
-                        pass
+                        logger.exception("Error marking user %s as logged out", user_id)
 
     try:
         def _fetch_logged_in_users():
@@ -1349,20 +1484,27 @@ async def restore_sessions():
         users = await asyncio.to_thread(_fetch_logged_in_users)
         logger.info("📊 Found %d logged in user(s), restoring up to %d", len(users), MAX_CONCURRENT_USERS)
 
-        # Restore sessions with strict limits
+        # Restore sessions with better error handling
         restore_tasks = []
         for row in users:
             try:
                 user_id = row["user_id"] if hasattr(row, "keys") else row[0]
                 session_data = row["session_data"] if hasattr(row, "keys") else row[1]
                 restore_tasks.append(restore_single_session(user_id, session_data))
-            except Exception:
+            except Exception as e:
+                logger.error("Error preparing to restore user %s: %s", user_id, e)
                 continue
 
-        await asyncio.gather(*restore_tasks, return_exceptions=True)
+        # Wait for all restores with timeout
+        await asyncio.wait_for(
+            asyncio.gather(*restore_tasks, return_exceptions=True),
+            timeout=60.0
+        )
         
-    except Exception:
-        logger.exception("Error fetching logged-in users from DB")
+    except asyncio.TimeoutError:
+        logger.error("Session restoration timed out")
+    except Exception as e:
+        logger.exception("Error in session restoration: %s", e)
 
 
 # ---------- Enhanced Periodic Cleanup ----------
