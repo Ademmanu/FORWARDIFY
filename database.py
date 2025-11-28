@@ -428,4 +428,4 @@ class Database:
         try:
             self.close_connection()
         except Exception:
-            passll
+            pass
