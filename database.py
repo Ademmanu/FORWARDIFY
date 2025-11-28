@@ -9,14 +9,7 @@ import logging
 logger = logging.getLogger("database")
 
 """
-Improved SQLite helper for FORWARDIFY
-
-Key improvements:
-- Use thread-local persistent sqlite3.Connection to reduce repeated open/close overhead.
-- Use sqlite3.Row for clearer column access and return dict objects consistently.
-- Safe use of transactions and context managers.
-- Keep check_same_thread=False for concurrency.
-- Avoid sqlite3.PARSE_DECLTYPES to keep timestamp strings as-is.
+Enhanced SQLite helper for FORWARDIFY with optimized methods for 20 users
 """
 
 _conn_init_lock = threading.Lock()
@@ -248,6 +241,36 @@ class Database:
 
         return tasks
 
+    # ENHANCED METHOD: Add this for optimized task loading
+    def get_user_tasks_limited(self, user_id: int, limit: int = 10) -> List[Dict]:
+        """Get limited number of tasks for a user (max 10)"""
+        conn = self.get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, label, source_ids, target_ids, is_active, created_at
+            FROM forwarding_tasks
+            WHERE user_id = ? AND is_active = 1
+            ORDER BY created_at DESC
+            LIMIT ?
+        """,
+            (user_id, limit),
+        )
+
+        tasks = []
+        for row in cur.fetchall():
+            tasks.append(
+                {
+                    "id": row["id"],
+                    "label": row["label"],
+                    "source_ids": json.loads(row["source_ids"]) if row["source_ids"] else [],
+                    "target_ids": json.loads(row["target_ids"]) if row["target_ids"] else [],
+                    "is_active": row["is_active"],
+                    "created_at": row["created_at"],
+                }
+            )
+        return tasks
+
     def get_all_active_tasks(self) -> List[Dict]:
         conn = self.get_connection()
         cur = conn.cursor()
@@ -330,6 +353,15 @@ class Database:
                 }
             )
         return users
+
+    # ENHANCED METHOD: Add this for user monitoring
+    def get_active_users_count(self) -> int:
+        """Get count of active users for monitoring"""
+        conn = self.get_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) as count FROM users WHERE is_logged_in = 1")
+        row = cur.fetchone()
+        return row[0] if row else 0
 
     def get_db_status(self) -> Dict:
         """
