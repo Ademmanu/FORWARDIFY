@@ -9,13 +9,7 @@ import logging
 logger = logging.getLogger("database")
 
 """
-Optimized SQLite helper for FORWARDIFY - Memory efficient for 25+ users
-
-Key optimizations:
-- Lazy connection creation to reduce memory footprint
-- Aggressive connection closing when not in use
-- Smaller cache sizes and batch operations
-- Memory-efficient row fetching
+Optimized SQLite helper for FORWARDIFY - Fixed connection management
 """
 
 _conn_init_lock = threading.Lock()
@@ -52,7 +46,7 @@ class Database:
     def get_connection(self) -> sqlite3.Connection:
         """
         Return a thread-local connection (create if missing).
-        Optimized to close connections more aggressively to save memory.
+        FIXED: Don't close connections aggressively during normal operations
         """
         conn = getattr(_thread_local, "conn", None)
         if conn:
@@ -75,7 +69,7 @@ class Database:
             raise
 
     def close_connection(self):
-        """More aggressive connection closing to free memory"""
+        """Only close connection when absolutely necessary (shutdown/idle)"""
         conn = getattr(_thread_local, "conn", None)
         if conn:
             try:
@@ -131,7 +125,7 @@ class Database:
             )
 
             conn.commit()
-            self.close_connection()  # Close immediately after init
+            # REMOVED: self.close_connection() - Keep connection open for subsequent operations
 
     def get_user(self, user_id: int) -> Optional[Dict]:
         conn = self.get_connection()
@@ -151,8 +145,10 @@ class Database:
                 "created_at": row["created_at"],
                 "updated_at": row["updated_at"],
             }
-        finally:
-            self.close_connection()
+        except Exception as e:
+            logger.exception("Error in get_user for %s: %s", user_id, e)
+            raise
+        # REMOVED: finally: self.close_connection() - Keep connection open
 
     def save_user(
         self,
@@ -200,8 +196,10 @@ class Database:
                 )
 
             conn.commit()
-        finally:
-            self.close_connection()
+        except Exception as e:
+            logger.exception("Error in save_user for %s: %s", user_id, e)
+            raise
+        # REMOVED: finally: self.close_connection() - Keep connection open
 
     def add_forwarding_task(self, user_id: int, label: str, source_ids: List[int], target_ids: List[int]) -> bool:
         conn = self.get_connection()
@@ -219,8 +217,10 @@ class Database:
                 return True
             except sqlite3.IntegrityError:
                 return False
-        finally:
-            self.close_connection()
+        except Exception as e:
+            logger.exception("Error in add_forwarding_task for %s: %s", user_id, e)
+            raise
+        # REMOVED: finally: self.close_connection() - Keep connection open
 
     def remove_forwarding_task(self, user_id: int, label: str) -> bool:
         conn = self.get_connection()
@@ -230,8 +230,10 @@ class Database:
             deleted = cur.rowcount > 0
             conn.commit()
             return deleted
-        finally:
-            self.close_connection()
+        except Exception as e:
+            logger.exception("Error in remove_forwarding_task for %s: %s", user_id, e)
+            raise
+        # REMOVED: finally: self.close_connection() - Keep connection open
 
     def get_user_tasks(self, user_id: int) -> List[Dict]:
         conn = self.get_connection()
@@ -261,8 +263,10 @@ class Database:
                 )
 
             return tasks
-        finally:
-            self.close_connection()
+        except Exception as e:
+            logger.exception("Error in get_user_tasks for %s: %s", user_id, e)
+            raise
+        # REMOVED: finally: self.close_connection() - Keep connection open
 
     def get_all_active_tasks(self) -> List[Dict]:
         conn = self.get_connection()
@@ -287,8 +291,10 @@ class Database:
                     }
                 )
             return tasks
-        finally:
-            self.close_connection()
+        except Exception as e:
+            logger.exception("Error in get_all_active_tasks: %s", e)
+            raise
+        # REMOVED: finally: self.close_connection() - Keep connection open
 
     def is_user_allowed(self, user_id: int) -> bool:
         conn = self.get_connection()
@@ -296,8 +302,10 @@ class Database:
             cur = conn.cursor()
             cur.execute("SELECT user_id FROM allowed_users WHERE user_id = ?", (user_id,))
             return cur.fetchone() is not None
-        finally:
-            self.close_connection()
+        except Exception as e:
+            logger.exception("Error in is_user_allowed for %s: %s", user_id, e)
+            raise
+        # REMOVED: finally: self.close_connection() - Keep connection open
 
     def is_user_admin(self, user_id: int) -> bool:
         conn = self.get_connection()
@@ -306,8 +314,10 @@ class Database:
             cur.execute("SELECT is_admin FROM allowed_users WHERE user_id = ?", (user_id,))
             row = cur.fetchone()
             return row is not None and int(row["is_admin"]) == 1
-        finally:
-            self.close_connection()
+        except Exception as e:
+            logger.exception("Error in is_user_admin for %s: %s", user_id, e)
+            raise
+        # REMOVED: finally: self.close_connection() - Keep connection open
 
     def add_allowed_user(self, user_id: int, username: Optional[str] = None, is_admin: bool = False, added_by: Optional[int] = None) -> bool:
         conn = self.get_connection()
@@ -325,8 +335,10 @@ class Database:
                 return True
             except sqlite3.IntegrityError:
                 return False
-        finally:
-            self.close_connection()
+        except Exception as e:
+            logger.exception("Error in add_allowed_user for %s: %s", user_id, e)
+            raise
+        # REMOVED: finally: self.close_connection() - Keep connection open
 
     def remove_allowed_user(self, user_id: int) -> bool:
         conn = self.get_connection()
@@ -336,8 +348,10 @@ class Database:
             deleted = cur.rowcount > 0
             conn.commit()
             return deleted
-        finally:
-            self.close_connection()
+        except Exception as e:
+            logger.exception("Error in remove_allowed_user for %s: %s", user_id, e)
+            raise
+        # REMOVED: finally: self.close_connection() - Keep connection open
 
     def get_all_allowed_users(self) -> List[Dict]:
         conn = self.get_connection()
@@ -362,8 +376,10 @@ class Database:
                     }
                 )
             return users
-        finally:
-            self.close_connection()
+        except Exception as e:
+            logger.exception("Error in get_all_allowed_users: %s", e)
+            raise
+        # REMOVED: finally: self.close_connection() - Keep connection open
 
     def get_db_status(self) -> Dict:
         """
@@ -418,6 +434,7 @@ class Database:
                     except Exception:
                         status["counts"][table] = None
             finally:
+                # Only close connection for status check (not frequently called)
                 self.close_connection()
         except Exception:
             logger.exception("Error querying DB status")
