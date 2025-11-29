@@ -670,9 +670,15 @@ async def fortasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     message = update.message if update.message else update.callback_query.message
 
-    tasks = tasks_cache.get(user_id) or []
+    # Refresh tasks from database to ensure we have latest data
+    try:
+        user_tasks = await db_call(db.get_user_tasks, user_id)
+        tasks_cache[user_id] = user_tasks
+    except Exception as e:
+        logger.exception("Error refreshing tasks from DB for user %s", user_id)
+        user_tasks = tasks_cache.get(user_id) or []
 
-    if not tasks:
+    if not user_tasks:
         await message.reply_text(
             "📋 **No Active Tasks**\n\n" 
             "You don't have any forwarding tasks yet.\n\n" 
@@ -686,7 +692,7 @@ async def fortasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     task_list += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
 
     keyboard = []
-    for task in tasks:
+    for task in user_tasks:
         task_list += f"• **{task['label']}**\n"
         task_list += f"  📥 Sources: {', '.join(map(str, task['source_ids']))}\n"
         task_list += f"  📤 Targets: {', '.join(map(str, task['target_ids']))}\n\n"
@@ -694,7 +700,7 @@ async def fortasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard.append([InlineKeyboardButton(f"⚙️ {task['label']}", callback_data=f"manage_task_{task['id']}")])
 
     task_list += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-    task_list += f"Total: **{len(tasks)} task(s)**\n\n"
+    task_list += f"Total: **{len(user_tasks)} task(s)**\n\n"
     task_list += "💡 **Click a task below to manage it!**"
 
     if update.message:
@@ -735,7 +741,7 @@ async def manage_task_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 📊 **Current Settings:**
 {outgoing_emoji} Outgoing: {'On' if settings['outgoing_enabled'] else 'Off'}
-{forward_tag_emoji} Forward Tag: {'On' if settings['forward_tag_enabled'] else 'Off'}
+{forward_tag_emoji} Forward Tag: {'On' if settings['forward_tag_enabled'] else 'Off'}  
 {control_emoji} Control: {'On' if settings['control_enabled'] else 'Off'}
 
 💡 **Choose an option to configure:**
@@ -815,8 +821,8 @@ async def toggle_filter_handler(update: Update, context: ContextTypes.DEFAULT_TY
     await query.answer()
     
     parts = query.data.split('_')
-    task_id = int(parts[2])
-    filter_type = '_'.join(parts[3:])
+    task_id = int(parts[3])  # Fixed: was parts[2], now parts[3]
+    filter_type = '_'.join(parts[4:])  # Fixed: was parts[3:], now parts[4:]
     
     # Get current filter state
     filters = await db_call(db.get_task_filters, task_id)
@@ -824,6 +830,9 @@ async def toggle_filter_handler(update: Update, context: ContextTypes.DEFAULT_TY
     
     # Toggle the state
     await db_call(db.update_task_filter, task_id, filter_type, None, not current_state)
+    
+    # Show confirmation
+    await query.answer(f"✅ Filter {'enabled' if not current_state else 'disabled'}!")
     
     # Go back to filters menu
     await filters_handler(update, context)
@@ -835,10 +844,12 @@ async def set_prefix_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     
     task_id = int(query.data.split('_')[-1])
     context.user_data['prefix_task_id'] = task_id
+    context.user_data['prefix_message_id'] = query.message.message_id
     
     await query.message.edit_text(
         "🔤 **Please enter the prefix text:**\n\n"
-        "💡 *This will be added before each forwarded message*",
+        "💡 *This will be added before each forwarded message*\n\n"
+        "Type /cancel to cancel.",
         parse_mode="Markdown"
     )
     return PREFIX_SUFFIX
@@ -850,39 +861,68 @@ async def set_suffix_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     
     task_id = int(query.data.split('_')[-1])
     context.user_data['suffix_task_id'] = task_id
+    context.user_data['suffix_message_id'] = query.message.message_id
     
     await query.message.edit_text(
         "🔤 **Please enter the suffix text:**\n\n"
-        "💡 *This will be added after each forwarded message*",
+        "💡 *This will be added after each forwarded message*\n\n"
+        "Type /cancel to cancel.",
         parse_mode="Markdown"
     )
     return PREFIX_SUFFIX
 
 
 async def prefix_suffix_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
     text = update.message.text.strip()
     
     if 'prefix_task_id' in context.user_data:
         task_id = context.user_data['prefix_task_id']
+        message_id = context.user_data.get('prefix_message_id')
         await db_call(db.update_task_filter, task_id, "prefix", text, True)
+        
+        # Send confirmation message
         await update.message.reply_text(
-            f"✅ **Prefix set successfully!**\n\n"
-            f"🔤 Your prefix: `{text}`\n\n"
-            "💡 *Prefix will be added to all forwarded messages*",
+            f"✅ **Prefix added successfully!**\n\n"
+            f"🔤 **Your prefix:** `{text}`\n\n"
+            f"💡 *This will be added before each forwarded message*",
             parse_mode="Markdown"
         )
+        
+        # Go back to filters menu
+        if message_id:
+            try:
+                await context.bot.delete_message(chat_id=user_id, message_id=message_id)
+            except Exception:
+                pass
+        
         del context.user_data['prefix_task_id']
+        if 'prefix_message_id' in context.user_data:
+            del context.user_data['prefix_message_id']
     
     elif 'suffix_task_id' in context.user_data:
         task_id = context.user_data['suffix_task_id']
+        message_id = context.user_data.get('suffix_message_id')
         await db_call(db.update_task_filter, task_id, "suffix", text, True)
+        
+        # Send confirmation message
         await update.message.reply_text(
-            f"✅ **Suffix set successfully!**\n\n"
-            f"🔤 Your suffix: `{text}`\n\n"
-            "💡 *Suffix will be added to all forwarded messages*",
+            f"✅ **Suffix added successfully!**\n\n"
+            f"🔤 **Your suffix:** `{text}`\n\n"
+            f"💡 *This will be added after each forwarded message*",
             parse_mode="Markdown"
         )
+        
+        # Go back to filters menu
+        if message_id:
+            try:
+                await context.bot.delete_message(chat_id=user_id, message_id=message_id)
+            except Exception:
+                pass
+        
         del context.user_data['suffix_task_id']
+        if 'suffix_message_id' in context.user_data:
+            del context.user_data['suffix_message_id']
     
     return ConversationHandler.END
 
@@ -897,10 +937,14 @@ async def toggle_setting_handler(update: Update, context: ContextTypes.DEFAULT_T
     
     # Get current settings
     settings = await db_call(db.get_task_settings, task_id)
-    current_value = settings.get(setting_type, 1)
+    current_value = bool(settings.get(setting_type, 1))
     
     # Toggle the setting
     await db_call(db.update_task_setting, task_id, setting_type, not current_value)
+    
+    # Show confirmation
+    setting_name = setting_type.replace('_', ' ').title()
+    await query.answer(f"✅ {setting_name} {'enabled' if not current_value else 'disabled'}!")
     
     # Go back to task management
     await manage_task_handler(update, context)
@@ -920,12 +964,14 @@ async def delete_task_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     context.user_data['delete_task_id'] = task_id
     context.user_data['delete_task_name'] = task['label']
+    context.user_data['delete_message_id'] = query.message.message_id
     
     await query.message.edit_text(
         f"🗑️ **Delete Task: {task['label']}**\n\n"
         f"⚠️ **This action cannot be undone!**\n\n"
         f"📝 **Please type the task name to confirm deletion:**\n\n"
-        f"`{task['label']}`",
+        f"`{task['label']}`\n\n"
+        "Type /cancel to cancel.",
         parse_mode="Markdown"
     )
 
@@ -936,36 +982,57 @@ async def confirm_delete_handler(update: Update, context: ContextTypes.DEFAULT_T
     
     if 'delete_task_id' not in context.user_data:
         await update.message.reply_text("❌ No pending deletion!")
-        return
+        return ConversationHandler.END
     
     task_id = context.user_data['delete_task_id']
     task_name = context.user_data['delete_task_name']
+    message_id = context.user_data.get('delete_message_id')
     
     if text != task_name:
         await update.message.reply_text(
             f"❌ **Task name doesn't match!**\n\n"
             f"Expected: `{task_name}`\n"
             f"You entered: `{text}`\n\n"
-            "Please try again or cancel with /cancel",
+            "Please try again or type /cancel to cancel.",
             parse_mode="Markdown"
         )
-        return
+        return ConversationHandler.END
     
     # Delete the task
     task = await get_task_by_id(task_id)
     if task:
-        await db_call(db.remove_forwarding_task, user_id, task['label'])
-        # Update cache
-        if user_id in tasks_cache:
-            tasks_cache[user_id] = [t for t in tasks_cache[user_id] if t.get('id') != task_id]
+        deleted = await db_call(db.remove_forwarding_task, user_id, task['label'])
+        if deleted:
+            # Update cache
+            if user_id in tasks_cache:
+                tasks_cache[user_id] = [t for t in tasks_cache[user_id] if t.get('id') != task_id]
+            
+            # Delete the confirmation message if possible
+            if message_id:
+                try:
+                    await context.bot.delete_message(chat_id=user_id, message_id=message_id)
+                except Exception:
+                    pass
+            
+            # Send success confirmation
+            await update.message.reply_text(
+                f"✅ **Task '{task_name}' deleted successfully!**\n\n"
+                f"🗑️ *The task has been completely removed from your list.*",
+                parse_mode="Markdown"
+            )
+        else:
+            await update.message.reply_text(
+                f"❌ **Failed to delete task '{task_name}'!**\n\n"
+                "Please try again.",
+                parse_mode="Markdown"
+            )
     
-    del context.user_data['delete_task_id']
-    del context.user_data['delete_task_name']
+    # Clean up context
+    for key in ['delete_task_id', 'delete_task_name', 'delete_message_id']:
+        if key in context.user_data:
+            del context.user_data[key]
     
-    await update.message.reply_text(
-        f"✅ **Task '{task_name}' deleted successfully!**",
-        parse_mode="Markdown"
-    )
+    return ConversationHandler.END
 
 
 # Helper function to get task by ID
