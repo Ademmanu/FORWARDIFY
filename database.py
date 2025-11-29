@@ -152,7 +152,6 @@ class Database:
             )
 
             conn.commit()
-            # REMOVED: self.close_connection() - Keep connection open for subsequent operations
 
     def get_user(self, user_id: int) -> Optional[Dict]:
         conn = self.get_connection()
@@ -162,7 +161,6 @@ class Database:
             row = cur.fetchone()
             if not row:
                 return None
-            # sqlite3.Row -> dict
             return {
                 "user_id": row["user_id"],
                 "phone": row["phone"],
@@ -175,7 +173,6 @@ class Database:
         except Exception as e:
             logger.exception("Error in get_user for %s: %s", user_id, e)
             raise
-        # REMOVED: finally: self.close_connection() - Keep connection open
 
     def save_user(
         self,
@@ -226,7 +223,6 @@ class Database:
         except Exception as e:
             logger.exception("Error in save_user for %s: %s", user_id, e)
             raise
-        # REMOVED: finally: self.close_connection() - Keep connection open
 
     def add_forwarding_task(self, user_id: int, label: str, source_ids: List[int], target_ids: List[int]) -> Optional[int]:
         conn = self.get_connection()
@@ -243,7 +239,7 @@ class Database:
                 task_id = cur.lastrowid
                 # Initialize default settings
                 cur.execute(
-                    "INSERT INTO task_settings (task_id, outgoing_enabled, forward_tag_enabled, control_enabled) VALUES (?, 1, 1, 1)",
+                    "INSERT OR IGNORE INTO task_settings (task_id, outgoing_enabled, forward_tag_enabled, control_enabled) VALUES (?, 1, 1, 1)",
                     (task_id,)
                 )
                 conn.commit()
@@ -253,7 +249,6 @@ class Database:
         except Exception as e:
             logger.exception("Error in add_forwarding_task for %s: %s", user_id, e)
             raise
-        # REMOVED: finally: self.close_connection() - Keep connection open
 
     def remove_forwarding_task(self, user_id: int, label: str) -> bool:
         conn = self.get_connection()
@@ -266,7 +261,6 @@ class Database:
         except Exception as e:
             logger.exception("Error in remove_forwarding_task for %s: %s", user_id, e)
             raise
-        # REMOVED: finally: self.close_connection() - Keep connection open
 
     def get_user_tasks(self, user_id: int) -> List[Dict]:
         conn = self.get_connection()
@@ -299,7 +293,6 @@ class Database:
         except Exception as e:
             logger.exception("Error in get_user_tasks for %s: %s", user_id, e)
             raise
-        # REMOVED: finally: self.close_connection() - Keep connection open
 
     def get_all_active_tasks(self) -> List[Dict]:
         conn = self.get_connection()
@@ -327,7 +320,6 @@ class Database:
         except Exception as e:
             logger.exception("Error in get_all_active_tasks: %s", e)
             raise
-        # REMOVED: finally: self.close_connection() - Keep connection open
 
     def is_user_allowed(self, user_id: int) -> bool:
         conn = self.get_connection()
@@ -338,7 +330,6 @@ class Database:
         except Exception as e:
             logger.exception("Error in is_user_allowed for %s: %s", user_id, e)
             raise
-        # REMOVED: finally: self.close_connection() - Keep connection open
 
     def is_user_admin(self, user_id: int) -> bool:
         conn = self.get_connection()
@@ -350,7 +341,6 @@ class Database:
         except Exception as e:
             logger.exception("Error in is_user_admin for %s: %s", user_id, e)
             raise
-        # REMOVED: finally: self.close_connection() - Keep connection open
 
     def add_allowed_user(self, user_id: int, username: Optional[str] = None, is_admin: bool = False, added_by: Optional[int] = None) -> bool:
         conn = self.get_connection()
@@ -371,7 +361,6 @@ class Database:
         except Exception as e:
             logger.exception("Error in add_allowed_user for %s: %s", user_id, e)
             raise
-        # REMOVED: finally: self.close_connection() - Keep connection open
 
     def remove_allowed_user(self, user_id: int) -> bool:
         conn = self.get_connection()
@@ -384,7 +373,6 @@ class Database:
         except Exception as e:
             logger.exception("Error in remove_allowed_user for %s: %s", user_id, e)
             raise
-        # REMOVED: finally: self.close_connection() - Keep connection open
 
     def get_all_allowed_users(self) -> List[Dict]:
         conn = self.get_connection()
@@ -412,7 +400,6 @@ class Database:
         except Exception as e:
             logger.exception("Error in get_all_allowed_users: %s", e)
             raise
-        # REMOVED: finally: self.close_connection() - Keep connection open
 
     # New methods for task filters and settings
     def get_task_filters(self, task_id: int) -> List[Dict]:
@@ -425,7 +412,7 @@ class Database:
                 filters.append({
                     "filter_type": row["filter_type"],
                     "value": row["value"],
-                    "is_active": row["is_active"]
+                    "is_active": bool(row["is_active"])
                 })
             return filters
         except Exception as e:
@@ -465,13 +452,13 @@ class Database:
             row = cur.fetchone()
             if row:
                 return {
-                    "outgoing_enabled": row["outgoing_enabled"],
-                    "forward_tag_enabled": row["forward_tag_enabled"],
-                    "control_enabled": row["control_enabled"]
+                    "outgoing_enabled": bool(row["outgoing_enabled"]),
+                    "forward_tag_enabled": bool(row["forward_tag_enabled"]),
+                    "control_enabled": bool(row["control_enabled"])
                 }
             else:
                 # Return default settings
-                return {"outgoing_enabled": 1, "forward_tag_enabled": 1, "control_enabled": 1}
+                return {"outgoing_enabled": True, "forward_tag_enabled": True, "control_enabled": True}
         except Exception as e:
             logger.exception("Error in get_task_settings for %s: %s", task_id, e)
             raise
