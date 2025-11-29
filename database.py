@@ -262,6 +262,19 @@ class Database:
             logger.exception("Error in remove_forwarding_task for %s: %s", user_id, e)
             raise
 
+    def remove_forwarding_task_by_id(self, task_id: int) -> bool:
+        """Remove task by ID instead of label"""
+        conn = self.get_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM forwarding_tasks WHERE id = ?", (task_id,))
+            deleted = cur.rowcount > 0
+            conn.commit()
+            return deleted
+        except Exception as e:
+            logger.exception("Error in remove_forwarding_task_by_id for %s: %s", task_id, e)
+            raise
+
     def get_user_tasks(self, user_id: int) -> List[Dict]:
         conn = self.get_connection()
         try:
