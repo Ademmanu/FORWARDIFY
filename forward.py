@@ -81,7 +81,7 @@ target_entity_cache: Dict[int, Dict[int, object]] = {}  # user_id -> {target_id:
 handler_registered: Dict[int, Callable] = {}
 
 # Global send queue is created later on the running event loop (in post_init/start_send_workers)
-send_queue: Optional[asyncio.Queue[Tuple[int, TelegramClient, int, str]]] = None
+send_queue: Optional[asyncio.Queue] = None
 
 UNAUTHORIZED_MESSAGE = """🚫 **Access Denied!** 
 
@@ -154,7 +154,7 @@ async def check_authorization(update: Update, context: ContextTypes.DEFAULT_TYPE
     return True
 
 
-# ---------- Simple UI handlers (left mostly unchanged) ----------
+# ---------- Simple UI handlers ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
@@ -215,7 +215,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         keyboard.append([InlineKeyboardButton("🟢 Connect Account", callback_data="login")])
 
-    # safe: update.message is present for /start
     await update.message.reply_text(
         message_text,
         reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
@@ -223,13 +222,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# ---------- Fixed Button Handler ----------
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    await query.answer()
 
     if not await check_authorization(update, context):
         return
-
-    await query.answer()
 
     data = query.data
     logger.info(f"Button pressed: {data}")
@@ -274,7 +273,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("❌ Error processing request!")
 
 
-# ---------- Login/logout and task commands ----------
+# ---------- Login/logout commands ----------
 async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id if update.effective_user else update.callback_query.from_user.id
 
@@ -283,7 +282,7 @@ async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     message = update.message if update.message else update.callback_query.message
 
-    # OPTIMIZED: Check current user count
+    # Check current user count
     if len(user_clients) >= MAX_CONCURRENT_USERS:
         await message.reply_text(
             "❌ **Server at capacity!**\n\n"
@@ -555,7 +554,7 @@ async def handle_logout_confirmation(update: Update, context: ContextTypes.DEFAU
     return True
 
 
-# ---------- Updated forwadd command with conversation handler ----------
+# ---------- Task creation with conversation handler ----------
 async def forwadd_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
@@ -666,9 +665,9 @@ async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
     return ConversationHandler.END
 
 
-# ---------- Updated fortasks command with inline buttons ----------
+# ---------- Task management with instant updates ----------
 async def fortasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id if update.effective_user else update.callback_query.from_user.id
+    user_id = update.effective_user.id
 
     if not await check_authorization(update, context):
         return
@@ -731,7 +730,6 @@ async def fortasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-# ---------- Task management handlers ----------
 async def manage_task_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -783,6 +781,18 @@ async def filters_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     task_id = int(query.data.split('_')[1])
     
+    # Build filters menu with current state
+    message_text, keyboard = await build_filters_menu(task_id)
+    
+    await query.message.edit_text(
+        message_text,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def build_filters_menu(task_id: int):
+    """Build the filters menu with current state"""
     filters_list = await db_call(db.get_task_filters, task_id)
     filters_dict = {f["filter_type"]: f for f in filters_list}
     
@@ -823,11 +833,7 @@ async def filters_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🔙 Back to Task", callback_data=f"manage_task_{task_id}")]
     ]
     
-    await query.message.edit_text(
-        message_text,
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    return message_text, keyboard
 
 
 async def toggle_filter_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -847,10 +853,16 @@ async def toggle_filter_handler(update: Update, context: ContextTypes.DEFAULT_TY
     
     # Show confirmation
     status = "enabled" if not current_state else "disabled"
-    await query.answer(f"✅ {filter_type.replace('_', ' ').title()} {status}!")
+    filter_name = filter_type.replace('_', ' ').title()
+    await query.answer(f"✅ {filter_name} {status}!")
     
-    # Refresh the filters menu
-    await filters_handler(update, context)
+    # Update the current message instantly
+    message_text, keyboard = await build_filters_menu(task_id)
+    await query.message.edit_text(
+        message_text,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
 
 
 async def toggle_setting_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -877,6 +889,7 @@ async def toggle_setting_handler(update: Update, context: ContextTypes.DEFAULT_T
     await manage_task_handler(update, context)
 
 
+# ---------- Fixed Delete Functionality ----------
 async def delete_task_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -908,7 +921,7 @@ async def confirm_delete_handler(update: Update, context: ContextTypes.DEFAULT_T
     
     if 'delete_task_id' not in context.user_data:
         await update.message.reply_text("❌ No pending deletion!")
-        return ConversationHandler.END
+        return
     
     task_id = context.user_data['delete_task_id']
     task_name = context.user_data['delete_task_name']
@@ -921,38 +934,38 @@ async def confirm_delete_handler(update: Update, context: ContextTypes.DEFAULT_T
             "Please try again or type /cancel to cancel.",
             parse_mode="Markdown"
         )
-        return ConversationHandler.END
+        return
     
-    # Delete the task
-    task = await get_task_by_id(task_id)
-    if task:
-        deleted = await db_call(db.remove_forwarding_task, user_id, task['label'])
-        if deleted:
-            # Update cache
-            if user_id in tasks_cache:
-                tasks_cache[user_id] = [t for t in tasks_cache[user_id] if t.get('id') != task_id]
-            
-            # Send success confirmation
-            await update.message.reply_text(
-                f"✅ **Task '{task_name}' deleted successfully!**\n\n"
-                f"🗑️ *The task has been completely removed from your list.*",
-                parse_mode="Markdown"
-            )
-        else:
-            await update.message.reply_text(
-                f"❌ **Failed to delete task '{task_name}'!**\n\n"
-                "Please try again.",
-                parse_mode="Markdown"
-            )
+    # Delete the task using task_id instead of label
+    deleted = await db_call(db.remove_forwarding_task_by_id, task_id)
+    if deleted:
+        # Update cache
+        if user_id in tasks_cache:
+            tasks_cache[user_id] = [t for t in tasks_cache[user_id] if t.get('id') != task_id]
+        
+        # Send success confirmation
+        await update.message.reply_text(
+            f"✅ **Task '{task_name}' deleted successfully!**\n\n"
+            f"🗑️ *The task has been completely removed from your list.*",
+            parse_mode="Markdown"
+        )
+        
+        # Go back to tasks list
+        await fortasks_command(update, context)
+    else:
+        await update.message.reply_text(
+            f"❌ **Failed to delete task '{task_name}'!**\n\n"
+            "Please try again.",
+            parse_mode="Markdown"
+        )
     
     # Clean up context
     for key in ['delete_task_id', 'delete_task_name']:
         if key in context.user_data:
             del context.user_data[key]
-    
-    return ConversationHandler.END
 
 
+# ---------- Fixed Prefix/Suffix Functionality ----------
 async def set_prefix_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -986,6 +999,7 @@ async def set_suffix_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def prefix_suffix_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
     text = update.message.text.strip()
     
     if 'prefix_task_id' in context.user_data:
@@ -1000,6 +1014,14 @@ async def prefix_suffix_handler(update: Update, context: ContextTypes.DEFAULT_TY
             parse_mode="Markdown"
         )
         
+        # Go back to filters menu
+        message_text, keyboard = await build_filters_menu(task_id)
+        await update.message.reply_text(
+            message_text,
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        
         del context.user_data['prefix_task_id']
     
     elif 'suffix_task_id' in context.user_data:
@@ -1012,6 +1034,14 @@ async def prefix_suffix_handler(update: Update, context: ContextTypes.DEFAULT_TY
             f"🔤 **Your suffix:** `{text}`\n\n"
             f"💡 *This will be added after each forwarded message*",
             parse_mode="Markdown"
+        )
+        
+        # Go back to filters menu
+        message_text, keyboard = await build_filters_menu(task_id)
+        await update.message.reply_text(
+            message_text,
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard)
         )
         
         del context.user_data['suffix_task_id']
@@ -1294,7 +1324,7 @@ async def show_categorized_chats(user_id: int, chat_id: int, message_id: int, ca
     await context.bot.edit_message_text(chat_list, chat_id=chat_id, message_id=message_id, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
 
-# ---------- OPTIMIZED Forwarding core: handler registration, message handler, send worker, resolver ----------
+# ---------- Fixed Forwarding Core with Forward Tag Support ----------
 def ensure_handler_registered_for_user(user_id: int, client: TelegramClient):
     """Attach a NewMessage handler once per client/user to avoid duplicates and store the handler (so it can be removed)."""
     if handler_registered.get(user_id):
@@ -1302,7 +1332,6 @@ def ensure_handler_registered_for_user(user_id: int, client: TelegramClient):
 
     async def _hot_message_handler(event):
         try:
-            # OPTIMIZED: Batch process messages and run GC periodically
             await optimized_gc()
             
             message_text = getattr(event, "raw_text", None) or getattr(getattr(event, "message", None), "message", None)
@@ -1330,7 +1359,7 @@ def ensure_handler_registered_for_user(user_id: int, client: TelegramClient):
                 if chat_id in task.get("source_ids", []):
                     # Check task settings
                     settings = await db_call(db.get_task_settings, task['id'])
-                    if not settings['control_enabled']:
+                    if not settings['control_enabled'] or not settings['outgoing_enabled']:
                         continue
                     
                     # Get filters for this task
@@ -1350,7 +1379,7 @@ def ensure_handler_registered_for_user(user_id: int, client: TelegramClient):
                             if send_queue is None:
                                 logger.debug("Send queue not initialized; dropping forward job")
                                 continue
-                            await send_queue.put((user_id, event.client, int(target_id), final_text))
+                            await send_queue.put((user_id, event.client, int(target_id), final_text, settings['forward_tag_enabled']))
                         except asyncio.QueueFull:
                             logger.warning("Send queue full, dropping forward job for user=%s target=%s", user_id, target_id)
         except Exception:
@@ -1371,27 +1400,29 @@ async def apply_filters(message_text: str, filters: List[Dict]) -> bool:
     
     text = message_text.strip()
     
+    # Check if raw_text filter is active (allows all messages)
+    raw_text_active = any(f["filter_type"] == "raw_text" and f["is_active"] for f in filters)
+    if raw_text_active:
+        return True
+    
     for filter_obj in filters:
         filter_type = filter_obj['filter_type']
         
-        if filter_type == 'raw_text':
-            return True
-            
-        elif filter_type == 'numbers_only':
+        if filter_type == 'numbers_only' and filter_obj['is_active']:
             if text.isdigit():
                 return True
                 
-        elif filter_type == 'alphabets_only':
+        elif filter_type == 'alphabets_only' and filter_obj['is_active']:
             if text.isalpha():
                 return True
                 
-        elif filter_type == 'removed_numbers':
+        elif filter_type == 'removed_numbers' and filter_obj['is_active']:
             # Remove numbers and check if there's text left
             cleaned = re.sub(r'\d+', '', text)
             if cleaned.strip():
                 return True
                 
-        elif filter_type == 'removed_alphabets':
+        elif filter_type == 'removed_alphabets' and filter_obj['is_active']:
             # Remove alphabets and check if there's text left
             cleaned = re.sub(r'[a-zA-Z]+', '', text)
             if cleaned.strip():
@@ -1447,7 +1478,7 @@ async def resolve_targets_for_user(user_id: int, target_ids: List[int]):
 
 
 async def send_worker_loop(worker_id: int):
-    """OPTIMIZED Worker that consumes send_queue and performs client.send_message with backoff on FloodWait."""
+    """OPTIMIZED Worker that consumes send_queue and performs client.send_message with forward tag support."""
     logger.info("Send worker %d started", worker_id)
     global send_queue
     if send_queue is None:
@@ -1456,7 +1487,7 @@ async def send_worker_loop(worker_id: int):
 
     while True:
         try:
-            user_id, client, target_id, message_text = await send_queue.get()
+            user_id, client, target_id, message_text, forward_tag_enabled = await send_queue.get()
         except asyncio.CancelledError:
             # Worker cancelled during shutdown
             break
@@ -1476,14 +1507,19 @@ async def send_worker_loop(worker_id: int):
                 continue
 
             try:
-                await client.send_message(entity, message_text)
-                logger.debug("Forwarded message for user %s to %s", user_id, target_id)
+                if forward_tag_enabled:
+                    # Forward with tag
+                    await client.forward_messages(entity, int(target_id), message_text)
+                else:
+                    # Send without forward tag
+                    await client.send_message(entity, message_text)
+                logger.debug("Forwarded message for user %s to %s (forward_tag: %s)", user_id, target_id, forward_tag_enabled)
             except FloodWaitError as fwe:
                 wait = int(getattr(fwe, "seconds", 10))
                 logger.warning("FloodWait for %s seconds. Pausing worker %d", wait, worker_id)
                 await asyncio.sleep(wait + 1)
                 try:
-                    await send_queue.put((user_id, client, target_id, message_text))
+                    await send_queue.put((user_id, client, target_id, message_text, forward_tag_enabled))
                 except asyncio.QueueFull:
                     logger.warning("Send queue full while re-enqueueing after FloodWait; dropping message.")
             except Exception as e:
@@ -1528,7 +1564,7 @@ async def start_forwarding_for_user(user_id: int):
     ensure_handler_registered_for_user(user_id, client)
 
 
-# ---------- OPTIMIZED Session restore and initialization ----------
+# ---------- Session restore and initialization ----------
 async def restore_sessions():
     logger.info("🔄 Restoring sessions...")
 
@@ -1560,7 +1596,7 @@ async def restore_sessions():
 
     logger.info("📊 Found %d logged in user(s)", len(users))
 
-    # OPTIMIZED: Restore sessions in batches to avoid memory spikes
+    # Restore sessions in batches to avoid memory spikes
     batch_size = 5
     for i in range(0, len(users), batch_size):
         batch = users[i:i + batch_size]
@@ -1786,6 +1822,7 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel_conversation)],
     )
 
+    # Add all handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("login", login_command))
     application.add_handler(CommandHandler("logout", logout_command))
