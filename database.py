@@ -124,6 +124,33 @@ class Database:
             """
             )
 
+            # Add new tables for task filters and settings
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS task_filters (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id INTEGER,
+                    filter_type TEXT NOT NULL,
+                    value TEXT,
+                    is_active INTEGER DEFAULT 0,
+                    FOREIGN KEY (task_id) REFERENCES forwarding_tasks (id) ON DELETE CASCADE,
+                    UNIQUE(task_id, filter_type)
+                )
+            """
+            )
+
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS task_settings (
+                    task_id INTEGER PRIMARY KEY,
+                    outgoing_enabled INTEGER DEFAULT 1,
+                    forward_tag_enabled INTEGER DEFAULT 1,
+                    control_enabled INTEGER DEFAULT 1,
+                    FOREIGN KEY (task_id) REFERENCES forwarding_tasks (id) ON DELETE CASCADE
+                )
+            """
+            )
+
             conn.commit()
             # REMOVED: self.close_connection() - Keep connection open for subsequent operations
 
@@ -201,7 +228,7 @@ class Database:
             raise
         # REMOVED: finally: self.close_connection() - Keep connection open
 
-    def add_forwarding_task(self, user_id: int, label: str, source_ids: List[int], target_ids: List[int]) -> bool:
+    def add_forwarding_task(self, user_id: int, label: str, source_ids: List[int], target_ids: List[int]) -> Optional[int]:
         conn = self.get_connection()
         try:
             cur = conn.cursor()
@@ -210,13 +237,19 @@ class Database:
                     """
                     INSERT INTO forwarding_tasks (user_id, label, source_ids, target_ids)
                     VALUES (?, ?, ?, ?)
-                """,
+                    """,
                     (user_id, label, json.dumps(source_ids), json.dumps(target_ids)),
                 )
+                task_id = cur.lastrowid
+                # Initialize default settings
+                cur.execute(
+                    "INSERT INTO task_settings (task_id, outgoing_enabled, forward_tag_enabled, control_enabled) VALUES (?, 1, 1, 1)",
+                    (task_id,)
+                )
                 conn.commit()
-                return True
+                return task_id
             except sqlite3.IntegrityError:
-                return False
+                return None
         except Exception as e:
             logger.exception("Error in add_forwarding_task for %s: %s", user_id, e)
             raise
@@ -381,6 +414,93 @@ class Database:
             raise
         # REMOVED: finally: self.close_connection() - Keep connection open
 
+    # New methods for task filters and settings
+    def get_task_filters(self, task_id: int) -> List[Dict]:
+        conn = self.get_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT filter_type, value, is_active FROM task_filters WHERE task_id = ?", (task_id,))
+            filters = []
+            for row in cur.fetchall():
+                filters.append({
+                    "filter_type": row["filter_type"],
+                    "value": row["value"],
+                    "is_active": row["is_active"]
+                })
+            return filters
+        except Exception as e:
+            logger.exception("Error in get_task_filters for %s: %s", task_id, e)
+            raise
+
+    def update_task_filter(self, task_id: int, filter_type: str, value: Optional[str] = None, is_active: bool = False):
+        conn = self.get_connection()
+        try:
+            cur = conn.cursor()
+            if value is not None:
+                cur.execute(
+                    """
+                    INSERT OR REPLACE INTO task_filters (task_id, filter_type, value, is_active)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (task_id, filter_type, value, 1 if is_active else 0)
+                )
+            else:
+                cur.execute(
+                    """
+                    INSERT OR REPLACE INTO task_filters (task_id, filter_type, is_active)
+                    VALUES (?, ?, ?)
+                    """,
+                    (task_id, filter_type, 1 if is_active else 0)
+                )
+            conn.commit()
+        except Exception as e:
+            logger.exception("Error in update_task_filter for %s: %s", task_id, e)
+            raise
+
+    def get_task_settings(self, task_id: int) -> Dict:
+        conn = self.get_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT outgoing_enabled, forward_tag_enabled, control_enabled FROM task_settings WHERE task_id = ?", (task_id,))
+            row = cur.fetchone()
+            if row:
+                return {
+                    "outgoing_enabled": row["outgoing_enabled"],
+                    "forward_tag_enabled": row["forward_tag_enabled"],
+                    "control_enabled": row["control_enabled"]
+                }
+            else:
+                # Return default settings
+                return {"outgoing_enabled": 1, "forward_tag_enabled": 1, "control_enabled": 1}
+        except Exception as e:
+            logger.exception("Error in get_task_settings for %s: %s", task_id, e)
+            raise
+
+    def update_task_setting(self, task_id: int, setting: str, value: bool):
+        conn = self.get_connection()
+        try:
+            cur = conn.cursor()
+            # Check if settings exist
+            cur.execute("SELECT 1 FROM task_settings WHERE task_id = ?", (task_id,))
+            if not cur.fetchone():
+                # Insert default settings
+                cur.execute(
+                    "INSERT INTO task_settings (task_id, outgoing_enabled, forward_tag_enabled, control_enabled) VALUES (?, 1, 1, 1)",
+                    (task_id,)
+                )
+            
+            if setting == "outgoing_enabled":
+                cur.execute("UPDATE task_settings SET outgoing_enabled = ? WHERE task_id = ?", (1 if value else 0, task_id))
+            elif setting == "forward_tag_enabled":
+                cur.execute("UPDATE task_settings SET forward_tag_enabled = ? WHERE task_id = ?", (1 if value else 0, task_id))
+            elif setting == "control_enabled":
+                cur.execute("UPDATE task_settings SET control_enabled = ? WHERE task_id = ?", (1 if value else 0, task_id))
+            
+            conn.commit()
+        except Exception as e:
+            logger.exception("Error in update_task_setting for %s: %s", task_id, e)
+            raise
+
     def get_db_status(self) -> Dict:
         """
         Return a small health/status snapshot for the DB:
@@ -419,7 +539,7 @@ class Database:
                     # ignore if PRAGMA unsupported
                     status["user_version"] = None
 
-                for table in ("users", "forwarding_tasks", "allowed_users"):
+                for table in ("users", "forwarding_tasks", "allowed_users", "task_filters", "task_settings"):
                     try:
                         cur.execute(f"SELECT COUNT(1) as c FROM {table}")
                         crow = cur.fetchone()
