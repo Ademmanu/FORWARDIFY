@@ -231,42 +231,47 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await query.answer()
 
-    if query.data == "login":
-        await query.message.delete()
-        await login_command(update, context)
-    elif query.data == "logout":
-        await query.message.delete()
-        await logout_command(update, context)
-    elif query.data == "show_tasks":
-        await query.message.delete()
-        await fortasks_command(update, context)
-    elif query.data.startswith("manage_task_"):
-        await manage_task_handler(update, context)
-    elif query.data.startswith("filters_"):
-        await filters_handler(update, context)
-    elif query.data.startswith("toggle_filter_"):
-        await toggle_filter_handler(update, context)
-    elif query.data.startswith("toggle_outgoing_"):
-        await toggle_setting_handler(update, context)
-    elif query.data.startswith("toggle_forward_tag_"):
-        await toggle_setting_handler(update, context)
-    elif query.data.startswith("toggle_control_"):
-        await toggle_setting_handler(update, context)
-    elif query.data.startswith("delete_task_"):
-        await delete_task_handler(update, context)
-    elif query.data.startswith("set_prefix_"):
-        await set_prefix_handler(update, context)
-    elif query.data.startswith("set_suffix_"):
-        await set_suffix_handler(update, context)
-    elif query.data.startswith("chatids_"):
-        user_id = query.from_user.id
-        if query.data == "chatids_back":
-            await show_chat_categories(user_id, query.message.chat.id, query.message.message_id, context)
+    data = query.data
+    logger.info(f"Button pressed: {data}")
+
+    try:
+        if data == "login":
+            await query.message.delete()
+            await login_command(update, context)
+        elif data == "logout":
+            await query.message.delete()
+            await logout_command(update, context)
+        elif data == "show_tasks":
+            await query.message.delete()
+            await fortasks_command(update, context)
+        elif data.startswith("manage_task_"):
+            await manage_task_handler(update, context)
+        elif data.startswith("filters_"):
+            await filters_handler(update, context)
+        elif data.startswith("filter_"):
+            await toggle_filter_handler(update, context)
+        elif data.startswith("setting_"):
+            await toggle_setting_handler(update, context)
+        elif data.startswith("delete_"):
+            await delete_task_handler(update, context)
+        elif data.startswith("prefix_"):
+            await set_prefix_handler(update, context)
+        elif data.startswith("suffix_"):
+            await set_suffix_handler(update, context)
+        elif data.startswith("chatids_"):
+            user_id = query.from_user.id
+            if data == "chatids_back":
+                await show_chat_categories(user_id, query.message.chat.id, query.message.message_id, context)
+            else:
+                parts = data.split("_")
+                category = parts[1]
+                page = int(parts[2])
+                await show_categorized_chats(user_id, query.message.chat.id, query.message.message_id, category, page, context)
         else:
-            parts = query.data.split("_")
-            category = parts[1]
-            page = int(parts[2])
-            await show_categorized_chats(user_id, query.message.chat.id, query.message.message_id, category, page, context)
+            await query.answer("❌ Unknown button action!")
+    except Exception as e:
+        logger.exception(f"Error in button handler for data {data}: {e}")
+        await query.answer("❌ Error processing request!")
 
 
 # ---------- Login/logout and task commands ----------
@@ -670,7 +675,7 @@ async def fortasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     message = update.message if update.message else update.callback_query.message
 
-    # Refresh tasks from database to ensure we have latest data
+    # Refresh tasks from database
     try:
         user_tasks = await db_call(db.get_user_tasks, user_id)
         tasks_cache[user_id] = user_tasks
@@ -679,13 +684,22 @@ async def fortasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_tasks = tasks_cache.get(user_id) or []
 
     if not user_tasks:
-        await message.reply_text(
-            "📋 **No Active Tasks**\n\n" 
-            "You don't have any forwarding tasks yet.\n\n" 
-            "Create one with:\n" 
-            "`/forwadd`",
-            parse_mode="Markdown",
-        )
+        if update.message:
+            await update.message.reply_text(
+                "📋 **No Active Tasks**\n\n" 
+                "You don't have any forwarding tasks yet.\n\n" 
+                "Create one with:\n" 
+                "`/forwadd`",
+                parse_mode="Markdown",
+            )
+        else:
+            await update.callback_query.message.edit_text(
+                "📋 **No Active Tasks**\n\n" 
+                "You don't have any forwarding tasks yet.\n\n" 
+                "Create one with:\n" 
+                "`/forwadd`",
+                parse_mode="Markdown",
+            )
         return
 
     task_list = "📋 **Your Forwarding Tasks**\n\n"
@@ -722,7 +736,7 @@ async def manage_task_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     query = update.callback_query
     await query.answer()
     
-    task_id = int(query.data.split('_')[-1])
+    task_id = int(query.data.split('_')[2])
     
     # Get task details
     task = await get_task_by_id(task_id)
@@ -749,10 +763,10 @@ async def manage_task_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     keyboard = [
         [InlineKeyboardButton("🔍 Filters", callback_data=f"filters_{task_id}")],
-        [InlineKeyboardButton(f"{outgoing_emoji} Outgoing", callback_data=f"toggle_outgoing_{task_id}")],
-        [InlineKeyboardButton(f"{forward_tag_emoji} Forward Tag", callback_data=f"toggle_forward_tag_{task_id}")],
-        [InlineKeyboardButton(f"{control_emoji} Control", callback_data=f"toggle_control_{task_id}")],
-        [InlineKeyboardButton("🗑️ Delete", callback_data=f"delete_task_{task_id}")],
+        [InlineKeyboardButton(f"{outgoing_emoji} Outgoing", callback_data=f"setting_outgoing_{task_id}")],
+        [InlineKeyboardButton(f"{forward_tag_emoji} Forward Tag", callback_data=f"setting_forward_tag_{task_id}")],
+        [InlineKeyboardButton(f"{control_emoji} Control", callback_data=f"setting_control_{task_id}")],
+        [InlineKeyboardButton("🗑️ Delete", callback_data=f"delete_{task_id}")],
         [InlineKeyboardButton("🔙 Back to Tasks", callback_data="show_tasks")]
     ]
     
@@ -767,7 +781,7 @@ async def filters_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     
-    task_id = int(query.data.split('_')[-1])
+    task_id = int(query.data.split('_')[1])
     
     filters_list = await db_call(db.get_task_filters, task_id)
     filters_dict = {f["filter_type"]: f for f in filters_list}
@@ -799,13 +813,13 @@ async def filters_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 """
     
     keyboard = [
-        [InlineKeyboardButton(f"{raw_emoji} Raw Text", callback_data=f"toggle_filter_{task_id}_raw_text")],
-        [InlineKeyboardButton(f"{numbers_emoji} Numbers Only", callback_data=f"toggle_filter_{task_id}_numbers_only")],
-        [InlineKeyboardButton(f"{alphabets_emoji} Alphabets Only", callback_data=f"toggle_filter_{task_id}_alphabets_only")],
-        [InlineKeyboardButton(f"{removed_numbers_emoji} Removed Numbers", callback_data=f"toggle_filter_{task_id}_removed_numbers")],
-        [InlineKeyboardButton(f"{removed_alphabets_emoji} Removed Alphabets", callback_data=f"toggle_filter_{task_id}_removed_alphabets")],
-        [InlineKeyboardButton(f"{prefix_emoji} Add Prefix", callback_data=f"set_prefix_{task_id}")],
-        [InlineKeyboardButton(f"{suffix_emoji} Add Suffix", callback_data=f"set_suffix_{task_id}")],
+        [InlineKeyboardButton(f"{raw_emoji} Raw Text", callback_data=f"filter_raw_text_{task_id}")],
+        [InlineKeyboardButton(f"{numbers_emoji} Numbers Only", callback_data=f"filter_numbers_only_{task_id}")],
+        [InlineKeyboardButton(f"{alphabets_emoji} Alphabets Only", callback_data=f"filter_alphabets_only_{task_id}")],
+        [InlineKeyboardButton(f"{removed_numbers_emoji} Removed Numbers", callback_data=f"filter_removed_numbers_{task_id}")],
+        [InlineKeyboardButton(f"{removed_alphabets_emoji} Removed Alphabets", callback_data=f"filter_removed_alphabets_{task_id}")],
+        [InlineKeyboardButton(f"{prefix_emoji} Add Prefix", callback_data=f"prefix_{task_id}")],
+        [InlineKeyboardButton(f"{suffix_emoji} Add Suffix", callback_data=f"suffix_{task_id}")],
         [InlineKeyboardButton("🔙 Back to Task", callback_data=f"manage_task_{task_id}")]
     ]
     
@@ -821,8 +835,8 @@ async def toggle_filter_handler(update: Update, context: ContextTypes.DEFAULT_TY
     await query.answer()
     
     parts = query.data.split('_')
-    task_id = int(parts[3])  # Fixed: was parts[2], now parts[3]
-    filter_type = '_'.join(parts[4:])  # Fixed: was parts[3:], now parts[4:]
+    filter_type = parts[1] + "_" + parts[2]  # e.g., "raw_text", "numbers_only"
+    task_id = int(parts[3])
     
     # Get current filter state
     filters = await db_call(db.get_task_filters, task_id)
@@ -832,99 +846,11 @@ async def toggle_filter_handler(update: Update, context: ContextTypes.DEFAULT_TY
     await db_call(db.update_task_filter, task_id, filter_type, None, not current_state)
     
     # Show confirmation
-    await query.answer(f"✅ Filter {'enabled' if not current_state else 'disabled'}!")
+    status = "enabled" if not current_state else "disabled"
+    await query.answer(f"✅ {filter_type.replace('_', ' ').title()} {status}!")
     
-    # Go back to filters menu
+    # Refresh the filters menu
     await filters_handler(update, context)
-
-
-async def set_prefix_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    task_id = int(query.data.split('_')[-1])
-    context.user_data['prefix_task_id'] = task_id
-    context.user_data['prefix_message_id'] = query.message.message_id
-    
-    await query.message.edit_text(
-        "🔤 **Please enter the prefix text:**\n\n"
-        "💡 *This will be added before each forwarded message*\n\n"
-        "Type /cancel to cancel.",
-        parse_mode="Markdown"
-    )
-    return PREFIX_SUFFIX
-
-
-async def set_suffix_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    task_id = int(query.data.split('_')[-1])
-    context.user_data['suffix_task_id'] = task_id
-    context.user_data['suffix_message_id'] = query.message.message_id
-    
-    await query.message.edit_text(
-        "🔤 **Please enter the suffix text:**\n\n"
-        "💡 *This will be added after each forwarded message*\n\n"
-        "Type /cancel to cancel.",
-        parse_mode="Markdown"
-    )
-    return PREFIX_SUFFIX
-
-
-async def prefix_suffix_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    text = update.message.text.strip()
-    
-    if 'prefix_task_id' in context.user_data:
-        task_id = context.user_data['prefix_task_id']
-        message_id = context.user_data.get('prefix_message_id')
-        await db_call(db.update_task_filter, task_id, "prefix", text, True)
-        
-        # Send confirmation message
-        await update.message.reply_text(
-            f"✅ **Prefix added successfully!**\n\n"
-            f"🔤 **Your prefix:** `{text}`\n\n"
-            f"💡 *This will be added before each forwarded message*",
-            parse_mode="Markdown"
-        )
-        
-        # Go back to filters menu
-        if message_id:
-            try:
-                await context.bot.delete_message(chat_id=user_id, message_id=message_id)
-            except Exception:
-                pass
-        
-        del context.user_data['prefix_task_id']
-        if 'prefix_message_id' in context.user_data:
-            del context.user_data['prefix_message_id']
-    
-    elif 'suffix_task_id' in context.user_data:
-        task_id = context.user_data['suffix_task_id']
-        message_id = context.user_data.get('suffix_message_id')
-        await db_call(db.update_task_filter, task_id, "suffix", text, True)
-        
-        # Send confirmation message
-        await update.message.reply_text(
-            f"✅ **Suffix added successfully!**\n\n"
-            f"🔤 **Your suffix:** `{text}`\n\n"
-            f"💡 *This will be added after each forwarded message*",
-            parse_mode="Markdown"
-        )
-        
-        # Go back to filters menu
-        if message_id:
-            try:
-                await context.bot.delete_message(chat_id=user_id, message_id=message_id)
-            except Exception:
-                pass
-        
-        del context.user_data['suffix_task_id']
-        if 'suffix_message_id' in context.user_data:
-            del context.user_data['suffix_message_id']
-    
-    return ConversationHandler.END
 
 
 async def toggle_setting_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -932,21 +858,22 @@ async def toggle_setting_handler(update: Update, context: ContextTypes.DEFAULT_T
     await query.answer()
     
     parts = query.data.split('_')
-    task_id = int(parts[-1])
-    setting_type = '_'.join(parts[1:-1])
+    setting_type = parts[1]  # e.g., "outgoing", "forward_tag", "control"
+    task_id = int(parts[2])
     
     # Get current settings
     settings = await db_call(db.get_task_settings, task_id)
-    current_value = bool(settings.get(setting_type, 1))
+    current_value = settings.get(f"{setting_type}_enabled", True)
     
     # Toggle the setting
-    await db_call(db.update_task_setting, task_id, setting_type, not current_value)
+    await db_call(db.update_task_setting, task_id, f"{setting_type}_enabled", not current_value)
     
     # Show confirmation
     setting_name = setting_type.replace('_', ' ').title()
-    await query.answer(f"✅ {setting_name} {'enabled' if not current_value else 'disabled'}!")
+    status = "enabled" if not current_value else "disabled"
+    await query.answer(f"✅ {setting_name} {status}!")
     
-    # Go back to task management
+    # Refresh the task management menu
     await manage_task_handler(update, context)
 
 
@@ -954,7 +881,7 @@ async def delete_task_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     query = update.callback_query
     await query.answer()
     
-    task_id = int(query.data.split('_')[-1])
+    task_id = int(query.data.split('_')[1])
     
     # Get task details for confirmation
     task = await get_task_by_id(task_id)
@@ -964,7 +891,6 @@ async def delete_task_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     context.user_data['delete_task_id'] = task_id
     context.user_data['delete_task_name'] = task['label']
-    context.user_data['delete_message_id'] = query.message.message_id
     
     await query.message.edit_text(
         f"🗑️ **Delete Task: {task['label']}**\n\n"
@@ -986,7 +912,6 @@ async def confirm_delete_handler(update: Update, context: ContextTypes.DEFAULT_T
     
     task_id = context.user_data['delete_task_id']
     task_name = context.user_data['delete_task_name']
-    message_id = context.user_data.get('delete_message_id')
     
     if text != task_name:
         await update.message.reply_text(
@@ -1007,13 +932,6 @@ async def confirm_delete_handler(update: Update, context: ContextTypes.DEFAULT_T
             if user_id in tasks_cache:
                 tasks_cache[user_id] = [t for t in tasks_cache[user_id] if t.get('id') != task_id]
             
-            # Delete the confirmation message if possible
-            if message_id:
-                try:
-                    await context.bot.delete_message(chat_id=user_id, message_id=message_id)
-                except Exception:
-                    pass
-            
             # Send success confirmation
             await update.message.reply_text(
                 f"✅ **Task '{task_name}' deleted successfully!**\n\n"
@@ -1028,9 +946,75 @@ async def confirm_delete_handler(update: Update, context: ContextTypes.DEFAULT_T
             )
     
     # Clean up context
-    for key in ['delete_task_id', 'delete_task_name', 'delete_message_id']:
+    for key in ['delete_task_id', 'delete_task_name']:
         if key in context.user_data:
             del context.user_data[key]
+    
+    return ConversationHandler.END
+
+
+async def set_prefix_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    task_id = int(query.data.split('_')[1])
+    context.user_data['prefix_task_id'] = task_id
+    
+    await query.message.edit_text(
+        "🔤 **Please enter the prefix text:**\n\n"
+        "💡 *This will be added before each forwarded message*\n\n"
+        "Type /cancel to cancel.",
+        parse_mode="Markdown"
+    )
+    return PREFIX_SUFFIX
+
+
+async def set_suffix_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    task_id = int(query.data.split('_')[1])
+    context.user_data['suffix_task_id'] = task_id
+    
+    await query.message.edit_text(
+        "🔤 **Please enter the suffix text:**\n\n"
+        "💡 *This will be added after each forwarded message*\n\n"
+        "Type /cancel to cancel.",
+        parse_mode="Markdown"
+    )
+    return PREFIX_SUFFIX
+
+
+async def prefix_suffix_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    
+    if 'prefix_task_id' in context.user_data:
+        task_id = context.user_data['prefix_task_id']
+        await db_call(db.update_task_filter, task_id, "prefix", text, True)
+        
+        # Send confirmation message
+        await update.message.reply_text(
+            f"✅ **Prefix added successfully!**\n\n"
+            f"🔤 **Your prefix:** `{text}`\n\n"
+            f"💡 *This will be added before each forwarded message*",
+            parse_mode="Markdown"
+        )
+        
+        del context.user_data['prefix_task_id']
+    
+    elif 'suffix_task_id' in context.user_data:
+        task_id = context.user_data['suffix_task_id']
+        await db_call(db.update_task_filter, task_id, "suffix", text, True)
+        
+        # Send confirmation message
+        await update.message.reply_text(
+            f"✅ **Suffix added successfully!**\n\n"
+            f"🔤 **Your suffix:** `{text}`\n\n"
+            f"💡 *This will be added after each forwarded message*",
+            parse_mode="Markdown"
+        )
+        
+        del context.user_data['suffix_task_id']
     
     return ConversationHandler.END
 
