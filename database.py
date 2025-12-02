@@ -2,7 +2,7 @@ import sqlite3
 import json
 import threading
 from datetime import datetime
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 import os
 import logging
 
@@ -104,6 +104,7 @@ class Database:
                     label TEXT,
                     source_ids TEXT,
                     target_ids TEXT,
+                    filters TEXT,
                     is_active INTEGER DEFAULT 1,
                     created_at TEXT DEFAULT (datetime('now')),
                     FOREIGN KEY (user_id) REFERENCES users (user_id),
@@ -201,17 +202,34 @@ class Database:
             raise
         # REMOVED: finally: self.close_connection() - Keep connection open
 
-    def add_forwarding_task(self, user_id: int, label: str, source_ids: List[int], target_ids: List[int]) -> bool:
+    def add_forwarding_task(self, user_id: int, label: str, source_ids: List[int], target_ids: List[int], filters: Optional[Dict[str, Any]] = None) -> bool:
         conn = self.get_connection()
         try:
             cur = conn.cursor()
             try:
+                # Default filters if not provided
+                if filters is None:
+                    filters = {
+                        "filters": {
+                            "raw_text": False,
+                            "numbers_only": False,
+                            "alphabets_only": False,
+                            "removed_alphabetic": False,
+                            "removed_numeric": False,
+                            "prefix": "",
+                            "suffix": ""
+                        },
+                        "outgoing": True,
+                        "forward_tag": False,
+                        "control": True
+                    }
+                
                 cur.execute(
                     """
-                    INSERT INTO forwarding_tasks (user_id, label, source_ids, target_ids)
-                    VALUES (?, ?, ?, ?)
+                    INSERT INTO forwarding_tasks (user_id, label, source_ids, target_ids, filters)
+                    VALUES (?, ?, ?, ?, ?)
                 """,
-                    (user_id, label, json.dumps(source_ids), json.dumps(target_ids)),
+                    (user_id, label, json.dumps(source_ids), json.dumps(target_ids), json.dumps(filters)),
                 )
                 conn.commit()
                 return True
@@ -219,6 +237,27 @@ class Database:
                 return False
         except Exception as e:
             logger.exception("Error in add_forwarding_task for %s: %s", user_id, e)
+            raise
+        # REMOVED: finally: self.close_connection() - Keep connection open
+
+    def update_task_filters(self, user_id: int, label: str, filters: Dict[str, Any]) -> bool:
+        """Update filters for a specific task"""
+        conn = self.get_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                UPDATE forwarding_tasks 
+                SET filters = ?, updated_at = ?
+                WHERE user_id = ? AND label = ?
+                """,
+                (json.dumps(filters), datetime.now().isoformat(), user_id, label),
+            )
+            updated = cur.rowcount > 0
+            conn.commit()
+            return updated
+        except Exception as e:
+            logger.exception("Error in update_task_filters for %s, task %s: %s", user_id, label, e)
             raise
         # REMOVED: finally: self.close_connection() - Keep connection open
 
@@ -241,7 +280,7 @@ class Database:
             cur = conn.cursor()
             cur.execute(
                 """
-                SELECT id, label, source_ids, target_ids, is_active, created_at
+                SELECT id, label, source_ids, target_ids, filters, is_active, created_at
                 FROM forwarding_tasks
                 WHERE user_id = ? AND is_active = 1
                 ORDER BY created_at DESC
@@ -251,12 +290,18 @@ class Database:
 
             tasks = []
             for row in cur.fetchall():
+                try:
+                    filters_data = json.loads(row["filters"]) if row["filters"] else {}
+                except (json.JSONDecodeError, TypeError):
+                    filters_data = {}
+                    
                 tasks.append(
                     {
                         "id": row["id"],
                         "label": row["label"],
                         "source_ids": json.loads(row["source_ids"]) if row["source_ids"] else [],
                         "target_ids": json.loads(row["target_ids"]) if row["target_ids"] else [],
+                        "filters": filters_data,
                         "is_active": row["is_active"],
                         "created_at": row["created_at"],
                     }
@@ -274,13 +319,18 @@ class Database:
             cur = conn.cursor()
             cur.execute(
                 """
-                SELECT user_id, id, label, source_ids, target_ids
+                SELECT user_id, id, label, source_ids, target_ids, filters
                 FROM forwarding_tasks
                 WHERE is_active = 1
             """
             )
             tasks = []
             for row in cur.fetchall():
+                try:
+                    filters_data = json.loads(row["filters"]) if row["filters"] else {}
+                except (json.JSONDecodeError, TypeError):
+                    filters_data = {}
+                    
                 tasks.append(
                     {
                         "user_id": row["user_id"],
@@ -288,6 +338,7 @@ class Database:
                         "label": row["label"],
                         "source_ids": json.loads(row["source_ids"]) if row["source_ids"] else [],
                         "target_ids": json.loads(row["target_ids"]) if row["target_ids"] else [],
+                        "filters": filters_data,
                     }
                 )
             return tasks

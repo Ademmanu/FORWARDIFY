@@ -4,7 +4,8 @@ import asyncio
 import logging
 import functools
 import gc
-from typing import Dict, List, Optional, Tuple, Set, Callable
+import re
+from typing import Dict, List, Optional, Tuple, Set, Callable, Any
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.errors import SessionPasswordNeededError, FloodWaitError
@@ -69,6 +70,9 @@ user_clients: Dict[int, TelegramClient] = {}
 login_states: Dict[int, Dict] = {}
 logout_states: Dict[int, Dict] = {}
 
+# Task creation states
+task_creation_states: Dict[int, Dict[str, Any]] = {}  # user_id -> {step: str, name: str, source_ids: List[int], target_ids: List[int]}
+
 # OPTIMIZED: Hot-path caches with memory limits
 tasks_cache: Dict[int, List[Dict]] = {}  # user_id -> list of task dicts
 target_entity_cache: Dict[int, Dict[int, object]] = {}  # user_id -> {target_id: resolved_entity}
@@ -76,7 +80,7 @@ target_entity_cache: Dict[int, Dict[int, object]] = {}  # user_id -> {target_id:
 handler_registered: Dict[int, Callable] = {}
 
 # Global send queue is created later on the running event loop (in post_init/start_send_workers)
-send_queue: Optional[asyncio.Queue[Tuple[int, TelegramClient, int, str]]] = None
+send_queue: Optional[asyncio.Queue] = None
 
 UNAUTHORIZED_MESSAGE = """🚫 **Access Denied!** 
 
@@ -117,11 +121,120 @@ async def optimized_gc():
         _last_gc_run = current_time
 
 
+# ---------- Message filtering functions ----------
+def extract_words(text: str) -> List[str]:
+    """Extract words from text, preserving emojis and special characters"""
+    return re.findall(r'\S+', text)
+
+def is_numeric_word(word: str) -> bool:
+    """Check if word contains only digits (numeric)"""
+    return word.isdigit()
+
+def is_alphabetic_word(word: str) -> bool:
+    """Check if word contains only letters (alphabetic)"""
+    return word.isalpha()
+
+def contains_numeric(word: str) -> bool:
+    """Check if word contains any digits"""
+    return any(char.isdigit() for char in word)
+
+def contains_alphabetic(word: str) -> bool:
+    """Check if word contains any letters"""
+    return any(char.isalpha() for char in word)
+
+def contains_only_special(word: str) -> bool:
+    """Check if word contains only special characters (no letters or digits)"""
+    return not (contains_numeric(word) or contains_alphabetic(word))
+
+def apply_filters(message_text: str, task_filters: Dict) -> List[str]:
+    """Apply filters to message text and return list of messages to forward"""
+    if not message_text:
+        return []
+    
+    filters_enabled = task_filters.get('filters', {})
+    
+    # If raw text is enabled, forward everything with prefix/suffix
+    if filters_enabled.get('raw_text', False):
+        processed = message_text
+        if filters_enabled.get('prefix'):
+            processed = filters_enabled['prefix'] + processed
+        if filters_enabled.get('suffix'):
+            processed = processed + filters_enabled['suffix']
+        return [processed]
+    
+    messages_to_send = []
+    words = extract_words(message_text)
+    
+    # Process based on enabled filters
+    if filters_enabled.get('numbers_only', False):
+        numeric_words = [word for word in words if is_numeric_word(word)]
+        for word in numeric_words:
+            processed = word
+            if filters_enabled.get('prefix'):
+                processed = filters_enabled['prefix'] + processed
+            if filters_enabled.get('suffix'):
+                processed = processed + filters_enabled['suffix']
+            messages_to_send.append(processed)
+    
+    elif filters_enabled.get('alphabets_only', False):
+        alphabetic_words = [word for word in words if is_alphabetic_word(word)]
+        for word in alphabetic_words:
+            processed = word
+            if filters_enabled.get('prefix'):
+                processed = filters_enabled['prefix'] + processed
+            if filters_enabled.get('suffix'):
+                processed = processed + filters_enabled['suffix']
+            messages_to_send.append(processed)
+    
+    elif filters_enabled.get('removed_alphabetic', False):
+        non_numeric_words = []
+        for word in words:
+            if is_numeric_word(word):
+                continue
+            if contains_alphabetic(word) or contains_only_special(word):
+                non_numeric_words.append(word)
+        
+        for word in non_numeric_words:
+            processed = word
+            if filters_enabled.get('prefix'):
+                processed = filters_enabled['prefix'] + processed
+            if filters_enabled.get('suffix'):
+                processed = processed + filters_enabled['suffix']
+            messages_to_send.append(processed)
+    
+    elif filters_enabled.get('removed_numeric', False):
+        non_alphabetic_words = []
+        for word in words:
+            if is_alphabetic_word(word):
+                continue
+            if contains_numeric(word) or contains_only_special(word):
+                non_alphabetic_words.append(word)
+        
+        for word in non_alphabetic_words:
+            processed = word
+            if filters_enabled.get('prefix'):
+                processed = filters_enabled['prefix'] + processed
+            if filters_enabled.get('suffix'):
+                processed = processed + filters_enabled['suffix']
+            messages_to_send.append(processed)
+    
+    else:
+        # No specific filter enabled, forward all words with prefix/suffix
+        for word in words:
+            processed = word
+            if filters_enabled.get('prefix'):
+                processed = filters_enabled['prefix'] + processed
+            if filters_enabled.get('suffix'):
+                processed = processed + filters_enabled['suffix']
+            messages_to_send.append(processed)
+    
+    return messages_to_send
+
+
 # ---------- Authorization helpers ----------
 async def check_authorization(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     user_id = update.effective_user.id
 
-    # Allow if user present in DB allowed list OR configured via env lists (ALLOWED_USERS or OWNER_IDS)
     try:
         is_allowed_db = await db_call(db.is_user_allowed, user_id)
     except Exception:
@@ -149,7 +262,7 @@ async def check_authorization(update: Update, context: ContextTypes.DEFAULT_TYPE
     return True
 
 
-# ---------- Simple UI handlers (left mostly unchanged) ----------
+# ---------- Simple UI handlers ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
@@ -182,25 +295,23 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 📋 **COMMANDS:**
 
 🔐 **Account Management:**
-  • /login - Connect your Telegram account
-  • /logout - Disconnect your account
+  /login - Connect your Telegram account
+  /logout - Disconnect your account
 
 📨 **Forwarding Tasks:**
-  • /forwadd [LABEL] [SOURCE] => [TARGET]
-     Example: /forwadd task1 123456 => 789012
-  • /foremove [LABEL] - Remove a task
-  • /fortasks - List all your tasks
+  /forwadd - Create a new forwarding task
+  /fortasks - List all your tasks
 
 🆔 **Utilities:**
-  • /getallid - Get all your chat IDs
+  /getallid - Get all your chat IDs
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 ⚙️ **How it works:**
 1. Connect your account with /login
 2. Create a forwarding task
-3. Send ONLY NUMBERS in source chat
-4. Bot forwards to target (no "Forwarded from" tag!)
+3. Send messages in source chat
+4. Bot forwards to target with your chosen filters!
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
@@ -212,7 +323,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         keyboard.append([InlineKeyboardButton("🟢 Connect Account", callback_data="login")])
 
-    # safe: update.message is present for /start
     await update.message.reply_text(
         message_text,
         reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
@@ -246,9 +356,749 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             category = parts[1]
             page = int(parts[2])
             await show_categorized_chats(user_id, query.message.chat.id, query.message.message_id, category, page, context)
+    elif query.data.startswith("task_"):
+        await handle_task_menu(update, context)
+    elif query.data.startswith("filter_"):
+        await handle_filter_menu(update, context)
+    elif query.data.startswith("toggle_"):
+        await handle_toggle_action(update, context)
+    elif query.data.startswith("delete_"):
+        await handle_delete_action(update, context)
+    elif query.data.startswith("prefix_"):
+        await handle_prefix_suffix(update, context)
+    elif query.data.startswith("suffix_"):
+        await handle_prefix_suffix(update, context)
+    elif query.data.startswith("confirm_delete_"):
+        await handle_confirm_delete(update, context)
 
 
-# ---------- Login/logout and task commands ----------
+# ---------- Task creation flow ----------
+async def forwadd_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start the interactive task creation process"""
+    user_id = update.effective_user.id
+
+    if not await check_authorization(update, context):
+        return
+
+    user = await db_call(db.get_user, user_id)
+    if not user or not user["is_logged_in"]:
+        await update.message.reply_text(
+            "❌ **You need to connect your account first!**\n\nUse /login to connect your Telegram account.",
+            parse_mode="Markdown"
+        )
+        return
+
+    task_creation_states[user_id] = {
+        "step": "waiting_name",
+        "name": "",
+        "source_ids": [],
+        "target_ids": []
+    }
+
+    await update.message.reply_text(
+        "🎯 **Let's create a new forwarding task!**\n\n"
+        "📝 **Step 1 of 3:** Please enter a name for your task.\n\n"
+        "💡 *Example: My Forwarding Task*",
+        parse_mode="Markdown"
+    )
+
+
+async def handle_task_creation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle interactive task creation steps"""
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+
+    if user_id not in task_creation_states:
+        return
+
+    state = task_creation_states[user_id]
+
+    try:
+        if state["step"] == "waiting_name":
+            if not text:
+                await update.message.reply_text("❌ **Please enter a valid task name!**")
+                return
+
+            state["name"] = text
+            state["step"] = "waiting_source"
+
+            await update.message.reply_text(
+                f"✅ **Task name saved:** {text}\n\n"
+                "📥 **Step 2 of 3:** Please enter the source chat ID(s).\n\n"
+                "You can enter multiple IDs separated by spaces.\n"
+                "💡 *Use /getallid to find your chat IDs*\n\n"
+                "**Example:** `123456789 987654321`",
+                parse_mode="Markdown"
+            )
+
+        elif state["step"] == "waiting_source":
+            if not text:
+                await update.message.reply_text("❌ **Please enter at least one source ID!**")
+                return
+
+            try:
+                source_ids = [int(id_str.strip()) for id_str in text.split() if id_str.strip().lstrip('-').isdigit()]
+                if not source_ids:
+                    await update.message.reply_text("❌ **Please enter valid numeric IDs!**")
+                    return
+
+                state["source_ids"] = source_ids
+                state["step"] = "waiting_target"
+
+                await update.message.reply_text(
+                    f"✅ **Source IDs saved:** {', '.join(map(str, source_ids))}\n\n"
+                    "📤 **Step 3 of 3:** Please enter the target chat ID(s).\n\n"
+                    "You can enter multiple IDs separated by spaces.\n"
+                    "💡 *Use /getallid to find your chat IDs*\n\n"
+                    "**Example:** `111222333`",
+                    parse_mode="Markdown"
+                )
+
+            except ValueError:
+                await update.message.reply_text("❌ **Please enter valid numeric IDs only!**")
+
+        elif state["step"] == "waiting_target":
+            if not text:
+                await update.message.reply_text("❌ **Please enter at least one target ID!**")
+                return
+
+            try:
+                target_ids = [int(id_str.strip()) for id_str in text.split() if id_str.strip().lstrip('-').isdigit()]
+                if not target_ids:
+                    await update.message.reply_text("❌ **Please enter valid numeric IDs!**")
+                    return
+
+                state["target_ids"] = target_ids
+
+                task_filters = {
+                    "filters": {
+                        "raw_text": False,
+                        "numbers_only": False,
+                        "alphabets_only": False,
+                        "removed_alphabetic": False,
+                        "removed_numeric": False,
+                        "prefix": "",
+                        "suffix": ""
+                    },
+                    "outgoing": True,
+                    "forward_tag": False,
+                    "control": True
+                }
+
+                added = await db_call(db.add_forwarding_task, 
+                                     user_id, 
+                                     state["name"], 
+                                     state["source_ids"], 
+                                     state["target_ids"],
+                                     task_filters)
+
+                if added:
+                    tasks_cache.setdefault(user_id, [])
+                    tasks_cache[user_id].append({
+                        "id": None,
+                        "label": state["name"],
+                        "source_ids": state["source_ids"],
+                        "target_ids": state["target_ids"],
+                        "is_active": 1,
+                        "filters": task_filters
+                    })
+
+                    try:
+                        asyncio.create_task(resolve_targets_for_user(user_id, target_ids))
+                    except Exception:
+                        logger.exception("Failed to schedule resolve_targets_for_user task")
+
+                    await update.message.reply_text(
+                        f"🎉 **Task created successfully!**\n\n"
+                        f"📋 **Name:** {state['name']}\n"
+                        f"📥 **Sources:** {', '.join(map(str, state['source_ids']))}\n"
+                        f"📤 **Targets:** {', '.join(map(str, state['target_ids']))}\n\n"
+                        "✅ All filters are set to default:\n"
+                        "• Outgoing: ✅ On\n"
+                        "• Forward Tag: ❌ Off\n"
+                        "• Control: ✅ On\n\n"
+                        "Use /fortasks to manage your task!",
+                        parse_mode="Markdown"
+                    )
+
+                    del task_creation_states[user_id]
+
+                else:
+                    await update.message.reply_text(
+                        f"❌ **Task '{state['name']}' already exists!**\n\n"
+                        "Please choose a different name.",
+                        parse_mode="Markdown"
+                    )
+
+            except ValueError:
+                await update.message.reply_text("❌ **Please enter valid numeric IDs only!**")
+
+    except Exception as e:
+        logger.exception("Error in task creation for user %s: %s", user_id, e)
+        await update.message.reply_text(
+            f"❌ **Error creating task:** {str(e)}\n\n"
+            "Please try again with /forwadd",
+            parse_mode="Markdown"
+        )
+        if user_id in task_creation_states:
+            del task_creation_states[user_id]
+
+
+# ---------- Task Menu System ----------
+async def fortasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List all tasks with inline buttons"""
+    user_id = update.effective_user.id if update.effective_user else update.callback_query.from_user.id
+
+    if not await check_authorization(update, context):
+        return
+
+    message = update.message if update.message else update.callback_query.message
+    tasks = tasks_cache.get(user_id) or []
+
+    if not tasks:
+        await message.reply_text(
+            "📋 **No Active Tasks**\n\n"
+            "You don't have any forwarding tasks yet.\n\n"
+            "Create one with:\n"
+            "/forwadd",
+            parse_mode="Markdown"
+        )
+        return
+
+    task_list = "📋 **Your Forwarding Tasks**\n\n"
+    task_list += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    
+    keyboard = []
+    
+    for i, task in enumerate(tasks, 1):
+        task_list += f"{i}. **{task['label']}**\n"
+        task_list += f"   📥 Sources: {', '.join(map(str, task['source_ids']))}\n"
+        task_list += f"   📤 Targets: {', '.join(map(str, task['target_ids']))}\n\n"
+        
+        keyboard.append([InlineKeyboardButton(f"{i}. {task['label']}", callback_data=f"task_{task['label']}")])
+
+    task_list += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    task_list += f"Total: **{len(tasks)} task(s)**\n\n"
+    task_list += "💡 **Tap any task below to manage it!**"
+
+    await message.reply_text(
+        task_list,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+
+
+async def handle_task_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show task management menu"""
+    query = update.callback_query
+    user_id = query.from_user.id
+    task_label = query.data.replace("task_", "")
+    
+    user_tasks = tasks_cache.get(user_id, [])
+    task = None
+    for t in user_tasks:
+        if t["label"] == task_label:
+            task = t
+            break
+    
+    if not task:
+        await query.answer("Task not found!", show_alert=True)
+        return
+    
+    filters = task.get("filters", {})
+    
+    outgoing_emoji = "✅" if filters.get("outgoing", True) else "❌"
+    forward_tag_emoji = "✅" if filters.get("forward_tag", False) else "❌"
+    control_emoji = "✅" if filters.get("control", True) else "❌"
+    
+    message_text = f"🔧 **Task Management: {task_label}**\n\n"
+    message_text += f"📥 **Sources:** {', '.join(map(str, task['source_ids']))}\n"
+    message_text += f"📤 **Targets:** {', '.join(map(str, task['target_ids']))}\n\n"
+    message_text += "⚙️ **Settings:**\n"
+    message_text += f"{outgoing_emoji} Outgoing - Controls if outgoing messages are forwarded\n"
+    message_text += f"{forward_tag_emoji} Forward Tag - Shows/hides 'Forwarded from' tag\n"
+    message_text += f"{control_emoji} Control - Pauses/runs forwarding\n\n"
+    message_text += "💡 **Tap any option below to change it!**"
+    
+    keyboard = [
+        [InlineKeyboardButton("🔍 Filters", callback_data=f"filter_{task_label}")],
+        [
+            InlineKeyboardButton(f"{outgoing_emoji} Outgoing", callback_data=f"toggle_{task_label}_outgoing"),
+            InlineKeyboardButton(f"{forward_tag_emoji} Forward Tag", callback_data=f"toggle_{task_label}_forward_tag")
+        ],
+        [
+            InlineKeyboardButton(f"{control_emoji} Control", callback_data=f"toggle_{task_label}_control"),
+            InlineKeyboardButton("🗑️ Delete", callback_data=f"delete_{task_label}")
+        ],
+        [InlineKeyboardButton("🔙 Back to Tasks", callback_data="show_tasks")]
+    ]
+    
+    await query.edit_message_text(
+        message_text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+
+
+async def handle_filter_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show filter management menu"""
+    query = update.callback_query
+    user_id = query.from_user.id
+    task_label = query.data.replace("filter_", "")
+    
+    user_tasks = tasks_cache.get(user_id, [])
+    task = None
+    for t in user_tasks:
+        if t["label"] == task_label:
+            task = t
+            break
+    
+    if not task:
+        await query.answer("Task not found!", show_alert=True)
+        return
+    
+    filters = task.get("filters", {})
+    filter_settings = filters.get("filters", {})
+    
+    raw_text_emoji = "✅" if filter_settings.get("raw_text", False) else "❌"
+    numbers_only_emoji = "✅" if filter_settings.get("numbers_only", False) else "❌"
+    alphabets_only_emoji = "✅" if filter_settings.get("alphabets_only", False) else "❌"
+    removed_alphabetic_emoji = "✅" if filter_settings.get("removed_alphabetic", False) else "❌"
+    removed_numeric_emoji = "✅" if filter_settings.get("removed_numeric", False) else "❌"
+    
+    prefix = filter_settings.get("prefix", "")
+    suffix = filter_settings.get("suffix", "")
+    prefix_text = f"'{prefix}'" if prefix else "Not set"
+    suffix_text = f"'{suffix}'" if suffix else "Not set"
+    
+    message_text = f"🔍 **Filters for: {task_label}**\n\n"
+    message_text += "Apply filters to messages before forwarding:\n\n"
+    message_text += "📋 **Available Filters:**\n"
+    message_text += f"{raw_text_emoji} Raw text - Forward any text\n"
+    message_text += f"{numbers_only_emoji} Numbers only - Forward only numbers\n"
+    message_text += f"{alphabets_only_emoji} Alphabets only - Forward only letters\n"
+    message_text += f"{removed_alphabetic_emoji} Removed Alphabetic - Keep letters & special chars, remove numbers\n"
+    message_text += f"{removed_numeric_emoji} Removed Numeric - Keep numbers & special chars, remove letters\n"
+    message_text += f"📝 **Prefix:** {prefix_text}\n"
+    message_text += f"📝 **Suffix:** {suffix_text}\n\n"
+    message_text += "💡 **Multiple filters can be active at once!**"
+    
+    keyboard = [
+        [
+            InlineKeyboardButton(f"{raw_text_emoji} Raw text", callback_data=f"toggle_{task_label}_raw_text"),
+            InlineKeyboardButton(f"{numbers_only_emoji} Numbers only", callback_data=f"toggle_{task_label}_numbers_only")
+        ],
+        [
+            InlineKeyboardButton(f"{alphabets_only_emoji} Alphabets only", callback_data=f"toggle_{task_label}_alphabets_only"),
+            InlineKeyboardButton(f"{removed_alphabetic_emoji} Removed Alphabetic", callback_data=f"toggle_{task_label}_removed_alphabetic")
+        ],
+        [
+            InlineKeyboardButton(f"{removed_numeric_emoji} Removed Numeric", callback_data=f"toggle_{task_label}_removed_numeric"),
+            InlineKeyboardButton("📝 Prefix/Suffix", callback_data=f"toggle_{task_label}_prefix_suffix")
+        ],
+        [InlineKeyboardButton("🔙 Back to Task", callback_data=f"task_{task_label}")]
+    ]
+    
+    await query.edit_message_text(
+        message_text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+
+
+async def update_button_inline(query, task_label, toggle_type, new_state):
+    """Update button inline without refreshing entire message"""
+    keyboard = query.message.reply_markup.inline_keyboard
+    button_found = False
+    
+    # Determine new emoji based on new state
+    new_emoji = "✅" if new_state else "❌"
+    
+    # Update the specific button in the keyboard
+    for row in keyboard:
+        for i, button in enumerate(row):
+            if button.callback_data and button.callback_data.startswith(f"toggle_{task_label}_{toggle_type}"):
+                # Extract the text after the emoji (preserve the label)
+                current_text = button.text
+                # Find the first non-emoji character (skip the first character which is the emoji)
+                # Handle both single emoji and emoji+space
+                if current_text.startswith("✅ ") or current_text.startswith("❌ "):
+                    # Format is "✅ Label" or "❌ Label"
+                    text_without_emoji = current_text[2:]  # Skip emoji and space
+                    row[i] = InlineKeyboardButton(
+                        f"{new_emoji} {text_without_emoji}",
+                        callback_data=button.callback_data
+                    )
+                elif current_text.startswith("✅") or current_text.startswith("❌"):
+                    # Format is "✅Label" or "❌Label"
+                    text_without_emoji = current_text[1:]  # Skip just the emoji
+                    row[i] = InlineKeyboardButton(
+                        f"{new_emoji}{text_without_emoji}",
+                        callback_data=button.callback_data
+                    )
+                else:
+                    # Fallback: just replace the button text completely
+                    row[i] = InlineKeyboardButton(
+                        f"{new_emoji} {toggle_type.replace('_', ' ').title()}",
+                        callback_data=button.callback_data
+                    )
+                button_found = True
+                break
+        if button_found:
+            break
+    
+    if button_found:
+        # Update just the inline keyboard without changing message text
+        await query.edit_message_reply_markup(
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    else:
+        # If button not found, fall back to refreshing the entire menu
+        if toggle_type in ["outgoing", "forward_tag", "control"]:
+            await handle_task_menu(update, context)
+        else:
+            await handle_filter_menu(update, context)
+
+
+async def handle_toggle_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle toggle actions for filters and settings with instant button updates"""
+    query = update.callback_query
+    user_id = query.from_user.id
+    data_parts = query.data.replace("toggle_", "").split("_")
+    
+    if len(data_parts) < 2:
+        await query.answer("Invalid action!", show_alert=True)
+        return
+    
+    task_label = data_parts[0]
+    toggle_type = "_".join(data_parts[1:])
+    
+    user_tasks = tasks_cache.get(user_id, [])
+    task_index = -1
+    for i, t in enumerate(user_tasks):
+        if t["label"] == task_label:
+            task_index = i
+            break
+    
+    if task_index == -1:
+        await query.answer("Task not found!", show_alert=True)
+        return
+    
+    task = user_tasks[task_index]
+    filters = task.get("filters", {})
+    new_state = None
+    
+    # Determine which setting/filter is being toggled
+    if toggle_type == "outgoing":
+        new_state = not filters.get("outgoing", True)
+        filters["outgoing"] = new_state
+        status_text = "Outgoing messages"
+        
+    elif toggle_type == "forward_tag":
+        new_state = not filters.get("forward_tag", False)
+        filters["forward_tag"] = new_state
+        status_text = "Forward tag"
+        
+    elif toggle_type == "control":
+        new_state = not filters.get("control", True)
+        filters["control"] = new_state
+        status_text = "Forwarding control"
+        
+    elif toggle_type in ["raw_text", "numbers_only", "alphabets_only", "removed_alphabetic", "removed_numeric"]:
+        filter_settings = filters.get("filters", {})
+        new_state = not filter_settings.get(toggle_type, False)
+        filter_settings[toggle_type] = new_state
+        filters["filters"] = filter_settings
+        status_text = toggle_type.replace('_', ' ').title()
+        
+    elif toggle_type == "prefix_suffix":
+        await show_prefix_suffix_menu(query, task_label)
+        return
+    
+    elif toggle_type == "clear_prefix_suffix":
+        filter_settings = filters.get("filters", {})
+        filter_settings["prefix"] = ""
+        filter_settings["suffix"] = ""
+        filters["filters"] = filter_settings
+        new_state = False
+        task["filters"] = filters
+        tasks_cache[user_id][task_index] = task
+        
+        try:
+            asyncio.create_task(
+                db_call(db.update_task_filters, user_id, task_label, filters)
+            )
+        except Exception as e:
+            logger.exception("Error updating task filters in DB: %s", e)
+        
+        await query.answer("✅ Prefix and suffix cleared!")
+        await handle_filter_menu(update, context)
+        return
+    
+    else:
+        await query.answer(f"Unknown toggle type: {toggle_type}")
+        return
+    
+    # Update cache with new state
+    task["filters"] = filters
+    tasks_cache[user_id][task_index] = task
+    
+    # Update the button inline FIRST (before answering)
+    keyboard = query.message.reply_markup.inline_keyboard
+    button_found = False
+    new_emoji = "✅" if new_state else "❌"
+    
+    # Create a new keyboard with updated button
+    new_keyboard = []
+    for row in keyboard:
+        new_row = []
+        for button in row:
+            if button.callback_data == query.data:
+                # Update this button
+                current_text = button.text
+                # Extract the text after the emoji
+                if "✅ " in current_text:
+                    text_without_emoji = current_text.split("✅ ", 1)[1]
+                    new_text = f"{new_emoji} {text_without_emoji}"
+                elif "❌ " in current_text:
+                    text_without_emoji = current_text.split("❌ ", 1)[1]
+                    new_text = f"{new_emoji} {text_without_emoji}"
+                elif current_text.startswith("✅"):
+                    text_without_emoji = current_text[1:]
+                    new_text = f"{new_emoji}{text_without_emoji}"
+                elif current_text.startswith("❌"):
+                    text_without_emoji = current_text[1:]
+                    new_text = f"{new_emoji}{text_without_emoji}"
+                else:
+                    # Fallback - preserve the button text but change emoji
+                    new_text = f"{new_emoji} {current_text}"
+                
+                new_row.append(InlineKeyboardButton(new_text, callback_data=query.data))
+                button_found = True
+            else:
+                new_row.append(button)
+        new_keyboard.append(new_row)
+    
+    # Update the message inline if button was found
+    if button_found:
+        try:
+            # Update the button first
+            await query.edit_message_reply_markup(
+                reply_markup=InlineKeyboardMarkup(new_keyboard)
+            )
+            # Then show the notification
+            status_display = "✅ On" if new_state else "❌ Off"
+            await query.answer(f"{status_text}: {status_display}")
+        except Exception as e:
+            logger.exception("Error updating inline keyboard: %s", e)
+            # If update fails, at least show the notification
+            status_display = "✅ On" if new_state else "❌ Off"
+            await query.answer(f"{status_text}: {status_display}")
+            # Fall back to refreshing the entire menu
+            if toggle_type in ["outgoing", "forward_tag", "control"]:
+                await handle_task_menu(update, context)
+            else:
+                await handle_filter_menu(update, context)
+    else:
+        # If button not found, at least show notification
+        status_display = "✅ On" if new_state else "❌ Off"
+        await query.answer(f"{status_text}: {status_display}")
+        # Refresh the entire menu
+        if toggle_type in ["outgoing", "forward_tag", "control"]:
+            await handle_task_menu(update, context)
+        else:
+            await handle_filter_menu(update, context)
+    
+    # Update database in background
+    try:
+        asyncio.create_task(
+            db_call(db.update_task_filters, user_id, task_label, filters)
+        )
+    except Exception as e:
+        logger.exception("Error updating task filters in DB: %s", e)
+
+
+async def show_prefix_suffix_menu(query, task_label):
+    """Show menu for setting prefix/suffix"""
+    user_id = query.from_user.id
+    
+    user_tasks = tasks_cache.get(user_id, [])
+    task = None
+    for t in user_tasks:
+        if t["label"] == task_label:
+            task = t
+            break
+    
+    if not task:
+        await query.answer("Task not found!", show_alert=True)
+        return
+    
+    filters = task.get("filters", {})
+    filter_settings = filters.get("filters", {})
+    prefix = filter_settings.get("prefix", "")
+    suffix = filter_settings.get("suffix", "")
+    
+    message_text = f"🔤 **Prefix/Suffix Setup for: {task_label}**\n\n"
+    message_text += "Add custom text to messages:\n\n"
+    message_text += f"📝 **Current Prefix:** '{prefix}'\n"
+    message_text += f"📝 **Current Suffix:** '{suffix}'\n\n"
+    message_text += "💡 **Examples:**\n"
+    message_text += "• Prefix '🔔 ' adds a bell before each message\n"
+    message_text += "• Suffix ' ✅' adds a checkmark after\n"
+    message_text += "• Use any characters: emojis, signs, numbers, letters\n\n"
+    message_text += "**Tap an option below to set it!**"
+    
+    keyboard = [
+        [InlineKeyboardButton("➕ Set Prefix", callback_data=f"prefix_{task_label}_set")],
+        [InlineKeyboardButton("➕ Set Suffix", callback_data=f"suffix_{task_label}_set")],
+        [InlineKeyboardButton("🗑️ Clear Prefix/Suffix", callback_data=f"toggle_{task_label}_clear_prefix_suffix")],
+        [InlineKeyboardButton("🔙 Back to Filters", callback_data=f"filter_{task_label}")]
+    ]
+    
+    await query.edit_message_text(
+        message_text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+
+
+async def handle_prefix_suffix(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle prefix/suffix setup"""
+    query = update.callback_query
+    user_id = query.from_user.id
+    data_parts = query.data.split("_")
+    
+    if len(data_parts) < 3:
+        await query.answer("Invalid action!", show_alert=True)
+        return
+    
+    action_type = data_parts[0]
+    task_label = data_parts[1]
+    action = data_parts[2] if len(data_parts) > 2 else ""
+    
+    if action == "set":
+        context.user_data[f"waiting_{action_type}"] = task_label
+        await query.edit_message_text(
+            f"📝 **Enter the {action_type} text for task '{task_label}':**\n\n"
+            f"Type your {action_type} text now.\n"
+            f"💡 *You can use any characters: emojis 🔔, signs ⚠️, numbers 123, letters ABC*\n\n"
+            f"**Example:** If you want the {action_type} '🔔 ', type: 🔔 ",
+            parse_mode="Markdown"
+        )
+    else:
+        await query.answer(f"Action: {action_type} {action}")
+
+
+async def handle_prefix_suffix_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle prefix/suffix text input"""
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+    
+    waiting_prefix = context.user_data.get("waiting_prefix")
+    waiting_suffix = context.user_data.get("waiting_suffix")
+    
+    if waiting_prefix:
+        task_label = waiting_prefix
+        action_type = "prefix"
+        del context.user_data["waiting_prefix"]
+    elif waiting_suffix:
+        task_label = waiting_suffix
+        action_type = "suffix"
+        del context.user_data["waiting_suffix"]
+    else:
+        return
+    
+    user_tasks = tasks_cache.get(user_id, [])
+    task_index = -1
+    for i, t in enumerate(user_tasks):
+        if t["label"] == task_label:
+            task_index = i
+            break
+    
+    if task_index == -1:
+        await update.message.reply_text("❌ Task not found!")
+        return
+    
+    task = user_tasks[task_index]
+    filters = task.get("filters", {})
+    filter_settings = filters.get("filters", {})
+    
+    if action_type == "prefix":
+        filter_settings["prefix"] = text
+        confirmation = f"✅ **Prefix set to:** '{text}'"
+    else:
+        filter_settings["suffix"] = text
+        confirmation = f"✅ **Suffix set to:** '{text}'"
+    
+    filters["filters"] = filter_settings
+    task["filters"] = filters
+    tasks_cache[user_id][task_index] = task
+    
+    try:
+        asyncio.create_task(
+            db_call(db.update_task_filters, user_id, task_label, filters)
+        )
+    except Exception as e:
+        logger.exception("Error updating task filters in DB: %s", e)
+    
+    await update.message.reply_text(
+        f"{confirmation}\n\n"
+        f"Task: **{task_label}**\n\n"
+        "All messages will now include this text when forwarded!",
+        parse_mode="Markdown"
+    )
+
+
+async def handle_delete_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle task deletion"""
+    query = update.callback_query
+    user_id = query.from_user.id
+    task_label = query.data.replace("delete_", "")
+    
+    message_text = f"🗑️ **Delete Task: {task_label}**\n\n"
+    message_text += "⚠️ **Are you sure you want to delete this task?**\n\n"
+    message_text += "This action cannot be undone!\n"
+    message_text += "All forwarding will stop immediately."
+    
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ Yes, Delete", callback_data=f"confirm_delete_{task_label}"),
+            InlineKeyboardButton("❌ Cancel", callback_data=f"task_{task_label}")
+        ]
+    ]
+    
+    await query.edit_message_text(
+        message_text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+
+
+async def handle_confirm_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Confirm and execute task deletion"""
+    query = update.callback_query
+    user_id = query.from_user.id
+    task_label = query.data.replace("confirm_delete_", "")
+    
+    deleted = await db_call(db.remove_forwarding_task, user_id, task_label)
+    
+    if deleted:
+        if user_id in tasks_cache:
+            tasks_cache[user_id] = [t for t in tasks_cache[user_id] if t.get("label") != task_label]
+        
+        await query.edit_message_text(
+            f"✅ **Task '{task_label}' deleted successfully!**\n\n"
+            "All forwarding for this task has been stopped.",
+            parse_mode="Markdown"
+        )
+    else:
+        await query.edit_message_text(
+            f"❌ **Task '{task_label}' not found!**",
+            parse_mode="Markdown"
+        )
+
+
+# ---------- Login/logout commands ----------
 async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id if update.effective_user else update.callback_query.from_user.id
 
@@ -257,7 +1107,6 @@ async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     message = update.message if update.message else update.callback_query.message
 
-    # OPTIMIZED: Check current user count
     if len(user_clients) >= MAX_CONCURRENT_USERS:
         await message.reply_text(
             "❌ **Server at capacity!**\n\n"
@@ -266,15 +1115,49 @@ async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    user = await db_call(db.get_user, user_id)
+    if user and user.get("is_logged_in"):
+        await message.reply_text(
+            "✅ **You are already logged in!**\n\n"
+            f"📱 Phone: `{user['phone']}`\n"
+            f"👤 Name: `{user['name']}`\n\n"
+            "Use /logout if you want to disconnect.",
+            parse_mode="Markdown",
+        )
+        return
+
+    # FIXED: Simplified Telethon client initialization
     client = TelegramClient(StringSession(), API_ID, API_HASH)
-    await client.connect()
+    
+    try:
+        await client.connect()
+    except Exception as e:
+        logger.error(f"Telethon connection failed: {e}")
+        await message.reply_text(
+            f"❌ **Connection failed:** {str(e)}\n\n"
+            "Please try again in a few minutes.",
+            parse_mode="Markdown",
+        )
+        return
 
     login_states[user_id] = {"client": client, "step": "waiting_phone"}
 
     await message.reply_text(
-        "📱 **Enter your phone number** (with country code):\n\n"
-        "Example: `+1234567890`\n\n"
-        "⚠️ Make sure to include the + sign!",
+        "📱 **Login Process**\n\n"
+        "1️⃣ **Enter your phone number** (with country code):\n\n"
+        "**Examples:**\n"
+        "• `+1234567890`\n"
+        "• `+447911123456`\n"
+        "• `+4915112345678`\n\n"
+        "⚠️ **Important:**\n"
+        "• Include the `+` sign\n"
+        "• Use international format\n"
+        "• No spaces or dashes\n\n"
+        "If you don't receive a code, try:\n"
+        "1. Check phone number format\n"
+        "2. Wait 2 minutes between attempts\n"
+        "3. Use the Telegram app to verify\n\n"
+        "**Type your phone number now:**",
         parse_mode="Markdown",
     )
 
@@ -282,6 +1165,16 @@ async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
+    # Check if we're in task creation
+    if user_id in task_creation_states:
+        await handle_task_creation(update, context)
+        return
+    
+    # Check if we're waiting for prefix/suffix input
+    if context.user_data.get("waiting_prefix") or context.user_data.get("waiting_suffix"):
+        await handle_prefix_suffix_input(update, context)
+        return
+    
     if user_id in logout_states:
         handled = await handle_logout_confirmation(update, context)
         if handled:
@@ -296,51 +1189,121 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
 
     try:
         if state["step"] == "waiting_phone":
+            if not text.startswith('+'):
+                await update.message.reply_text(
+                    "❌ **Invalid format!**\n\n"
+                    "Phone number must start with `+`\n"
+                    "Example: `+1234567890`\n\n"
+                    "Please enter your phone number again:",
+                    parse_mode="Markdown",
+                )
+                return
+            
+            clean_phone = ''.join(c for c in text if c.isdigit() or c == '+')
+            
+            if len(clean_phone) < 8:
+                await update.message.reply_text(
+                    "❌ **Invalid phone number!**\n\n"
+                    "Phone number seems too short. Please check and try again.\n"
+                    "Example: `+1234567890`",
+                    parse_mode="Markdown",
+                )
+                return
+
             processing_msg = await update.message.reply_text(
-                "⏳ **Processing...**\n\n"
-                "Requesting verification code from Telegram...",
+                "⏳ **Sending verification code...**\n\n"
+                "This may take a few seconds. Please wait...",
                 parse_mode="Markdown",
             )
 
-            result = await client.send_code_request(text)
-            state["phone"] = text
-            state["phone_code_hash"] = result.phone_code_hash
-            state["step"] = "waiting_code"
+            try:
+                logger.info(f"Sending code request to {clean_phone}")
+                result = await client.send_code_request(clean_phone)
+                logger.info(f"Code request result received for {clean_phone}")
+                
+                state["phone"] = clean_phone
+                state["phone_code_hash"] = result.phone_code_hash
+                state["step"] = "waiting_code"
 
-            await processing_msg.edit_text(
-                "✅ **Code sent!**\n\n"
-                "🔑 **Enter the verification code in this format:**\n\n"
-                "`verify12345`\n\n"
-                "⚠️ Type 'verify' followed immediately by your code (no spaces, no brackets).\n"
-                "Example: If your code is 54321, type: `verify54321`",
-                parse_mode="Markdown",
-            )
+                await processing_msg.edit_text(
+                    f"✅ **Verification code sent!**\n\n"
+                    f"📱 **Code sent to:** `{clean_phone}`\n\n"
+                    "2️⃣ **Enter the verification code:**\n\n"
+                    "**Format:** `verify12345`\n"
+                    "• Type `verify` followed by your 5-digit code\n"
+                    "• No spaces, no brackets\n\n"
+                    "**Example:** If your code is `54321`, type:\n"
+                    "`verify54321`\n\n"
+                    "⚠️ **If you don't receive the code:**\n"
+                    "1. Check your Telegram app notifications\n"
+                    "2. Wait 2-3 minutes\n"
+                    "3. Check spam messages\n"
+                    "4. Try login via Telegram app first",
+                    parse_mode="Markdown",
+                )
+
+            except Exception as e:
+                error_msg = str(e)
+                logger.error(f"Error sending code for user {user_id}: {error_msg}")
+                
+                if "PHONE_NUMBER_INVALID" in error_msg:
+                    error_text = "❌ **Invalid phone number!**\n\nPlease check the format and try again."
+                elif "PHONE_NUMBER_BANNED" in error_msg:
+                    error_text = "❌ **Phone number banned!**\n\nThis phone number cannot be used."
+                elif "FLOOD" in error_msg or "Too many" in error_msg:
+                    error_text = "❌ **Too many attempts!**\n\nPlease wait 2-3 minutes before trying again."
+                elif "PHONE_CODE_EXPIRED" in error_msg:
+                    error_text = "❌ **Code expired!**\n\nPlease start over with /login."
+                else:
+                    error_text = f"❌ **Error:** {error_msg}\n\nPlease try again in a few minutes."
+                
+                await processing_msg.edit_text(
+                    error_text + "\n\nUse /login to try again.",
+                    parse_mode="Markdown",
+                )
+                
+                try:
+                    await client.disconnect()
+                except:
+                    pass
+                
+                if user_id in login_states:
+                    del login_states[user_id]
+                return
 
         elif state["step"] == "waiting_code":
             if not text.startswith("verify"):
                 await update.message.reply_text(
                     "❌ **Invalid format!**\n\n"
-                    "Please use this format:\n"
-                    "`verify12345`\n\n"
-                    "Type 'verify' followed immediately by your code.\n"
-                    "Example: If your code is 54321, type: `verify54321`",
+                    "Please use the format: `verify12345`\n\n"
+                    "Type `verify` followed immediately by your 5-digit code.\n"
+                    "**Example:** `verify54321`",
                     parse_mode="Markdown",
                 )
                 return
 
             code = text[6:]
-
+            
             if not code or not code.isdigit():
                 await update.message.reply_text(
                     "❌ **Invalid code!**\n\n"
-                    "Please type 'verify' followed by your verification code.\n"
-                    "Example: `verify12345`",
+                    "Code must contain only digits.\n"
+                    "**Example:** `verify12345`",
+                    parse_mode="Markdown",
+                )
+                return
+            
+            if len(code) != 5:
+                await update.message.reply_text(
+                    "❌ **Code must be 5 digits!**\n\n"
+                    f"Your code has {len(code)} digits. Please check and try again.\n"
+                    "**Example:** `verify12345`",
                     parse_mode="Markdown",
                 )
                 return
 
             verifying_msg = await update.message.reply_text(
-                "🔄 **Verifying...**\n\n" "Checking your verification code...",
+                "🔄 **Verifying code...**\n\nPlease wait...",
                 parse_mode="Markdown",
             )
 
@@ -353,7 +1316,6 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
                 await db_call(db.save_user, user_id, state["phone"], me.first_name, session_string, True)
 
                 user_clients[user_id] = client
-                # ensure caches exist
                 tasks_cache.setdefault(user_id, [])
                 target_entity_cache.setdefault(user_id, {})
                 await start_forwarding_for_user(user_id)
@@ -361,22 +1323,44 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
                 del login_states[user_id]
 
                 await verifying_msg.edit_text(
-                    "✅ **Successfully connected!**\n\n"
-                    f"👤 Name: {me.first_name}\n"
-                    f"📱 Phone: {state['phone']}\n\n"
-                    "You can now create forwarding tasks with:\n"
-                    "`/forwadd [LABEL] [SOURCE_ID] => [TARGET_ID]`",
+                    "✅ **Successfully connected!** 🎉\n\n"
+                    f"👤 **Name:** {me.first_name or 'User'}\n"
+                    f"📱 **Phone:** `{state['phone']}`\n"
+                    f"🆔 **User ID:** `{me.id}`\n\n"
+                    "**Now you can:**\n"
+                    "• Create forwarding tasks with /forwadd\n"
+                    "• View your tasks with /fortasks\n"
+                    "• Get chat IDs with /getallid\n\n"
+                    "Welcome aboard! 🚀",
                     parse_mode="Markdown",
                 )
 
             except SessionPasswordNeededError:
                 state["step"] = "waiting_2fa"
                 await verifying_msg.edit_text(
-                    "🔐 **2FA Password Required**\n\n"
-                    "**Enter your 2-step verification password in this format:**\n\n"
-                    "`passwordYourPassword123`\n\n"
-                    "⚠️ Type 'password' followed immediately by your 2FA password (no spaces, no brackets).\n"
-                    "Example: If your password is 'mypass123', type: `passwordmypass123`",
+                    "🔐 **2-Step Verification Required**\n\n"
+                    "This account has 2FA enabled for extra security.\n\n"
+                    "3️⃣ **Enter your 2FA password:**\n\n"
+                    "**Format:** `passwordYourPassword123`\n"
+                    "• Type `password` followed by your 2FA password\n"
+                    "• No spaces, no brackets\n\n"
+                    "**Example:** If your password is `mypass123`, type:\n"
+                    "`passwordmypass123`",
+                    parse_mode="Markdown",
+                )
+            except Exception as e:
+                error_msg = str(e)
+                logger.error(f"Error verifying code for user {user_id}: {error_msg}")
+                
+                if "PHONE_CODE_INVALID" in error_msg:
+                    error_text = "❌ **Invalid code!**\n\nPlease check the code and try again."
+                elif "PHONE_CODE_EXPIRED" in error_msg:
+                    error_text = "❌ **Code expired!**\n\nPlease request a new code with /login."
+                else:
+                    error_text = f"❌ **Verification failed:** {error_msg}"
+                
+                await verifying_msg.edit_text(
+                    error_text + "\n\nUse /login to try again.",
                     parse_mode="Markdown",
                 )
 
@@ -384,10 +1368,9 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
             if not text.startswith("password"):
                 await update.message.reply_text(
                     "❌ **Invalid format!**\n\n"
-                    "Please use this format:\n"
-                    "`passwordYourPassword123`\n\n"
-                    "Type 'password' followed immediately by your 2FA password.\n"
-                    "Example: If your password is 'mypass123', type: `passwordmypass123`",
+                    "Please use the format: `passwordYourPassword123`\n\n"
+                    "Type `password` followed immediately by your 2FA password.\n"
+                    "**Example:** `passwordmypass123`",
                     parse_mode="Markdown",
                 )
                 return
@@ -397,47 +1380,69 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
             if not password:
                 await update.message.reply_text(
                     "❌ **No password provided!**\n\n"
-                    "Please type 'password' followed by your 2FA password.\n"
-                    "Example: `passwordmypass123`",
+                    "Please type `password` followed by your 2FA password.\n"
+                    "**Example:** `passwordmypass123`",
                     parse_mode="Markdown",
                 )
                 return
 
             verifying_msg = await update.message.reply_text(
-                "🔄 **Verifying 2FA...**\n\n" "Checking your password...", parse_mode="Markdown"
-            )
-
-            await client.sign_in(password=password)
-
-            me = await client.get_me()
-            session_string = client.session.save()
-
-            await db_call(db.save_user, user_id, state["phone"], me.first_name, session_string, True)
-
-            user_clients[user_id] = client
-            tasks_cache.setdefault(user_id, [])
-            target_entity_cache.setdefault(user_id, {})
-            await start_forwarding_for_user(user_id)
-
-            del login_states[user_id]
-
-            await verifying_msg.edit_text(
-                "✅ **Successfully connected!**\n\n"
-                f"👤 Name: {me.first_name}\n"
-                f"📱 Phone: {state['phone']}\n\n"
-                "You can now create forwarding tasks!",
+                "🔄 **Verifying 2FA password...**\n\nPlease wait...",
                 parse_mode="Markdown",
             )
 
+            try:
+                await client.sign_in(password=password)
+
+                me = await client.get_me()
+                session_string = client.session.save()
+
+                await db_call(db.save_user, user_id, state["phone"], me.first_name, session_string, True)
+
+                user_clients[user_id] = client
+                tasks_cache.setdefault(user_id, [])
+                target_entity_cache.setdefault(user_id, {})
+                await start_forwarding_for_user(user_id)
+
+                del login_states[user_id]
+
+                await verifying_msg.edit_text(
+                    "✅ **Successfully connected with 2FA!** 🎉\n\n"
+                    f"👤 **Name:** {me.first_name or 'User'}\n"
+                    f"📱 **Phone:** `{state['phone']}`\n"
+                    f"🆔 **User ID:** `{me.id}`\n\n"
+                    "**Now you can:**\n"
+                    "• Create forwarding tasks with /forwadd\n"
+                    "• View your tasks with /fortasks\n"
+                    "• Get chat IDs with /getallid\n\n"
+                    "Your account is now securely connected! 🔐",
+                    parse_mode="Markdown",
+                )
+
+            except Exception as e:
+                error_msg = str(e)
+                logger.error(f"Error verifying 2FA for user {user_id}: {error_msg}")
+                
+                if "PASSWORD_HASH_INVALID" in error_msg or "PASSWORD_INVALID" in error_msg:
+                    error_text = "❌ **Invalid 2FA password!**\n\nPlease check your password and try again."
+                else:
+                    error_text = f"❌ **2FA verification failed:** {error_msg}"
+                
+                await verifying_msg.edit_text(
+                    error_text + "\n\nUse /login to try again.",
+                    parse_mode="Markdown",
+                )
+
     except Exception as e:
-        logger.exception("Error during login process for %s", user_id)
+        logger.exception("Unexpected error during login process for %s", user_id)
         await update.message.reply_text(
-            f"❌ **Error:** {str(e)}\n\n" "Please try /login again.",
+            f"❌ **Unexpected error:** {str(e)}\n\n"
+            "Please try /login again.\n\n"
+            "If the problem persists, contact support.",
             parse_mode="Markdown",
         )
         if user_id in login_states:
             try:
-                # ensure Telethon client disconnected if login failed
                 c = login_states[user_id].get("client")
                 if c:
                     await c.disconnect()
@@ -491,11 +1496,9 @@ async def handle_logout_confirmation(update: Update, context: ContextTypes.DEFAU
         )
         return True
 
-    # Disconnect client's telethon session (if present)
     if user_id in user_clients:
         client = user_clients[user_id]
         try:
-            # remove handler if present
             handler = handler_registered.get(user_id)
             if handler:
                 try:
@@ -510,12 +1513,11 @@ async def handle_logout_confirmation(update: Update, context: ContextTypes.DEFAU
         finally:
             user_clients.pop(user_id, None)
 
-    # mark as logged out in DB
     try:
         await db_call(db.save_user, user_id, None, None, None, False)
     except Exception:
         logger.exception("Error saving user logout state for %s", user_id)
-    # clear caches for this user
+    
     tasks_cache.pop(user_id, None)
     target_entity_cache.pop(user_id, None)
     logout_states.pop(user_id, None)
@@ -527,133 +1529,6 @@ async def handle_logout_confirmation(update: Update, context: ContextTypes.DEFAU
         parse_mode="Markdown",
     )
     return True
-
-
-async def forwadd_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-
-    if not await check_authorization(update, context):
-        return
-
-    user = await db_call(db.get_user, user_id)
-    if not user or not user["is_logged_in"]:
-        await update.message.reply_text(
-            "❌ **You need to connect your account first!**\n\n" "Use /login to connect your Telegram account.", parse_mode="Markdown"
-        )
-        return
-
-    text = update.message.text.strip()
-
-    try:
-        parts = text.split(" ", 1)
-        if len(parts) < 2 or "=>" not in parts[1]:
-            raise ValueError("Invalid format")
-
-        label_and_source, target_part = parts[1].split("=>")
-        label_parts = label_and_source.strip().split()
-
-        if len(label_parts) < 2:
-            raise ValueError("Invalid format")
-
-        label = label_parts[0]
-        source_ids = [int(x) for x in label_parts[1:]]
-        target_ids = [int(x.strip()) for x in target_part.split()]
-
-        added = await db_call(db.add_forwarding_task, user_id, label, source_ids, target_ids)
-        if added:
-            # Update in-memory cache immediately (hot path)
-            tasks_cache.setdefault(user_id, [])
-            tasks_cache[user_id].append(
-                {"id": None, "label": label, "source_ids": source_ids, "target_ids": target_ids, "is_active": 1}
-            )
-            # schedule async resolve of target entities (background)
-            try:
-                asyncio.create_task(resolve_targets_for_user(user_id, target_ids))
-            except Exception:
-                logger.exception("Failed to schedule resolve_targets_for_user task")
-
-            await update.message.reply_text(
-                f"✅ **Task created: {label}**\n\n"
-                f"📥 Sources: {', '.join(map(str, source_ids))}\n"
-                f"📤 Targets: {', '.join(map(str, target_ids))}\n\n"
-                "Send number-only messages in the source chats to forward them!",
-                parse_mode="Markdown",
-            )
-        else:
-            await update.message.reply_text(
-                f"❌ **Task '{label}' already exists!**\n\n" "Use /foremove to delete it first.",
-                parse_mode="Markdown",
-            )
-
-    except Exception as e:
-        logger.exception("Error in forwadd: %s", e)
-        await update.message.reply_text(
-            "❌ **Invalid format!**\n\n"
-            "**Usage:**\n"
-            "`/forwadd [LABEL] [SOURCE_ID] => [TARGET_ID]`\n\n"
-            "**Example:**\n"
-            "`/forwadd task1 123456789 => 987654321`",
-            parse_mode="Markdown",
-        )
-
-
-async def foremove_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-
-    if not await check_authorization(update, context):
-        return
-
-    text = update.message.text.strip()
-    parts = text.split()
-
-    if len(parts) < 2:
-        await update.message.reply_text(
-            "❌ **Invalid format!**\n\n" "**Usage:** `/foremove [LABEL]`\n\n" "**Example:** `/foremove task1`", parse_mode="Markdown"
-        )
-        return
-
-    label = parts[1]
-
-    deleted = await db_call(db.remove_forwarding_task, user_id, label)
-    if deleted:
-        # Update in-memory cache
-        if user_id in tasks_cache:
-            tasks_cache[user_id] = [t for t in tasks_cache[user_id] if t.get("label") != label]
-        await update.message.reply_text(f"✅ **Task '{label}' removed!**", parse_mode="Markdown")
-    else:
-        await update.message.reply_text(f"❌ **Task '{label}' not found!**", parse_mode="Markdown")
-
-
-async def fortasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id if update.effective_user else update.callback_query.from_user.id
-
-    if not await check_authorization(update, context):
-        return
-
-    message = update.message if update.message else update.callback_query.message
-
-    # Use in-memory cache for fast response
-    tasks = tasks_cache.get(user_id) or []
-
-    if not tasks:
-        await message.reply_text(
-            "📋 **No Active Tasks**\n\n" "You don't have any forwarding tasks yet.\n\n" "Create one with:\n" "`/forwadd [LABEL] [SOURCE_ID] => [TARGET_ID]`",
-            parse_mode="Markdown",
-        )
-        return
-
-    task_list = "📋 **Your Forwarding Tasks**\n\n"
-    task_list += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-
-    for i, task in enumerate(tasks, 1):
-        task_list += f"{i}. **{task['label']}**\n"
-        task_list += f"   📥 Sources: {', '.join(map(str, task['source_ids']))}\n"
-        task_list += f"   📤 Targets: {', '.join(map(str, task['target_ids']))}\n\n"
-
-    task_list += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-    task_list += f"Total: **{len(tasks)} task(s)**"
-
-    await message.reply_text(task_list, parse_mode="Markdown")
 
 
 async def getallid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -692,8 +1567,8 @@ async def adduser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "❌ **Invalid format!**\n\n"
             "**Usage:**\n"
-            "`/adduser [USER_ID]` - Add regular user\n"
-            "`/adduser [USER_ID] admin` - Add admin user",
+            "/adduser [USER_ID] - Add regular user\n"
+            "/adduser [USER_ID] admin - Add admin user",
             parse_mode="Markdown",
         )
         return
@@ -709,7 +1584,6 @@ async def adduser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"✅ **User added!**\n\nID: `{new_user_id}`\nRole: {role}",
                 parse_mode="Markdown",
             )
-            # notify the added user (best-effort)
             try:
                 await context.bot.send_message(new_user_id, "✅ You have been added. Send /start to begin.", parse_mode="Markdown")
             except Exception:
@@ -744,11 +1618,9 @@ async def removeuser_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         removed = await db_call(db.remove_allowed_user, remove_user_id)
         if removed:
-            # Best-effort: disconnect user's Telethon client and clear in-memory state
             if remove_user_id in user_clients:
                 try:
                     client = user_clients[remove_user_id]
-                    # remove event handler if present
                     handler = handler_registered.get(remove_user_id)
                     if handler:
                         try:
@@ -763,7 +1635,6 @@ async def removeuser_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 finally:
                     user_clients.pop(remove_user_id, None)
 
-            # mark as logged out in users table and clear caches
             try:
                 await db_call(db.save_user, remove_user_id, None, None, None, False)
             except Exception:
@@ -775,7 +1646,6 @@ async def removeuser_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
             await update.message.reply_text(f"✅ **User `{remove_user_id}` removed!**", parse_mode="Markdown")
 
-            # Notify removed user (best-effort)
             try:
                 await context.bot.send_message(remove_user_id, "❌ You have been removed. Contact the owner to regain access.", parse_mode="Markdown")
             except Exception:
@@ -922,23 +1792,25 @@ async def show_categorized_chats(user_id: int, chat_id: int, message_id: int, ca
     await context.bot.edit_message_text(chat_list, chat_id=chat_id, message_id=message_id, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
 
-# ---------- OPTIMIZED Forwarding core: handler registration, message handler, send worker, resolver ----------
+# ---------- OPTIMIZED Forwarding core ----------
 def ensure_handler_registered_for_user(user_id: int, client: TelegramClient):
-    """Attach a NewMessage handler once per client/user to avoid duplicates and store the handler (so it can be removed)."""
+    """Attach a NewMessage handler once per client/user to avoid duplicates."""
     if handler_registered.get(user_id):
         return
 
     async def _hot_message_handler(event):
         try:
-            # OPTIMIZED: Batch process messages and run GC periodically
             await optimized_gc()
             
-            # Prefer raw_text for Telethon messages, fallback to message.message
-            message_text = getattr(event, "raw_text", None) or getattr(getattr(event, "message", None), "message", None)
-            if not message_text or not message_text.strip().isdigit():
+            message = getattr(event, "message", None)
+            if not message:
+                return
+                
+            message_text = getattr(event, "raw_text", None) or getattr(message, "message", None)
+            if not message_text:
                 return
 
-            chat_id = getattr(event, "chat_id", None) or getattr(getattr(event, "message", None), "chat_id", None)
+            chat_id = getattr(event, "chat_id", None) or getattr(message, "chat_id", None)
             if chat_id is None:
                 return
 
@@ -946,18 +1818,33 @@ def ensure_handler_registered_for_user(user_id: int, client: TelegramClient):
             if not user_tasks:
                 return
 
+            message_outgoing = getattr(message, "out", False)
+            
             for task in user_tasks:
+                if not task.get("filters", {}).get("control", True):
+                    continue
+                    
+                if message_outgoing and not task.get("filters", {}).get("outgoing", True):
+                    continue
+                    
                 if chat_id in task.get("source_ids", []):
-                    for target_id in task.get("target_ids", []):
-                        try:
-                            # ensure send_queue exists and is on running loop
-                            global send_queue
-                            if send_queue is None:
-                                logger.debug("Send queue not initialized; dropping forward job")
-                                continue
-                            await send_queue.put((user_id, client, int(target_id), message_text))
-                        except asyncio.QueueFull:
-                            logger.warning("Send queue full, dropping forward job for user=%s target=%s", user_id, target_id)
+                    forward_tag = task.get("filters", {}).get("forward_tag", False)
+                    filtered_messages = apply_filters(message_text, task.get("filters", {}))
+                    
+                    for filtered_msg in filtered_messages:
+                        for target_id in task.get("target_ids", []):
+                            try:
+                                global send_queue
+                                if send_queue is None:
+                                    logger.debug("Send queue not initialized; dropping forward job")
+                                    continue
+                                    
+                                await send_queue.put((user_id, client, int(target_id), filtered_msg, 
+                                                     task.get("filters", {}), forward_tag, 
+                                                     chat_id if forward_tag else None,
+                                                     message.id if forward_tag else None))
+                            except asyncio.QueueFull:
+                                logger.warning("Send queue full, dropping forward job for user=%s target=%s", user_id, target_id)
         except Exception:
             logger.exception("Error in hot message handler for user %s", user_id)
 
@@ -970,7 +1857,7 @@ def ensure_handler_registered_for_user(user_id: int, client: TelegramClient):
 
 
 async def resolve_target_entity_once(user_id: int, client: TelegramClient, target_id: int) -> Optional[object]:
-    """Try to resolve a target entity and cache it. Returns entity or None."""
+    """Try to resolve a target entity and cache it."""
     if user_id not in target_entity_cache:
         target_entity_cache[user_id] = {}
 
@@ -1001,7 +1888,7 @@ async def resolve_targets_for_user(user_id: int, target_ids: List[int]):
 
 
 async def send_worker_loop(worker_id: int):
-    """OPTIMIZED Worker that consumes send_queue and performs client.send_message with backoff on FloodWait."""
+    """Worker that consumes send_queue and performs client.send_message with backoff."""
     logger.info("Send worker %d started", worker_id)
     global send_queue
     if send_queue is None:
@@ -1010,12 +1897,10 @@ async def send_worker_loop(worker_id: int):
 
     while True:
         try:
-            user_id, client, target_id, message_text = await send_queue.get()
+            user_id, client, target_id, message_text, task_filters, forward_tag, source_chat_id, message_id = await send_queue.get()
         except asyncio.CancelledError:
-            # Worker cancelled during shutdown
             break
         except Exception:
-            # if loop closed or other error
             logger.exception("Error getting item from send_queue in worker %d", worker_id)
             break
 
@@ -1030,14 +1915,24 @@ async def send_worker_loop(worker_id: int):
                 continue
 
             try:
-                await client.send_message(entity, message_text)
-                logger.debug("Forwarded message for user %s to %s", user_id, target_id)
+                if forward_tag and source_chat_id and message_id:
+                    try:
+                        source_entity = await client.get_input_entity(int(source_chat_id))
+                        await client.forward_messages(entity, message_id, source_entity)
+                        logger.debug("Forwarded message with tag for user %s to %s", user_id, target_id)
+                    except Exception as e:
+                        logger.warning("Failed to forward with tag, falling back to regular send: %s", e)
+                        await client.send_message(entity, message_text)
+                else:
+                    await client.send_message(entity, message_text)
+                    logger.debug("Forwarded message without tag for user %s to %s", user_id, target_id)
+                    
             except FloodWaitError as fwe:
                 wait = int(getattr(fwe, "seconds", 10))
                 logger.warning("FloodWait for %s seconds. Pausing worker %d", wait, worker_id)
                 await asyncio.sleep(wait + 1)
                 try:
-                    await send_queue.put((user_id, client, target_id, message_text))
+                    await send_queue.put((user_id, client, target_id, message_text, task_filters, forward_tag, source_chat_id, message_id))
                 except asyncio.QueueFull:
                     logger.warning("Send queue full while re-enqueueing after FloodWait; dropping message.")
             except Exception as e:
@@ -1049,7 +1944,6 @@ async def send_worker_loop(worker_id: int):
             try:
                 send_queue.task_done()
             except Exception:
-                # If queue or loop closed, ignore
                 pass
 
 
@@ -1058,7 +1952,6 @@ async def start_send_workers():
     if _send_workers_started:
         return
 
-    # create queue on the current running loop (safe)
     if send_queue is None:
         send_queue = asyncio.Queue(maxsize=SEND_QUEUE_MAXSIZE)
 
@@ -1082,11 +1975,10 @@ async def start_forwarding_for_user(user_id: int):
     ensure_handler_registered_for_user(user_id, client)
 
 
-# ---------- OPTIMIZED Session restore and initialization ----------
+# ---------- Session restore ----------
 async def restore_sessions():
     logger.info("🔄 Restoring sessions...")
 
-    # fetch logged-in users in a thread to avoid blocking the event loop
     def _fetch_logged_in_users():
         conn = db.get_connection()
         cur = conn.cursor()
@@ -1099,7 +1991,6 @@ async def restore_sessions():
         logger.exception("Error fetching logged-in users from DB")
         users = []
 
-    # Preload tasks cache from DB (single DB call off the loop)
     try:
         all_active = await db_call(db.get_all_active_tasks)
     except Exception:
@@ -1110,18 +2001,23 @@ async def restore_sessions():
     for t in all_active:
         uid = t["user_id"]
         tasks_cache.setdefault(uid, [])
-        tasks_cache[uid].append({"id": t["id"], "label": t["label"], "source_ids": t["source_ids"], "target_ids": t["target_ids"], "is_active": 1})
+        tasks_cache[uid].append({
+            "id": t["id"], 
+            "label": t["label"], 
+            "source_ids": t["source_ids"], 
+            "target_ids": t["target_ids"], 
+            "is_active": 1,
+            "filters": t.get("filters", {})
+        })
 
     logger.info("📊 Found %d logged in user(s)", len(users))
 
-    # OPTIMIZED: Restore sessions in batches to avoid memory spikes
     batch_size = 5
     for i in range(0, len(users), batch_size):
         batch = users[i:i + batch_size]
         restore_tasks = []
         
         for row in batch:
-            # row may be sqlite3.Row or tuple
             try:
                 user_id = row["user_id"] if isinstance(row, dict) or hasattr(row, "keys") else row[0]
                 session_data = row["session_data"] if isinstance(row, dict) or hasattr(row, "keys") else row[1]
@@ -1136,19 +2032,19 @@ async def restore_sessions():
         
         if restore_tasks:
             await asyncio.gather(*restore_tasks, return_exceptions=True)
-            await asyncio.sleep(1)  # Small delay between batches
+            await asyncio.sleep(1)
 
 
 async def restore_single_session(user_id: int, session_data: str):
     """Restore a single user session with error handling"""
     try:
+        # FIXED: Simplified Telethon client initialization
         client = TelegramClient(StringSession(session_data), API_ID, API_HASH)
         await client.connect()
 
         if await client.is_user_authorized():
             user_clients[user_id] = client
             target_entity_cache.setdefault(user_id, {})
-            # Try to resolve all targets for this user's tasks in background
             user_tasks = tasks_cache.get(user_id, [])
             all_targets = []
             for tt in user_tasks:
@@ -1176,20 +2072,17 @@ async def shutdown_cleanup():
     """Disconnect Telethon clients and cancel worker tasks cleanly."""
     logger.info("Shutdown cleanup: cancelling worker tasks and disconnecting clients...")
 
-    # cancel worker tasks
     for t in list(worker_tasks):
         try:
             t.cancel()
         except Exception:
             logger.exception("Error cancelling worker task")
     if worker_tasks:
-        # wait for tasks to finish cancellation
         try:
             await asyncio.gather(*worker_tasks, return_exceptions=True)
         except Exception:
             logger.exception("Error while awaiting worker task cancellations")
 
-    # disconnect telethon clients in batches
     user_ids = list(user_clients.keys())
     batch_size = 5
     for i in range(0, len(user_ids), batch_size):
@@ -1198,7 +2091,6 @@ async def shutdown_cleanup():
         for uid in batch:
             client = user_clients.get(uid)
             if client:
-                # remove handler if present
                 handler = handler_registered.get(uid)
                 if handler:
                     try:
@@ -1214,7 +2106,6 @@ async def shutdown_cleanup():
     
     user_clients.clear()
 
-    # close DB connection if needed
     try:
         db.close_connection()
     except Exception:
@@ -1223,7 +2114,7 @@ async def shutdown_cleanup():
     logger.info("Shutdown cleanup complete.")
 
 
-# ---------- Application post_init: start send workers and restore sessions ----------
+# ---------- Application post_init ----------
 async def post_init(application: Application):
     global MAIN_LOOP
     MAIN_LOOP = asyncio.get_running_loop()
@@ -1233,7 +2124,6 @@ async def post_init(application: Application):
     await application.bot.delete_webhook(drop_pending_updates=True)
     logger.info("🧹 Cleared webhooks")
 
-    # Ensure configured OWNER_IDS are present in DB as admin users
     if OWNER_IDS:
         for oid in OWNER_IDS:
             try:
@@ -1244,7 +2134,6 @@ async def post_init(application: Application):
             except Exception:
                 logger.exception("Error adding owner/admin %s from env", oid)
 
-    # Ensure configured ALLOWED_USERS are present in DB as allowed users (non-admin)
     if ALLOWED_USERS:
         for au in ALLOWED_USERS:
             try:
@@ -1253,15 +2142,10 @@ async def post_init(application: Application):
             except Exception:
                 logger.exception("Error adding allowed user %s from env: %s", au)
 
-    # start send workers and restore sessions
     await start_send_workers()
     await restore_sessions()
 
-    # register a monitoring callback with the webserver (best-effort, thread-safe)
     async def _collect_metrics():
-        """
-        Run inside the bot event loop to safely access asyncio objects and in-memory state.
-        """
         try:
             q = None
             try:
@@ -1279,19 +2163,16 @@ async def post_init(application: Application):
             return {"error": f"failed to collect metrics in loop: {e}"}
 
     def _forward_metrics():
-        """
-        This wrapper runs in the Flask thread; it will call into the bot's event loop to gather data safely.
-        """
         global MAIN_LOOP
-        if MAIN_LOOP is None:
+        if MAIN_LOOP is not None:
+            try:
+                future = asyncio.run_coroutine_threadsafe(_collect_metrics(), MAIN_LOOP)
+                return future.result(timeout=1.0)
+            except Exception as e:
+                logger.exception("Failed to collect metrics from main loop")
+                return {"error": f"failed to collect metrics: {e}"}
+        else:
             return {"error": "bot main loop not available"}
-
-        try:
-            future = asyncio.run_coroutine_threadsafe(_collect_metrics(), MAIN_LOOP)
-            return future.result(timeout=1.0)
-        except Exception as e:
-            logger.exception("Failed to collect metrics from main loop")
-            return {"error": f"failed to collect metrics: {e}"}
 
     try:
         register_monitoring(_forward_metrics)
@@ -1323,7 +2204,6 @@ def main():
 
     logger.info("🤖 Starting Forwarder Bot...")
 
-    # start webserver thread first (keeps /health available)
     start_server_thread()
 
     application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
@@ -1332,7 +2212,6 @@ def main():
     application.add_handler(CommandHandler("login", login_command))
     application.add_handler(CommandHandler("logout", logout_command))
     application.add_handler(CommandHandler("forwadd", forwadd_command))
-    application.add_handler(CommandHandler("foremove", foremove_command))
     application.add_handler(CommandHandler("fortasks", fortasks_command))
     application.add_handler(CommandHandler("getallid", getallid_command))
     application.add_handler(CommandHandler("adduser", adduser_command))
@@ -1345,7 +2224,6 @@ def main():
     try:
         application.run_polling(drop_pending_updates=True)
     finally:
-        # run a final cleanup on a fresh loop to ensure Telethon clients are disconnected
         try:
             asyncio.run(shutdown_cleanup())
         except Exception:
