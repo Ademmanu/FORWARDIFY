@@ -126,26 +126,6 @@ def extract_words(text: str) -> List[str]:
     """Extract words from text, preserving emojis and special characters"""
     return re.findall(r'\S+', text)
 
-def is_numeric_word(word: str) -> bool:
-    """Check if word contains only digits (numeric)"""
-    return word.isdigit()
-
-def is_alphabetic_word(word: str) -> bool:
-    """Check if word contains only letters (alphabetic)"""
-    return word.isalpha()
-
-def contains_numeric(word: str) -> bool:
-    """Check if word contains any digits"""
-    return any(char.isdigit() for char in word)
-
-def contains_alphabetic(word: str) -> bool:
-    """Check if word contains any letters"""
-    return any(char.isalpha() for char in word)
-
-def contains_only_special(word: str) -> bool:
-    """Check if word contains only special characters (no letters or digits)"""
-    return not (contains_numeric(word) or contains_alphabetic(word))
-
 def apply_filters(message_text: str, task_filters: Dict) -> List[str]:
     """Apply filters to message text and return list of messages to forward"""
     if not message_text:
@@ -162,14 +142,14 @@ def apply_filters(message_text: str, task_filters: Dict) -> List[str]:
             processed = processed + filters_enabled['suffix']
         return [processed]
     
-    messages_to_send = []
     words = extract_words(message_text)
+    messages_to_send = []
     
     # Process based on enabled filters
     if filters_enabled.get('numbers_only', False):
-        numeric_words = [word for word in words if is_numeric_word(word)]
-        for word in numeric_words:
-            processed = word
+        # ONLY forward if the ENTIRE message is numeric
+        if message_text.replace(' ', '').isdigit():
+            processed = message_text
             if filters_enabled.get('prefix'):
                 processed = filters_enabled['prefix'] + processed
             if filters_enabled.get('suffix'):
@@ -177,9 +157,11 @@ def apply_filters(message_text: str, task_filters: Dict) -> List[str]:
             messages_to_send.append(processed)
     
     elif filters_enabled.get('alphabets_only', False):
-        alphabetic_words = [word for word in words if is_alphabetic_word(word)]
-        for word in alphabetic_words:
-            processed = word
+        # ONLY forward if the ENTIRE message is alphabetic (letters only, no spaces)
+        # Remove spaces and check if all characters are letters
+        text_without_spaces = message_text.replace(' ', '')
+        if text_without_spaces and text_without_spaces.isalpha():
+            processed = message_text
             if filters_enabled.get('prefix'):
                 processed = filters_enabled['prefix'] + processed
             if filters_enabled.get('suffix'):
@@ -187,36 +169,30 @@ def apply_filters(message_text: str, task_filters: Dict) -> List[str]:
             messages_to_send.append(processed)
     
     elif filters_enabled.get('removed_alphabetic', False):
-        non_numeric_words = []
+        # Remove letters from each word, keep numbers and special characters
         for word in words:
-            if is_numeric_word(word):
-                continue
-            if contains_alphabetic(word) or contains_only_special(word):
-                non_numeric_words.append(word)
-        
-        for word in non_numeric_words:
-            processed = word
-            if filters_enabled.get('prefix'):
-                processed = filters_enabled['prefix'] + processed
-            if filters_enabled.get('suffix'):
-                processed = processed + filters_enabled['suffix']
-            messages_to_send.append(processed)
+            # Remove all alphabetic characters
+            filtered_word = ''.join(char for char in word if not char.isalpha())
+            if filtered_word:  # Only add if something remains
+                processed = filtered_word
+                if filters_enabled.get('prefix'):
+                    processed = filters_enabled['prefix'] + processed
+                if filters_enabled.get('suffix'):
+                    processed = processed + filters_enabled['suffix']
+                messages_to_send.append(processed)
     
     elif filters_enabled.get('removed_numeric', False):
-        non_alphabetic_words = []
+        # Remove numbers from each word, keep letters and special characters
         for word in words:
-            if is_alphabetic_word(word):
-                continue
-            if contains_numeric(word) or contains_only_special(word):
-                non_alphabetic_words.append(word)
-        
-        for word in non_alphabetic_words:
-            processed = word
-            if filters_enabled.get('prefix'):
-                processed = filters_enabled['prefix'] + processed
-            if filters_enabled.get('suffix'):
-                processed = processed + filters_enabled['suffix']
-            messages_to_send.append(processed)
+            # Remove all numeric characters
+            filtered_word = ''.join(char for char in word if not char.isdigit())
+            if filtered_word:  # Only add if something remains
+                processed = filtered_word
+                if filters_enabled.get('prefix'):
+                    processed = filters_enabled['prefix'] + processed
+                if filters_enabled.get('suffix'):
+                    processed = processed + filters_enabled['suffix']
+                messages_to_send.append(processed)
     
     else:
         # No specific filter enabled, forward all words with prefix/suffix
@@ -674,14 +650,14 @@ async def handle_filter_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
     message_text = f"🔍 **Filters for: {task_label}**\n\n"
     message_text += "Apply filters to messages before forwarding:\n\n"
     message_text += "📋 **Available Filters:**\n"
-    message_text += f"{raw_text_emoji} Raw text - Forward any text\n"
-    message_text += f"{numbers_only_emoji} Numbers only - Forward only numbers\n"
-    message_text += f"{alphabets_only_emoji} Alphabets only - Forward only letters\n"
-    message_text += f"{removed_alphabetic_emoji} Removed Alphabetic - Keep letters & special chars, remove numbers\n"
-    message_text += f"{removed_numeric_emoji} Removed Numeric - Keep numbers & special chars, remove letters\n"
+    message_text += f"{raw_text_emoji} Raw text - Forward entire text as-is\n"
+    message_text += f"{numbers_only_emoji} Numbers only - Forward ONLY if message contains ONLY numbers\n"
+    message_text += f"{alphabets_only_emoji} Alphabets only - Forward ONLY if message contains ONLY letters\n"
+    message_text += f"{removed_alphabetic_emoji} Removed Alphabetic - Keep numbers & special chars, remove letters\n"
+    message_text += f"{removed_numeric_emoji} Removed Numeric - Keep letters & special chars, remove numbers\n"
     message_text += f"📝 **Prefix:** {prefix_text}\n"
     message_text += f"📝 **Suffix:** {suffix_text}\n\n"
-    message_text += "💡 **Multiple filters can be active at once!**"
+    message_text += "💡 **Only one filter can be active at a time (except Raw Text)!**"
     
     keyboard = [
         [
@@ -786,6 +762,7 @@ async def handle_toggle_action(update: Update, context: ContextTypes.DEFAULT_TYP
     
     task = user_tasks[task_index]
     filters = task.get("filters", {})
+    filter_settings = filters.get("filters", {})
     new_state = None
     
     # Determine which setting/filter is being toggled
@@ -805,7 +782,14 @@ async def handle_toggle_action(update: Update, context: ContextTypes.DEFAULT_TYP
         status_text = "Forwarding control"
         
     elif toggle_type in ["raw_text", "numbers_only", "alphabets_only", "removed_alphabetic", "removed_numeric"]:
-        filter_settings = filters.get("filters", {})
+        # Handle filter exclusivity (only one filter can be active at a time, except raw_text)
+        if toggle_type != "raw_text":
+            # If turning ON a filter, turn OFF all other filters
+            if not filter_settings.get(toggle_type, False):
+                for filter_key in ["numbers_only", "alphabets_only", "removed_alphabetic", "removed_numeric", "raw_text"]:
+                    if filter_key != toggle_type:
+                        filter_settings[filter_key] = False
+        
         new_state = not filter_settings.get(toggle_type, False)
         filter_settings[toggle_type] = new_state
         filters["filters"] = filter_settings
@@ -1794,7 +1778,7 @@ async def show_categorized_chats(user_id: int, chat_id: int, message_id: int, ca
 
 # ---------- OPTIMIZED Forwarding core ----------
 def ensure_handler_registered_for_user(user_id: int, client: TelegramClient):
-    """Attach a NewMessage handler once per client/user to avoid duplicates."""
+    """Attach NewMessage and MessageEdited handlers once per client/user to avoid duplicates."""
     if handler_registered.get(user_id):
         return
 
@@ -1806,7 +1790,17 @@ def ensure_handler_registered_for_user(user_id: int, client: TelegramClient):
             if not message:
                 return
                 
-            message_text = getattr(event, "raw_text", None) or getattr(message, "message", None)
+            # Get message text - check if it's an edited message
+            if isinstance(event, events.MessageEdited):
+                # For edited messages, we need to get the new text
+                message_text = getattr(event, "raw_text", None) or getattr(message, "message", None)
+                if message_text is None:
+                    # Try to get text from the message object
+                    message_text = message.text or message.message
+            else:
+                # For new messages
+                message_text = getattr(event, "raw_text", None) or getattr(message, "message", None)
+                
             if not message_text:
                 return
 
@@ -1819,6 +1813,7 @@ def ensure_handler_registered_for_user(user_id: int, client: TelegramClient):
                 return
 
             message_outgoing = getattr(message, "out", False)
+            is_edited = isinstance(event, events.MessageEdited)
             
             for task in user_tasks:
                 if not task.get("filters", {}).get("control", True):
@@ -1839,21 +1834,28 @@ def ensure_handler_registered_for_user(user_id: int, client: TelegramClient):
                                     logger.debug("Send queue not initialized; dropping forward job")
                                     continue
                                     
-                                await send_queue.put((user_id, client, int(target_id), filtered_msg, 
-                                                     task.get("filters", {}), forward_tag, 
-                                                     chat_id if forward_tag else None,
-                                                     message.id if forward_tag else None))
+                                # For edited messages, we don't forward with tag (can't forward edited messages)
+                                if is_edited:
+                                    await send_queue.put((user_id, client, int(target_id), filtered_msg, 
+                                                         task.get("filters", {}), False, None, None))
+                                else:
+                                    await send_queue.put((user_id, client, int(target_id), filtered_msg, 
+                                                         task.get("filters", {}), forward_tag, 
+                                                         chat_id if forward_tag else None,
+                                                         message.id if forward_tag else None))
                             except asyncio.QueueFull:
                                 logger.warning("Send queue full, dropping forward job for user=%s target=%s", user_id, target_id)
         except Exception:
             logger.exception("Error in hot message handler for user %s", user_id)
 
     try:
+        # Register for both new messages and edited messages
         client.add_event_handler(_hot_message_handler, events.NewMessage())
+        client.add_event_handler(_hot_message_handler, events.MessageEdited())
         handler_registered[user_id] = _hot_message_handler
-        logger.info("Registered NewMessage handler for user %s", user_id)
+        logger.info("Registered NewMessage and MessageEdited handlers for user %s", user_id)
     except Exception:
-        logger.exception("Failed to add event handler for user %s", user_id)
+        logger.exception("Failed to add event handlers for user %s", user_id)
 
 
 async def resolve_target_entity_once(user_id: int, client: TelegramClient, target_id: int) -> Optional[object]:
