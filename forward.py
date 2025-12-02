@@ -146,16 +146,26 @@ def contains_only_special(word: str) -> bool:
     """Check if word contains only special characters (no letters or digits)"""
     return not (contains_numeric(word) or contains_alphabetic(word))
 
-def contains_emoji_or_symbol(word: str) -> bool:
-    """Check if word contains emojis or symbols (non-alphanumeric Unicode)"""
-    # Check for emojis and symbols (non-letter, non-digit, non-punctuation)
+def is_emoji(word: str) -> bool:
+    """Check if word is an emoji or contains emojis"""
+    # Emoji regex pattern
+    emoji_pattern = re.compile(
+        "["
+        "\U0001F600-\U0001F64F"  # emoticons
+        "\U0001F300-\U0001F5FF"  # symbols & pictographs
+        "\U0001F680-\U0001F6FF"  # transport & map symbols
+        "\U0001F1E0-\U0001F1FF"  # flags (iOS)
+        "\U00002702-\U000027B0"  # dingbats
+        "\U000024C2-\U0001F251" 
+        "]+", flags=re.UNICODE)
+    return bool(emoji_pattern.search(word))
+
+def contains_special_characters(word: str) -> bool:
+    """Check if word contains special characters (punctuation, symbols)"""
+    # Check for any character that is not alphanumeric and not emoji
     for char in word:
-        # If character is not alphanumeric and not common punctuation
-        if not char.isalnum() and char not in '!@#$%^&*()_+-=[]{}|;:,.<>?/~`"\'\\':
-            # Check if it's likely an emoji or special symbol
-            # Emojis typically have higher Unicode code points
-            if ord(char) > 0x2600:  # Above common symbols range
-                return True
+        if not char.isalnum() and not is_emoji(char):
+            return True
     return False
 
 def apply_filters(message_text: str, task_filters: Dict) -> List[str]:
@@ -179,10 +189,9 @@ def apply_filters(message_text: str, task_filters: Dict) -> List[str]:
     
     # Process based on enabled filters
     if filters_enabled.get('numbers_only', False):
-        # Only forward words that are 100% numbers
-        numeric_words = [word for word in words if is_numeric_word(word)]
-        for word in numeric_words:
-            processed = word
+        # Only forward if entire message is a number
+        if is_numeric_word(message_text.replace(' ', '')):
+            processed = message_text
             if filters_enabled.get('prefix'):
                 processed = filters_enabled['prefix'] + processed
             if filters_enabled.get('suffix'):
@@ -190,10 +199,9 @@ def apply_filters(message_text: str, task_filters: Dict) -> List[str]:
             messages_to_send.append(processed)
     
     elif filters_enabled.get('alphabets_only', False):
-        # Only forward words that are 100% letters
-        alphabetic_words = [word for word in words if is_alphabetic_word(word)]
-        for word in alphabetic_words:
-            processed = word
+        # Only forward if entire message is alphabetic
+        if is_alphabetic_word(message_text.replace(' ', '')):
+            processed = message_text
             if filters_enabled.get('prefix'):
                 processed = filters_enabled['prefix'] + processed
             if filters_enabled.get('suffix'):
@@ -201,15 +209,16 @@ def apply_filters(message_text: str, task_filters: Dict) -> List[str]:
             messages_to_send.append(processed)
     
     elif filters_enabled.get('removed_alphabetic', False):
-        # Remove alphabetic words (letters) and emojis, keep numbers and special characters
+        # Forward ONLY letters + special characters (no numbers, no emojis)
         for word in words:
-            # Skip words that contain letters OR emojis
-            if contains_alphabetic(word) or contains_emoji_or_symbol(word):
+            # Skip if contains numbers
+            if contains_numeric(word):
                 continue
-            
-            # Keep words that contain numbers OR are only special characters
-            # But exclude pure emoji/symbol words
-            if contains_numeric(word) or contains_only_special(word):
+            # Skip if is emoji
+            if is_emoji(word):
+                continue
+            # Forward if contains letters or special characters
+            if contains_alphabetic(word) or contains_special_characters(word):
                 processed = word
                 if filters_enabled.get('prefix'):
                     processed = filters_enabled['prefix'] + processed
@@ -218,15 +227,16 @@ def apply_filters(message_text: str, task_filters: Dict) -> List[str]:
                 messages_to_send.append(processed)
     
     elif filters_enabled.get('removed_numeric', False):
-        # Remove numeric words (numbers) and emojis, keep letters and special characters
+        # Forward ONLY numbers + special characters (no letters, no emojis)
         for word in words:
-            # Skip words that contain numbers OR emojis
-            if contains_numeric(word) or contains_emoji_or_symbol(word):
+            # Skip if contains letters
+            if contains_alphabetic(word):
                 continue
-            
-            # Keep words that contain letters OR are only special characters
-            # But exclude pure emoji/symbol words
-            if contains_alphabetic(word) or contains_only_special(word):
+            # Skip if is emoji
+            if is_emoji(word):
+                continue
+            # Forward if contains numbers or special characters
+            if contains_numeric(word) or contains_special_characters(word):
                 processed = word
                 if filters_enabled.get('prefix'):
                     processed = filters_enabled['prefix'] + processed
@@ -693,8 +703,8 @@ async def handle_filter_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
     message_text += f"{raw_text_emoji} Raw text - Forward any text\n"
     message_text += f"{numbers_only_emoji} Numbers only - Forward only numbers\n"
     message_text += f"{alphabets_only_emoji} Alphabets only - Forward only letters\n"
-    message_text += f"{removed_alphabetic_emoji} Removed Alphabetic - Keep letters & special chars, remove numbers\n"
-    message_text += f"{removed_numeric_emoji} Removed Numeric - Keep numbers & special chars, remove letters\n"
+    message_text += f"{removed_alphabetic_emoji} Removed Alphabetic - Keep letters & special chars, remove numbers & emojis\n"
+    message_text += f"{removed_numeric_emoji} Removed Numeric - Keep numbers & special chars, remove letters & emojis\n"
     message_text += f"📝 **Prefix:** {prefix_text}\n"
     message_text += f"📝 **Suffix:** {suffix_text}\n\n"
     message_text += "💡 **Multiple filters can be active at once!**"
@@ -1818,6 +1828,9 @@ def ensure_handler_registered_for_user(user_id: int, client: TelegramClient):
         try:
             await optimized_gc()
             
+            # Check if this is a message edit
+            is_edit = isinstance(event, events.MessageEdited)
+            
             message = getattr(event, "message", None)
             if not message:
                 return
@@ -1865,9 +1878,11 @@ def ensure_handler_registered_for_user(user_id: int, client: TelegramClient):
             logger.exception("Error in hot message handler for user %s", user_id)
 
     try:
+        # Register handler for both new messages and message edits
         client.add_event_handler(_hot_message_handler, events.NewMessage())
+        client.add_event_handler(_hot_message_handler, events.MessageEdited())
         handler_registered[user_id] = _hot_message_handler
-        logger.info("Registered NewMessage handler for user %s", user_id)
+        logger.info("Registered NewMessage and MessageEdited handler for user %s", user_id)
     except Exception:
         logger.exception("Failed to add event handler for user %s", user_id)
 
