@@ -432,6 +432,39 @@ class Database:
             raise
         # REMOVED: finally: self.close_connection() - Keep connection open
 
+    def get_logged_in_users(self, limit: Optional[int] = None) -> List[Dict]:
+        """
+        Return logged-in users (user_id and session_data), ordered by updated_at desc.
+        If limit is provided, return up to that many users. This helps restore only
+        a limited number of sessions at startup to prevent OOM on constrained hosts.
+        """
+        conn = self.get_connection()
+        try:
+            cur = conn.cursor()
+            if limit and int(limit) > 0:
+                cur.execute(
+                    "SELECT user_id, session_data FROM users WHERE is_logged_in = 1 ORDER BY updated_at DESC LIMIT ?",
+                    (int(limit),),
+                )
+            else:
+                cur.execute(
+                    "SELECT user_id, session_data FROM users WHERE is_logged_in = 1 ORDER BY updated_at DESC"
+                )
+            rows = cur.fetchall()
+            result = []
+            for r in rows:
+                # sqlite3.Row supports dict-like access
+                try:
+                    user_id = r["user_id"]
+                    session_data = r["session_data"]
+                except Exception:
+                    user_id, session_data = r[0], r[1]
+                result.append({"user_id": user_id, "session_data": session_data})
+            return result
+        except Exception as e:
+            logger.exception("Error fetching logged-in users: %s", e)
+            raise
+
     def get_db_status(self) -> Dict:
         """
         Return a small health/status snapshot for the DB:
