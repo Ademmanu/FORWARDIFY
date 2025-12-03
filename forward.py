@@ -5,7 +5,9 @@ import logging
 import functools
 import gc
 import re
+import time
 from typing import Dict, List, Optional, Tuple, Set, Callable, Any
+from collections import OrderedDict
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.errors import SessionPasswordNeededError, FloodWaitError
@@ -56,16 +58,23 @@ if allowed_env:
         except ValueError:
             logger.warning("Invalid ALLOWED_USERS value skipped: %s", part)
 
-# OPTIMIZED Tuning parameters for Render free tier (25+ users, unlimited forwarding)
-SEND_WORKER_COUNT = int(os.getenv("SEND_WORKER_COUNT", "15"))  # Reduced workers to save memory
-SEND_QUEUE_MAXSIZE = int(os.getenv("SEND_QUEUE_MAXSIZE", "10000"))  # Reduced queue size
-TARGET_RESOLVE_RETRY_SECONDS = int(os.getenv("TARGET_RESOLVE_RETRY_SECONDS", "30"))  # Faster retry
-MAX_CONCURRENT_USERS = int(os.getenv("MAX_CONCURRENT_USERS", "50"))  # Increased user limit
+# OPTIMIZED Tuning parameters for Render free tier (25 concurrent users)
+SEND_WORKER_COUNT = int(os.getenv("SEND_WORKER_COUNT", "8"))  # Lowered workers to save memory
+SEND_QUEUE_MAXSIZE = int(os.getenv("SEND_QUEUE_MAXSIZE", "5000"))  # Reduced queue size
+TARGET_RESOLVE_RETRY_SECONDS = int(os.getenv("TARGET_RESOLVE_RETRY_SECONDS", "30"))  # Retry delay
+MAX_CONCURRENT_USERS = int(os.getenv("MAX_CONCURRENT_USERS", "25"))  # Target concurrent connected accounts
 MESSAGE_PROCESS_BATCH_SIZE = int(os.getenv("MESSAGE_PROCESS_BATCH_SIZE", "5"))  # Batch processing
+
+# Per-user concurrency and rate limiting (configurable)
+SEND_CONCURRENCY_PER_USER = int(os.getenv("SEND_CONCURRENCY_PER_USER", "4"))  # max concurrent sends per user client
+SEND_RATE_PER_USER = float(os.getenv("SEND_RATE_PER_USER", "5.0"))  # tokens per second (burst smoothing)
+
+# Target entity LRU cache size per user
+TARGET_ENTITY_CACHE_SIZE = int(os.getenv("TARGET_ENTITY_CACHE_SIZE", "256"))
 
 db = Database()
 
-# OPTIMIZED: Use weak references and smaller data structures
+# OPTIMIZED: Use weak references and smaller data structures where possible
 user_clients: Dict[int, TelegramClient] = {}
 login_states: Dict[int, Dict] = {}
 logout_states: Dict[int, Dict] = {}
@@ -75,9 +84,17 @@ task_creation_states: Dict[int, Dict[str, Any]] = {}  # user_id -> {step: str, n
 
 # OPTIMIZED: Hot-path caches with memory limits
 tasks_cache: Dict[int, List[Dict]] = {}  # user_id -> list of task dicts
-target_entity_cache: Dict[int, Dict[int, object]] = {}  # user_id -> {target_id: resolved_entity}
+
+# target_entity_cache will be per-user bounded LRU: { user_id: OrderedDict[target_id->entity] }
+target_entity_cache: Dict[int, OrderedDict] = {}
+
 # handler_registered maps user_id -> handler callable (so we can remove it)
 handler_registered: Dict[int, Callable] = {}
+
+# Per-user concurrency semaphores and rate-limiters
+user_send_semaphores: Dict[int, asyncio.Semaphore] = {}
+# rate limiter: user_id -> (tokens: float, last_refill: float)
+user_rate_limiters: Dict[int, Tuple[float, float]] = {}
 
 # Global send queue is created later on the running event loop (in post_init/start_send_workers)
 send_queue: Optional[asyncio.Queue] = None
@@ -119,6 +136,65 @@ async def optimized_gc():
         collected = gc.collect()
         logger.debug(f"Garbage collection freed {collected} objects")
         _last_gc_run = current_time
+
+
+# ---------- Helpers: LRU target cache and per-user limiters ----------
+def _ensure_user_target_cache(user_id: int):
+    if user_id not in target_entity_cache:
+        target_entity_cache[user_id] = OrderedDict()
+
+
+def _get_cached_target(user_id: int, target_id: int):
+    _ensure_user_target_cache(user_id)
+    od = target_entity_cache[user_id]
+    if target_id in od:
+        # move to end = mark most recently used
+        od.move_to_end(target_id)
+        return od[target_id]
+    return None
+
+
+def _set_cached_target(user_id: int, target_id: int, entity: object):
+    _ensure_user_target_cache(user_id)
+    od = target_entity_cache[user_id]
+    od[target_id] = entity
+    od.move_to_end(target_id)
+    # enforce size limit
+    while len(od) > TARGET_ENTITY_CACHE_SIZE:
+        od.popitem(last=False)  # pop least recently used
+
+
+def _ensure_user_send_semaphore(user_id: int):
+    if user_id not in user_send_semaphores:
+        user_send_semaphores[user_id] = asyncio.Semaphore(SEND_CONCURRENCY_PER_USER)
+
+
+def _ensure_user_rate_limiter(user_id: int):
+    if user_id not in user_rate_limiters:
+        user_rate_limiters[user_id] = (SEND_RATE_PER_USER, asyncio.get_event_loop().time())
+
+
+async def _consume_token(user_id: int, amount: float = 1.0):
+    """
+    Token-bucket style refill. Returns when token is available.
+    This limits burst rate per user, reducing flood/wait.
+    """
+    _ensure_user_rate_limiter(user_id)
+    while True:
+        tokens, last = user_rate_limiters[user_id]
+        now = asyncio.get_event_loop().time()
+        # refill
+        elapsed = max(0.0, now - last)
+        refill = elapsed * SEND_RATE_PER_USER
+        tokens = min(tokens + refill, SEND_RATE_PER_USER * 10)  # allow some burst up to 10*rate
+        if tokens >= amount:
+            tokens -= amount
+            user_rate_limiters[user_id] = (tokens, now)
+            return
+        # store updated tokens and time
+        user_rate_limiters[user_id] = (tokens, now)
+        # sleep a short while before retrying
+        await asyncio.sleep(0.1)
 
 
 # ---------- Message filtering functions ----------
@@ -1343,7 +1419,9 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
 
                 user_clients[user_id] = client
                 tasks_cache.setdefault(user_id, [])
-                target_entity_cache.setdefault(user_id, {})
+                _ensure_user_target_cache(user_id)
+                _ensure_user_send_semaphore(user_id)
+                _ensure_user_rate_limiter(user_id)
                 await start_forwarding_for_user(user_id)
 
                 del login_states[user_id]
@@ -1427,7 +1505,9 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
 
                 user_clients[user_id] = client
                 tasks_cache.setdefault(user_id, [])
-                target_entity_cache.setdefault(user_id, {})
+                _ensure_user_target_cache(user_id)
+                _ensure_user_send_semaphore(user_id)
+                _ensure_user_rate_limiter(user_id)
                 await start_forwarding_for_user(user_id)
 
                 del login_states[user_id]
@@ -1546,6 +1626,8 @@ async def handle_logout_confirmation(update: Update, context: ContextTypes.DEFAU
     
     tasks_cache.pop(user_id, None)
     target_entity_cache.pop(user_id, None)
+    user_send_semaphores.pop(user_id, None)
+    user_rate_limiters.pop(user_id, None)
     logout_states.pop(user_id, None)
 
     await update.message.reply_text(
@@ -1669,6 +1751,8 @@ async def removeuser_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             tasks_cache.pop(remove_user_id, None)
             target_entity_cache.pop(remove_user_id, None)
             handler_registered.pop(remove_user_id, None)
+            user_send_semaphores.pop(remove_user_id, None)
+            user_rate_limiters.pop(remove_user_id, None)
 
             await update.message.reply_text(f"✅ **User `{remove_user_id}` removed!**", parse_mode="Markdown")
 
@@ -1868,10 +1952,8 @@ def ensure_handler_registered_for_user(user_id: int, client: TelegramClient):
                                     logger.debug("Send queue not initialized; dropping forward job")
                                     continue
                                     
-                                await send_queue.put((user_id, client, int(target_id), filtered_msg, 
-                                                     task.get("filters", {}), forward_tag, 
-                                                     chat_id if forward_tag else None,
-                                                     message.id if forward_tag else None))
+                                # Put minimal job info into queue; actual send-run will handle rate-limiting and concurrency.
+                                await send_queue.put((user_id, target_id, filtered_msg, task.get("filters", {}), forward_tag, chat_id if forward_tag else None, message.id if forward_tag else None))
                             except asyncio.QueueFull:
                                 logger.warning("Send queue full, dropping forward job for user=%s target=%s", user_id, target_id)
         except Exception:
@@ -1889,15 +1971,14 @@ def ensure_handler_registered_for_user(user_id: int, client: TelegramClient):
 
 async def resolve_target_entity_once(user_id: int, client: TelegramClient, target_id: int) -> Optional[object]:
     """Try to resolve a target entity and cache it."""
-    if user_id not in target_entity_cache:
-        target_entity_cache[user_id] = {}
-
-    if target_id in target_entity_cache[user_id]:
-        return target_entity_cache[user_id][target_id]
+    # Check bounded cache first
+    ent = _get_cached_target(user_id, target_id)
+    if ent:
+        return ent
 
     try:
         entity = await client.get_input_entity(int(target_id))
-        target_entity_cache[user_id][target_id] = entity
+        _set_cached_target(user_id, target_id, entity)
         return entity
     except Exception:
         logger.debug("Could not resolve target %s for user %s now", target_id, user_id)
@@ -1928,46 +2009,78 @@ async def send_worker_loop(worker_id: int):
 
     while True:
         try:
-            user_id, client, target_id, message_text, task_filters, forward_tag, source_chat_id, message_id = await send_queue.get()
+            job = await send_queue.get()
         except asyncio.CancelledError:
             break
         except Exception:
             logger.exception("Error getting item from send_queue in worker %d", worker_id)
-            break
+            await asyncio.sleep(0.5)
+            continue
 
         try:
-            entity = None
-            if user_id in target_entity_cache:
-                entity = target_entity_cache[user_id].get(target_id)
-            if not entity:
-                entity = await resolve_target_entity_once(user_id, client, target_id)
-            if not entity:
-                logger.debug("Skipping send: target %s unresolved for user %s", target_id, user_id)
+            # Unpack job
+            try:
+                user_id, target_id, message_text, task_filters, forward_tag, source_chat_id, message_id = job
+            except Exception:
+                logger.warning("Malformed job in send_queue; skipping")
                 continue
 
-            try:
-                if forward_tag and source_chat_id and message_id:
-                    try:
-                        source_entity = await client.get_input_entity(int(source_chat_id))
-                        await client.forward_messages(entity, message_id, source_entity)
-                        logger.debug("Forwarded message with tag for user %s to %s", user_id, target_id)
-                    except Exception as e:
-                        logger.warning("Failed to forward with tag, falling back to regular send: %s", e)
-                        await client.send_message(entity, message_text)
-                else:
-                    await client.send_message(entity, message_text)
-                    logger.debug("Forwarded message without tag for user %s to %s", user_id, target_id)
-                    
-            except FloodWaitError as fwe:
-                wait = int(getattr(fwe, "seconds", 10))
-                logger.warning("FloodWait for %s seconds. Pausing worker %d", wait, worker_id)
-                await asyncio.sleep(wait + 1)
+            client = user_clients.get(user_id)
+            if not client:
+                # user isn't currently connected; skip
+                logger.debug("Skipping send: client not connected for user %s", user_id)
+                continue
+
+            # ensure concurrency and rate-limit per user
+            _ensure_user_send_semaphore(user_id)
+            await _consume_token(user_id, 1.0)  # wait for token to be available
+            sem = user_send_semaphores[user_id]
+
+            async with sem:
                 try:
-                    await send_queue.put((user_id, client, target_id, message_text, task_filters, forward_tag, source_chat_id, message_id))
-                except asyncio.QueueFull:
-                    logger.warning("Send queue full while re-enqueueing after FloodWait; dropping message.")
-            except Exception as e:
-                logger.exception("Error sending message for user %s to %s: %s", user_id, target_id, e)
+                    entity = None
+                    ent = _get_cached_target(user_id, target_id)
+                    if ent:
+                        entity = ent
+                    else:
+                        entity = await resolve_target_entity_once(user_id, client, target_id)
+
+                    if not entity:
+                        logger.debug("Skipping send: target %s unresolved for user %s", target_id, user_id)
+                        continue
+
+                    try:
+                        if forward_tag and source_chat_id and message_id:
+                            try:
+                                source_entity = await client.get_input_entity(int(source_chat_id))
+                                await client.forward_messages(entity, message_id, source_entity)
+                                logger.debug("Forwarded message with tag for user %s to %s", user_id, target_id)
+                            except Exception as e:
+                                logger.warning("Failed to forward with tag, falling back to regular send: %s", e)
+                                await client.send_message(entity, message_text)
+                        else:
+                            await client.send_message(entity, message_text)
+                            logger.debug("Forwarded message without tag for user %s to %s", user_id, target_id)
+                            
+                    except FloodWaitError as fwe:
+                        wait = int(getattr(fwe, "seconds", 10))
+                        logger.warning("FloodWait for %s seconds. Re-enqueueing job and sleeping worker %d", wait, worker_id)
+                        # Re-enqueue with a delay using a background task so we don't block worker loop too long
+                        async def _requeue_later(delay, job_item):
+                            try:
+                                await asyncio.sleep(delay)
+                                try:
+                                    await send_queue.put(job_item)
+                                except asyncio.QueueFull:
+                                    logger.warning("Send queue full while re-enqueueing after FloodWait; dropping message.")
+                            except Exception:
+                                logger.exception("Error in delayed requeue")
+                        asyncio.create_task(_requeue_later(wait + 1, job))
+                    except Exception as e:
+                        logger.exception("Error sending message for user %s to %s: %s", user_id, target_id, e)
+
+                except Exception:
+                    logger.exception("Unexpected error in per-send block for worker %d", worker_id)
 
         except Exception:
             logger.exception("Unexpected error in send worker %d", worker_id)
@@ -2001,7 +2114,9 @@ async def start_forwarding_for_user(user_id: int):
 
     client = user_clients[user_id]
     tasks_cache.setdefault(user_id, [])
-    target_entity_cache.setdefault(user_id, {})
+    _ensure_user_target_cache(user_id)
+    _ensure_user_send_semaphore(user_id)
+    _ensure_user_rate_limiter(user_id)
 
     ensure_handler_registered_for_user(user_id, client)
 
@@ -2010,14 +2125,9 @@ async def start_forwarding_for_user(user_id: int):
 async def restore_sessions():
     logger.info("🔄 Restoring sessions...")
 
-    def _fetch_logged_in_users():
-        conn = db.get_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT user_id, session_data FROM users WHERE is_logged_in = 1")
-        return cur.fetchall()
-
     try:
-        users = await asyncio.to_thread(_fetch_logged_in_users)
+        # Fetch at most MAX_CONCURRENT_USERS sessions to restore at startup to avoid OOM
+        users = await asyncio.to_thread(lambda: db.get_logged_in_users(MAX_CONCURRENT_USERS))
     except Exception:
         logger.exception("Error fetching logged-in users from DB")
         users = []
@@ -2041,41 +2151,54 @@ async def restore_sessions():
             "filters": t.get("filters", {})
         })
 
-    logger.info("📊 Found %d logged in user(s)", len(users))
+    logger.info("📊 Scheduled restore for %d logged in user(s) (up to MAX_CONCURRENT_USERS=%d)", len(users), MAX_CONCURRENT_USERS)
 
-    batch_size = 5
-    for i in range(0, len(users), batch_size):
-        batch = users[i:i + batch_size]
-        restore_tasks = []
-        
-        for row in batch:
+    # Restore in small batches to reduce parallel connection spikes
+    batch_size = 3
+    restore_tasks = []
+    for row in users:
+        try:
+            user_id = row.get("user_id") if isinstance(row, dict) else row[0]
+            session_data = row.get("session_data") if isinstance(row, dict) else row[1]
+        except Exception:
             try:
-                user_id = row["user_id"] if isinstance(row, dict) or hasattr(row, "keys") else row[0]
-                session_data = row["session_data"] if isinstance(row, dict) or hasattr(row, "keys") else row[1]
+                user_id, session_data = row[0], row[1]
             except Exception:
-                try:
-                    user_id, session_data = row[0], row[1]
-                except Exception:
-                    continue
+                continue
 
-            if session_data:
-                restore_tasks.append(restore_single_session(user_id, session_data))
-        
-        if restore_tasks:
+        if session_data:
+            restore_tasks.append(restore_single_session(user_id, session_data))
+
+        # If we have batch_size tasks, run them concurrently
+        if len(restore_tasks) >= batch_size:
             await asyncio.gather(*restore_tasks, return_exceptions=True)
+            restore_tasks = []
             await asyncio.sleep(1)
+    if restore_tasks:
+        await asyncio.gather(*restore_tasks, return_exceptions=True)
 
 
 async def restore_single_session(user_id: int, session_data: str):
     """Restore a single user session with error handling"""
     try:
-        # FIXED: Simplified Telethon client initialization
         client = TelegramClient(StringSession(session_data), API_ID, API_HASH)
         await client.connect()
 
         if await client.is_user_authorized():
+            # If we're already at capacity, skip restoring this session (it remains persisted in DB)
+            if len(user_clients) >= MAX_CONCURRENT_USERS:
+                logger.info("Skipping restore for user %s due to capacity limits", user_id)
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+                await db_call(db.save_user, user_id, None, None, None, True)  # keep logged flag
+                return
+
             user_clients[user_id] = client
-            target_entity_cache.setdefault(user_id, {})
+            target_entity_cache.setdefault(user_id, OrderedDict())
+            _ensure_user_send_semaphore(user_id)
+            _ensure_user_rate_limiter(user_id)
             user_tasks = tasks_cache.get(user_id, [])
             all_targets = []
             for tt in user_tasks:
@@ -2093,6 +2216,7 @@ async def restore_single_session(user_id: int, session_data: str):
     except Exception as e:
         logger.exception("❌ Failed to restore session for user %s: %s", user_id, e)
         try:
+            # Leave DB logged-in flag as-is (so user can be restored later), but mark session invalid if needed
             await db_call(db.save_user, user_id, None, None, None, False)
         except Exception:
             logger.exception("Error marking user logged out after failed restore for %s", user_id)
@@ -2136,6 +2260,9 @@ async def shutdown_cleanup():
             await asyncio.gather(*disconnect_tasks, return_exceptions=True)
     
     user_clients.clear()
+    target_entity_cache.clear()
+    user_send_semaphores.clear()
+    user_rate_limiters.clear()
 
     try:
         db.close_connection()
