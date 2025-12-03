@@ -2382,8 +2382,50 @@ def main():
     try:
         application.run_polling(drop_pending_updates=True)
     finally:
+        # Run shutdown_cleanup in a safe manner:
+        # - If there's a running loop (MAIN_LOOP from post_init or current running loop),
+        #   schedule shutdown_cleanup there and wait for completion.
+        # - Otherwise create a temporary loop to run cleanup so Telethon/asyncio internals
+        #   don't attempt to use a closed loop.
         try:
-            asyncio.run(shutdown_cleanup())
+            loop_to_use = None
+            try:
+                # Prefer MAIN_LOOP set during post_init if available and running
+                if MAIN_LOOP is not None and getattr(MAIN_LOOP, "is_running", lambda: False)():
+                    loop_to_use = MAIN_LOOP
+                else:
+                    # fallback to any running loop in this thread
+                    running_loop = None
+                    try:
+                        running_loop = asyncio.get_running_loop()
+                    except RuntimeError:
+                        running_loop = None
+                    if running_loop is not None and getattr(running_loop, "is_running", lambda: False)():
+                        loop_to_use = running_loop
+            except Exception:
+                loop_to_use = None
+
+            if loop_to_use:
+                try:
+                    future = asyncio.run_coroutine_threadsafe(shutdown_cleanup(), loop_to_use)
+                    future.result(timeout=30)
+                except Exception:
+                    logger.exception("Error waiting for shutdown_cleanup scheduled on running loop")
+            else:
+                # No running loop available; create a temporary loop to run cleanup.
+                tmp_loop = asyncio.new_event_loop()
+                try:
+                    asyncio.set_event_loop(tmp_loop)
+                    tmp_loop.run_until_complete(shutdown_cleanup())
+                finally:
+                    try:
+                        tmp_loop.close()
+                    except Exception:
+                        pass
+                    try:
+                        asyncio.set_event_loop(None)
+                    except Exception:
+                        pass
         except Exception:
             logger.exception("Error during shutdown cleanup")
 
