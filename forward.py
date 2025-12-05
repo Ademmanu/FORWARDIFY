@@ -6,6 +6,8 @@ import functools
 import gc
 import re
 import time
+import signal
+import threading
 from typing import Dict, List, Optional, Tuple, Set, Callable, Any
 from collections import OrderedDict
 from telethon import TelegramClient, events
@@ -2227,6 +2229,7 @@ async def shutdown_cleanup():
     """Disconnect Telethon clients and cancel worker tasks cleanly."""
     logger.info("Shutdown cleanup: cancelling worker tasks and disconnecting clients...")
 
+    # Cancel our worker tasks
     for t in list(worker_tasks):
         try:
             t.cancel()
@@ -2238,6 +2241,7 @@ async def shutdown_cleanup():
         except Exception:
             logger.exception("Error while awaiting worker task cancellations")
 
+    # Attempt to disconnect Telethon clients in a best-effort way
     user_ids = list(user_clients.keys())
     batch_size = 5
     for i in range(0, len(user_ids), batch_size):
@@ -2245,20 +2249,39 @@ async def shutdown_cleanup():
         disconnect_tasks = []
         for uid in batch:
             client = user_clients.get(uid)
-            if client:
-                handler = handler_registered.get(uid)
-                if handler:
-                    try:
-                        client.remove_event_handler(handler)
-                    except Exception:
-                        logger.exception("Error removing event handler during shutdown for user %s", uid)
-                    handler_registered.pop(uid, None)
+            if not client:
+                continue
 
+            # Remove registered handler if any
+            handler = handler_registered.get(uid)
+            if handler:
+                try:
+                    client.remove_event_handler(handler)
+                except Exception:
+                    logger.exception("Error removing event handler during shutdown for user %s", uid)
+                handler_registered.pop(uid, None)
+
+            try:
                 disconnect_tasks.append(client.disconnect())
-        
+            except Exception:
+                # Fallback synchronous close of session object if present
+                try:
+                    sess = getattr(client, "session", None)
+                    if sess is not None:
+                        try:
+                            sess.close()
+                        except Exception:
+                            logger.exception("Failed to close client.session for user %s", uid)
+                except Exception:
+                    logger.exception("Failed fallback client close for user %s", uid)
+
         if disconnect_tasks:
-            await asyncio.gather(*disconnect_tasks, return_exceptions=True)
-    
+            try:
+                await asyncio.gather(*disconnect_tasks, return_exceptions=True)
+            except Exception:
+                logger.exception("Error while awaiting client disconnects for a batch")
+
+    # Clear runtime caches
     user_clients.clear()
     target_entity_cache.clear()
     user_send_semaphores.clear()
@@ -2281,6 +2304,29 @@ async def post_init(application: Application):
 
     await application.bot.delete_webhook(drop_pending_updates=True)
     logger.info("🧹 Cleared webhooks")
+
+    # Register signals so we run cleanup while loop is still running
+    def _signal_handler(sig_num, frame):
+        logger.info("Signal %s received, scheduling shutdown...", sig_num)
+        try:
+            if MAIN_LOOP is not None and getattr(MAIN_LOOP, "is_running", lambda: False)():
+                # Schedule shutdown on MAIN_LOOP
+                future = asyncio.run_coroutine_threadsafe(_graceful_shutdown(application), MAIN_LOOP)
+                try:
+                    future.result(timeout=30)
+                except Exception:
+                    logger.exception("Graceful shutdown timed out or failed")
+            else:
+                logger.warning("Main loop not available when signal received")
+        except Exception:
+            logger.exception("Error in signal handler")
+
+    # Attach handlers for common termination signals
+    try:
+        signal.signal(signal.SIGINT, _signal_handler)
+        signal.signal(signal.SIGTERM, _signal_handler)
+    except Exception:
+        logger.exception("Failed to register signal handlers; platform may not support them")
 
     if OWNER_IDS:
         for oid in OWNER_IDS:
@@ -2340,6 +2386,22 @@ async def post_init(application: Application):
     logger.info("✅ Bot initialized!")
 
 
+async def _graceful_shutdown(application: Application):
+    """Run shutdown_cleanup and stop the application, executed on MAIN_LOOP."""
+    try:
+        await shutdown_cleanup()
+    except Exception:
+        logger.exception("Error during graceful shutdown_cleanup")
+    try:
+        # Attempt to stop the PTB application gracefully
+        try:
+            await application.stop()
+        except Exception:
+            logger.exception("Error stopping Application during graceful shutdown")
+    except Exception:
+        logger.exception("Error scheduling application stop during graceful shutdown")
+
+
 def _get_memory_usage_mb():
     """Get current memory usage in MB"""
     try:
@@ -2382,26 +2444,20 @@ def main():
     try:
         application.run_polling(drop_pending_updates=True)
     finally:
-        # Run shutdown_cleanup in a safe manner:
-        # - If there's a running loop (MAIN_LOOP from post_init or current running loop),
-        #   schedule shutdown_cleanup there and wait for completion.
-        # - Otherwise create a temporary loop to run cleanup so Telethon/asyncio internals
-        #   don't attempt to use a closed loop.
+        # Fallback cleanup if shutdown did not run via signals
         try:
+            # Prefer MAIN_LOOP if it's running
             loop_to_use = None
             try:
-                # Prefer MAIN_LOOP set during post_init if available and running
                 if MAIN_LOOP is not None and getattr(MAIN_LOOP, "is_running", lambda: False)():
                     loop_to_use = MAIN_LOOP
                 else:
-                    # fallback to any running loop in this thread
-                    running_loop = None
                     try:
                         running_loop = asyncio.get_running_loop()
+                        if getattr(running_loop, "is_running", lambda: False)():
+                            loop_to_use = running_loop
                     except RuntimeError:
-                        running_loop = None
-                    if running_loop is not None and getattr(running_loop, "is_running", lambda: False)():
-                        loop_to_use = running_loop
+                        loop_to_use = None
             except Exception:
                 loop_to_use = None
 
@@ -2410,9 +2466,9 @@ def main():
                     future = asyncio.run_coroutine_threadsafe(shutdown_cleanup(), loop_to_use)
                     future.result(timeout=30)
                 except Exception:
-                    logger.exception("Error waiting for shutdown_cleanup scheduled on running loop")
+                    logger.exception("Error waiting for fallback shutdown_cleanup scheduled on running loop")
             else:
-                # No running loop available; create a temporary loop to run cleanup.
+                # create temporary loop and run cleanup
                 tmp_loop = asyncio.new_event_loop()
                 try:
                     asyncio.set_event_loop(tmp_loop)
@@ -2427,7 +2483,7 @@ def main():
                     except Exception:
                         pass
         except Exception:
-            logger.exception("Error during shutdown cleanup")
+            logger.exception("Error during fallback shutdown cleanup")
 
 
 if __name__ == "__main__":
