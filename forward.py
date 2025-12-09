@@ -60,21 +60,6 @@ if allowed_env:
         except ValueError:
             logger.warning("Invalid ALLOWED_USERS value skipped: %s", part)
 
-# User sessions stored in environment variable (format: user_id:session_string,user_id:session_string)
-USER_SESSIONS: Dict[int, str] = {}
-user_sessions_env = os.getenv("USER_SESSIONS", "").strip()
-if user_sessions_env:
-    for session_pair in user_sessions_env.split(","):
-        session_pair = session_pair.strip()
-        if not session_pair or ":" not in session_pair:
-            continue
-        try:
-            user_id_str, session_string = session_pair.split(":", 1)
-            user_id = int(user_id_str.strip())
-            USER_SESSIONS[user_id] = session_string.strip()
-        except (ValueError, IndexError):
-            logger.warning("Invalid USER_SESSIONS entry skipped: %s", session_pair)
-
 # OPTIMIZED Tuning parameters for Render free tier (25 concurrent users)
 SEND_WORKER_COUNT = int(os.getenv("SEND_WORKER_COUNT", "8"))  # Lowered workers to save memory
 SEND_QUEUE_MAXSIZE = int(os.getenv("SEND_QUEUE_MAXSIZE", "5000"))  # Reduced queue size
@@ -153,70 +138,6 @@ async def optimized_gc():
         collected = gc.collect()
         logger.debug(f"Garbage collection freed {collected} objects")
         _last_gc_run = current_time
-
-
-# ---------- String Session Management ----------
-async def save_user_session_to_env(user_id: int, session_string: str):
-    """Save user session string and notify owners"""
-    # Update in-memory cache
-    USER_SESSIONS[user_id] = session_string
-    
-    # Get user info for notification
-    client = user_clients.get(user_id)
-    user_info = ""
-    if client:
-        try:
-            me = await client.get_me()
-            user_info = f"👤 User: {me.first_name or 'Unknown'}\n📱 Phone: {me.phone}\n🆔 User ID: {me.id}"
-        except Exception:
-            user_info = f"🆔 User ID: {user_id}"
-    
-    # Create session format for env var
-    session_env_format = f"{user_id}:{session_string}"
-    
-    # Notify all owners about new session
-    for owner_id in OWNER_IDS:
-        try:
-            bot = None
-            # Get bot instance from context or application
-            for app in Application._instances:
-                if hasattr(app, 'bot'):
-                    bot = app.bot
-                    break
-            
-            if bot:
-                notification = (
-                    f"🔐 **New User Session Generated**\n\n"
-                    f"{user_info}\n\n"
-                    f"📋 **Session String:**\n"
-                    f"```\n{session_string}\n```\n\n"
-                    f"📝 **Env Var Format:**\n"
-                    f"```\n{session_env_format}\n```\n\n"
-                    f"💡 **Add this to USER_SESSIONS env var for persistence.**"
-                )
-                await bot.send_message(
-                    chat_id=owner_id,
-                    text=notification,
-                    parse_mode="Markdown"
-                )
-                logger.info(f"Notified owner {owner_id} about new session for user {user_id}")
-        except Exception as e:
-            logger.error(f"Failed to notify owner {owner_id}: {e}")
-
-
-async def get_all_sessions_env_format() -> str:
-    """Get all sessions in env var format"""
-    session_pairs = []
-    for user_id, session_string in USER_SESSIONS.items():
-        session_pairs.append(f"{user_id}:{session_string}")
-    return ",".join(session_pairs)
-
-
-async def get_user_session_env_format(user_id: int) -> Optional[str]:
-    """Get specific user session in env var format"""
-    if user_id in USER_SESSIONS:
-        return f"{user_id}:{USER_SESSIONS[user_id]}"
-    return None
 
 
 # ---------- Helpers: LRU target cache and per-user limiters ----------
@@ -445,12 +366,6 @@ async def check_authorization(update: Update, context: ContextTypes.DEFAULT_TYPE
     return True
 
 
-async def check_owner(update: Update) -> bool:
-    """Check if user is an owner/admin"""
-    user_id = update.effective_user.id
-    return user_id in OWNER_IDS or await db_call(db.is_user_admin, user_id)
-
-
 # ---------- Simple UI handlers ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -458,17 +373,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_authorization(update, context):
         return
 
-    # Check if user has active session
-    is_logged_in = user_id in user_clients
-    user_session_exists = user_id in USER_SESSIONS
-    
+    user = await db_call(db.get_user, user_id)
+
     user_name = update.effective_user.first_name or "User"
+    user_phone = user["phone"] if user and user["phone"] else "Not connected"
+    is_logged_in = user and user["is_logged_in"]
+
     status_emoji = "🟢" if is_logged_in else "🔴"
     status_text = "Online" if is_logged_in else "Offline"
-    
-    if user_session_exists and not is_logged_in:
-        status_emoji = "🟡"
-        status_text = "Session exists (needs restart)"
 
     message_text = f"""
 ╔═══════════════════════════╗
@@ -479,8 +391,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 👤 **User:** {user_name}
+📱 **Phone:** `{user_phone}`
 {status_emoji} **Status:** {status_text}
-{'📋 **Session:** Saved in env var' if user_session_exists else '⚠️ **Session:** Not saved'}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -572,7 +484,8 @@ async def forwadd_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_authorization(update, context):
         return
 
-    if user_id not in user_clients:
+    user = await db_call(db.get_user, user_id)
+    if not user or not user["is_logged_in"]:
         await update.message.reply_text(
             "❌ **You need to connect your account first!**\n\nUse /login to connect your Telegram account.",
             parse_mode="Markdown"
@@ -1289,94 +1202,6 @@ async def handle_confirm_delete(update: Update, context: ContextTypes.DEFAULT_TY
         )
 
 
-# ---------- New Commands for Owners ----------
-async def getstrings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Get all string sessions in env var format (Owner only)"""
-    user_id = update.effective_user.id
-    
-    if not await check_owner(update):
-        await update.message.reply_text("❌ **Owner Only**\n\nThis command is only available to owners.", parse_mode="Markdown")
-        return
-    
-    if not USER_SESSIONS:
-        await update.message.reply_text(
-            "📭 **No Sessions Found**\n\n"
-            "No user sessions are currently saved.\n"
-            "Sessions will appear here after users log in.",
-            parse_mode="Markdown"
-        )
-        return
-    
-    env_format = await get_all_sessions_env_format()
-    session_count = len(USER_SESSIONS)
-    
-    message = f"📋 **All String Sessions ({session_count})**\n\n"
-    message += "**Env Var Format:**\n"
-    message += "```\n"
-    message += env_format
-    message += "\n```\n\n"
-    
-    message += "**Individual Sessions:**\n"
-    for user_id, session_string in USER_SESSIONS.items():
-        message += f"`{user_id}:{session_string[:30]}...`\n"
-    
-    message += "\n💡 **Copy the env var format above and add to USER_SESSIONS env var for persistence.**"
-    
-    await update.message.reply_text(message, parse_mode="Markdown")
-
-
-async def getuserstring_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Get string session for specific user (Owner only)"""
-    user_id = update.effective_user.id
-    
-    if not await check_owner(update):
-        await update.message.reply_text("❌ **Owner Only**\n\nThis command is only available to owners.", parse_mode="Markdown")
-        return
-    
-    text = update.message.text.strip()
-    parts = text.split()
-    
-    if len(parts) < 2:
-        await update.message.reply_text(
-            "❌ **Invalid format!**\n\n"
-            "**Usage:** `/getuserstring [USER_ID]`\n\n"
-            "**Example:** `/getuserstring 123456789`",
-            parse_mode="Markdown"
-        )
-        return
-    
-    try:
-        target_user_id = int(parts[1])
-        session_string = USER_SESSIONS.get(target_user_id)
-        
-        if not session_string:
-            await update.message.reply_text(
-                f"❌ **No session found for user ID `{target_user_id}`**",
-                parse_mode="Markdown"
-            )
-            return
-        
-        env_format = f"{target_user_id}:{session_string}"
-        
-        message = f"🔐 **Session for User ID: `{target_user_id}`**\n\n"
-        message += "**Full Session String:**\n"
-        message += "```\n"
-        message += session_string
-        message += "\n```\n\n"
-        
-        message += "**Env Var Format:**\n"
-        message += "```\n"
-        message += env_format
-        message += "\n```\n\n"
-        
-        message += "💡 **Add this to USER_SESSIONS env var for persistence.**"
-        
-        await update.message.reply_text(message, parse_mode="Markdown")
-        
-    except ValueError:
-        await update.message.reply_text("❌ **Invalid user ID!**\n\nUser ID must be a number.", parse_mode="Markdown")
-
-
 # ---------- Login/logout commands ----------
 async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id if update.effective_user else update.callback_query.from_user.id
@@ -1394,9 +1219,12 @@ async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if user_id in user_clients:
+    user = await db_call(db.get_user, user_id)
+    if user and user.get("is_logged_in"):
         await message.reply_text(
             "✅ **You are already logged in!**\n\n"
+            f"📱 Phone: `{user['phone']}`\n"
+            f"👤 Name: `{user['name']}`\n\n"
             "Use /logout if you want to disconnect.",
             parse_mode="Markdown",
         )
@@ -1589,8 +1417,7 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
                 me = await client.get_me()
                 session_string = client.session.save()
 
-                # Save user session to environment variable cache and notify owners
-                await save_user_session_to_env(user_id, session_string)
+                await db_call(db.save_user, user_id, state["phone"], me.first_name, session_string, True)
 
                 user_clients[user_id] = client
                 tasks_cache.setdefault(user_id, [])
@@ -1676,8 +1503,7 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
                 me = await client.get_me()
                 session_string = client.session.save()
 
-                # Save user session to environment variable cache and notify owners
-                await save_user_session_to_env(user_id, session_string)
+                await db_call(db.save_user, user_id, state["phone"], me.first_name, session_string, True)
 
                 user_clients[user_id] = client
                 tasks_cache.setdefault(user_id, [])
@@ -1741,18 +1567,20 @@ async def logout_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     message = update.message if update.message else update.callback_query.message
 
-    if user_id not in user_clients:
+    user = await db_call(db.get_user, user_id)
+    if not user or not user["is_logged_in"]:
         await message.reply_text(
             "❌ **You're not connected!**\n\n" "Use /login to connect your account.", parse_mode="Markdown"
         )
         return
 
-    logout_states[user_id] = {}
+    logout_states[user_id] = {"phone": user["phone"]}
 
     await message.reply_text(
         "⚠️ **Confirm Logout**\n\n"
-        "Type `CONFIRM LOGOUT` exactly to disconnect your account.\n\n"
-        "⚠️ **Warning:** This will stop all forwarding tasks until you login again!",
+        f"📱 **Enter your phone number to confirm disconnection:**\n\n"
+        f"Your connected phone: `{user['phone']}`\n\n"
+        "Type your phone number exactly to confirm logout.",
         parse_mode="Markdown",
     )
 
@@ -1764,12 +1592,14 @@ async def handle_logout_confirmation(update: Update, context: ContextTypes.DEFAU
         return False
 
     text = update.message.text.strip()
+    stored_phone = logout_states[user_id]["phone"]
 
-    if text != "CONFIRM LOGOUT":
+    if text != stored_phone:
         await update.message.reply_text(
-            "❌ **Confirmation text doesn't match!**\n\n"
-            "Please type exactly: `CONFIRM LOGOUT`\n\n"
-            "Or use /start to cancel.",
+            "❌ **Phone number doesn't match!**\n\n"
+            f"Expected: `{stored_phone}`\n"
+            f"You entered: `{text}`\n\n"
+            "Please try again or use /start to cancel.",
             parse_mode="Markdown",
         )
         return True
@@ -1791,33 +1621,11 @@ async def handle_logout_confirmation(update: Update, context: ContextTypes.DEFAU
         finally:
             user_clients.pop(user_id, None)
 
-    # Remove session from environment variable cache
-    USER_SESSIONS.pop(user_id, None)
+    try:
+        await db_call(db.save_user, user_id, None, None, None, False)
+    except Exception:
+        logger.exception("Error saving user logout state for %s", user_id)
     
-    # Notify owners about session removal
-    for owner_id in OWNER_IDS:
-        try:
-            bot = None
-            for app in Application._instances:
-                if hasattr(app, 'bot'):
-                    bot = app.bot
-                    break
-            
-            if bot:
-                notification = (
-                    f"🚪 **User Logged Out**\n\n"
-                    f"🆔 User ID: {user_id}\n\n"
-                    f"📋 **Session removed from cache.**\n"
-                    f"Remove `{user_id}:...` from USER_SESSIONS env var."
-                )
-                await bot.send_message(
-                    chat_id=owner_id,
-                    text=notification,
-                    parse_mode="Markdown"
-                )
-        except Exception as e:
-            logger.error(f"Failed to notify owner {owner_id} about logout: {e}")
-
     tasks_cache.pop(user_id, None)
     target_entity_cache.pop(user_id, None)
     user_send_semaphores.pop(user_id, None)
@@ -1839,7 +1647,8 @@ async def getallid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_authorization(update, context):
         return
 
-    if user_id not in user_clients:
+    user = await db_call(db.get_user, user_id)
+    if not user or not user["is_logged_in"]:
         await update.message.reply_text("❌ **You need to connect your account first!**\n\n" "Use /login to connect.", parse_mode="Markdown")
         return
 
@@ -1936,7 +1745,10 @@ async def removeuser_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 finally:
                     user_clients.pop(remove_user_id, None)
 
-            USER_SESSIONS.pop(remove_user_id, None)
+            try:
+                await db_call(db.save_user, remove_user_id, None, None, None, False)
+            except Exception:
+                logger.exception("Error saving user logged_out state for %s", remove_user_id)
 
             tasks_cache.pop(remove_user_id, None)
             target_entity_cache.pop(remove_user_id, None)
@@ -2311,9 +2123,16 @@ async def start_forwarding_for_user(user_id: int):
     ensure_handler_registered_for_user(user_id, client)
 
 
-# ---------- Session restore from ENV ----------
+# ---------- Session restore ----------
 async def restore_sessions():
-    logger.info("🔄 Restoring sessions from USER_SESSIONS env var...")
+    logger.info("🔄 Restoring sessions...")
+
+    try:
+        # Fetch at most MAX_CONCURRENT_USERS sessions to restore at startup to avoid OOM
+        users = await asyncio.to_thread(lambda: db.get_logged_in_users(MAX_CONCURRENT_USERS))
+    except Exception:
+        logger.exception("Error fetching logged-in users from DB")
+        users = []
 
     try:
         all_active = await db_call(db.get_all_active_tasks)
@@ -2334,38 +2153,50 @@ async def restore_sessions():
             "filters": t.get("filters", {})
         })
 
-    # Restore sessions from USER_SESSIONS env var
-    session_count = len(USER_SESSIONS)
-    logger.info("📊 Found %d user sessions in USER_SESSIONS env var", session_count)
+    logger.info("📊 Scheduled restore for %d logged in user(s) (up to MAX_CONCURRENT_USERS=%d)", len(users), MAX_CONCURRENT_USERS)
 
     # Restore in small batches to reduce parallel connection spikes
     batch_size = 3
     restore_tasks = []
-    for user_id, session_string in USER_SESSIONS.items():
-        restore_tasks.append(restore_single_session(user_id, session_string))
+    for row in users:
+        try:
+            user_id = row.get("user_id") if isinstance(row, dict) else row[0]
+            session_data = row.get("session_data") if isinstance(row, dict) else row[1]
+        except Exception:
+            try:
+                user_id, session_data = row[0], row[1]
+            except Exception:
+                continue
+
+        if session_data:
+            restore_tasks.append(restore_single_session(user_id, session_data))
 
         # If we have batch_size tasks, run them concurrently
         if len(restore_tasks) >= batch_size:
             await asyncio.gather(*restore_tasks, return_exceptions=True)
             restore_tasks = []
             await asyncio.sleep(1)
-    
     if restore_tasks:
         await asyncio.gather(*restore_tasks, return_exceptions=True)
 
 
-async def restore_single_session(user_id: int, session_string: str):
-    """Restore a single user session from string with error handling"""
+async def restore_single_session(user_id: int, session_data: str):
+    """Restore a single user session with error handling"""
     try:
-        # If we're already at capacity, skip restoring this session
-        if len(user_clients) >= MAX_CONCURRENT_USERS:
-            logger.info("Skipping restore for user %s due to capacity limits", user_id)
-            return
-
-        client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
+        client = TelegramClient(StringSession(session_data), API_ID, API_HASH)
         await client.connect()
 
         if await client.is_user_authorized():
+            # If we're already at capacity, skip restoring this session (it remains persisted in DB)
+            if len(user_clients) >= MAX_CONCURRENT_USERS:
+                logger.info("Skipping restore for user %s due to capacity limits", user_id)
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+                await db_call(db.save_user, user_id, None, None, None, True)  # keep logged flag
+                return
+
             user_clients[user_id] = client
             target_entity_cache.setdefault(user_id, OrderedDict())
             _ensure_user_send_semaphore(user_id)
@@ -2382,11 +2213,15 @@ async def restore_single_session(user_id: int, session_string: str):
             await start_forwarding_for_user(user_id)
             logger.info("✅ Restored session for user %s", user_id)
         else:
-            # Session expired, remove from cache
-            USER_SESSIONS.pop(user_id, None)
-            logger.warning("⚠️ Session expired for user %s, removed from cache", user_id)
+            await db_call(db.save_user, user_id, None, None, None, False)
+            logger.warning("⚠️ Session expired for user %s", user_id)
     except Exception as e:
         logger.exception("❌ Failed to restore session for user %s: %s", user_id, e)
+        try:
+            # Leave DB logged-in flag as-is (so user can be restored later), but mark session invalid if needed
+            await db_call(db.save_user, user_id, None, None, None, False)
+        except Exception:
+            logger.exception("Error marking user logged out after failed restore for %s", user_id)
 
 
 # ---------- Graceful shutdown cleanup ----------
@@ -2525,7 +2360,6 @@ async def post_init(application: Application):
                 "send_queue_size": q,
                 "worker_count": len(worker_tasks),
                 "active_user_clients_count": len(user_clients),
-                "stored_sessions_count": len(USER_SESSIONS),
                 "tasks_cache_counts": {uid: len(tasks_cache.get(uid, [])) for uid in list(tasks_cache.keys())},
                 "memory_usage_mb": _get_memory_usage_mb(),
             }
@@ -2600,8 +2434,6 @@ def main():
     application.add_handler(CommandHandler("forwadd", forwadd_command))
     application.add_handler(CommandHandler("fortasks", fortasks_command))
     application.add_handler(CommandHandler("getallid", getallid_command))
-    application.add_handler(CommandHandler("getstrings", getstrings_command))
-    application.add_handler(CommandHandler("getuserstring", getuserstring_command))
     application.add_handler(CommandHandler("adduser", adduser_command))
     application.add_handler(CommandHandler("removeuser", removeuser_command))
     application.add_handler(CommandHandler("listusers", listusers_command))
