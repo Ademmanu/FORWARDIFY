@@ -465,6 +465,22 @@ class Database:
             logger.exception("Error fetching logged-in users: %s", e)
             raise
 
+    def get_user_phone_status(self, user_id: int) -> Dict:
+        """Get user phone status (whether phone is set or not)"""
+        conn = self.get_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT phone, is_logged_in FROM users WHERE user_id = ?", (user_id,))
+            row = cur.fetchone()
+            if not row:
+                return {"has_phone": False, "is_logged_in": False}
+            
+            has_phone = row["phone"] is not None and row["phone"] != ""
+            return {"has_phone": has_phone, "is_logged_in": bool(row["is_logged_in"])}
+        except Exception as e:
+            logger.exception("Error in get_user_phone_status for %s: %s", user_id, e)
+            raise
+
     def get_db_status(self) -> Dict:
         """
         Return a small health/status snapshot for the DB:
