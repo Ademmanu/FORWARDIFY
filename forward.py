@@ -518,110 +518,85 @@ async def handle_phone_verification(update: Update, context: ContextTypes.DEFAUL
 
 # ---------- String Session Commands ----------
 async def getallstring_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Get all string sessions in env var format (owners only)"""
+    """Get all string sessions in env var format (owners only) - FIXED VERSION"""
     user_id = update.effective_user.id
     
     if user_id not in OWNER_IDS:
-        # Get message object
         if update.message:
             await update.message.reply_text("❌ **Only owners can use this command!**", parse_mode="Markdown")
         elif update.callback_query:
             await update.callback_query.answer("Only owners can use this command!", show_alert=True)
         return
     
-    # Get message object based on update type
+    # Get message object
     message_obj = update.message if update.message else update.callback_query.message
     
     if not message_obj:
         return
     
-    # Get all session strings from both database and current sessions
-    all_sessions = {}
+    # Show we're working
+    processing_msg = await message_obj.reply_text("⏳ **Searching database for sessions...**")
     
-    # Add sessions from current runtime
-    for uid, session_string in user_session_strings.items():
-        all_sessions[uid] = session_string
-    
-    # Add sessions from database
     try:
-        users = await asyncio.to_thread(lambda: db.get_logged_in_users(MAX_CONCURRENT_USERS * 2))
-        for row in users:
+        # Direct database query - simple and reliable
+        import sqlite3
+        
+        def query_database():
+            conn = sqlite3.connect("bot_data.db")
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            # Get all users with session data
+            cur.execute(
+                "SELECT user_id, session_data, name, phone FROM users WHERE session_data IS NOT NULL AND session_data != '' ORDER BY user_id"
+            )
+            rows = cur.fetchall()
+            conn.close()
+            return rows
+        
+        rows = await asyncio.to_thread(query_database)
+        
+        if not rows:
+            await processing_msg.edit_text("📭 **No string sessions found in database!**")
+            return
+        
+        # Delete processing message
+        await processing_msg.delete()
+        
+        # Send header
+        header_msg = await message_obj.reply_text(
+            "🔑 **All String Sessions**\n\n"
+            "**Well Arranged Copy-Paste Env Var Format:**\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+            parse_mode="Markdown"
+        )
+        
+        # Send each session one by one
+        for i, row in enumerate(rows, 1):
+            user_id_db = row["user_id"]
+            session_data = row["session_data"]
+            username = row["name"] or f"User {user_id_db}"
+            phone = row["phone"] or "Not available"
+            
+            message_text = f"👤 **User:** {username} (ID: `{user_id_db}`)\n"
+            message_text += f"📱 **Phone:** `{phone}`\n\n"
+            message_text += f"**Env Var Format:**\n```{user_id_db}:{session_data}```\n\n"
+            message_text += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            
             try:
-                uid = row.get("user_id") if isinstance(row, dict) else row[0]
-                session_data = row.get("session_data") if isinstance(row, dict) else row[1]
-                if session_data and uid not in all_sessions:
-                    all_sessions[uid] = session_data
-            except Exception:
+                await message_obj.reply_text(message_text, parse_mode="Markdown")
+            except Exception as e:
+                logger.error(f"Error sending session {i}: {e}")
                 continue
+        
+        # Send total count
+        await message_obj.reply_text(f"📊 **Total:** {len(rows)} session(s)")
+        
     except Exception as e:
-        logger.exception(f"Error fetching sessions from database: {e}")
-    
-    if not all_sessions:
-        await message_obj.reply_text("📭 **No string sessions available!**", parse_mode="Markdown")
-        return
-    
-    # If this was from a callback query, answer it first
-    if update.callback_query:
-        await update.callback_query.answer()
-    
-    message_text = "🔑 **All String Sessions**\n\n"
-    message_text += "**Well Arranged Copy-Paste Env Var Format:**\n\n"
-    message_text += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-    
-    env_var_format = []
-    
-    for uid, session_string in all_sessions.items():
-        # Get user info
-        user = await db_call(db.get_user, uid)
-        username = "Unknown"
-        phone = "Not available"
-        
-        if user:
-            if user.get("name"):
-                username = user["name"]
-            if user.get("phone"):
-                phone = user["phone"]
-            elif user.get("session_data"):
-                username = f"User (Session exists)"
-        
-        message_text += f"👤 **User:** {username} (ID: `{uid}`)\n"
-        message_text += f"📱 **Phone:** `{phone}`\n\n"
-        message_text += f"**Env Var Format:**\n```{uid}:{session_string}```\n\n"
-        message_text += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        
-        # Add to env var format list
-        env_var_format.append(f"{uid}:{session_string}")
-    
-    message_text += f"📊 **Total:** {len(all_sessions)} session(s)\n\n"
-    message_text += "💡 **Copy and add to USER_SESSIONS env var (comma-separated)**"
-    
-    # Also send the complete env var string
-    complete_env_var = ",".join(env_var_format)
-    message_text += f"\n\n**Complete env var value:**\n```USER_SESSIONS={complete_env_var}```"
-    
-    # Split message if too long
-    if len(message_text) > 4000:
-        parts = []
-        current_part = ""
-        lines = message_text.split('\n')
-        
-        for line in lines:
-            if len(current_part) + len(line) + 1 < 4000:
-                current_part += line + '\n'
-            else:
-                parts.append(current_part)
-                current_part = line + '\n'
-        
-        if current_part:
-            parts.append(current_part)
-        
-        for i, part in enumerate(parts):
-            if i == 0:
-                await message_obj.reply_text(part, parse_mode="Markdown")
-            else:
-                await message_obj.reply_text(part, parse_mode="Markdown")
-    else:
-        await message_obj.reply_text(message_text, parse_mode="Markdown")
+        logger.exception(f"Error in getallstring_command: {e}")
+        try:
+            await processing_msg.edit_text(f"❌ **Error fetching sessions:** {str(e)[:200]}")
+        except:
+            await message_obj.reply_text(f"❌ **Error:** {str(e)[:200]}")
 
 
 async def getuserstring_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -659,31 +634,15 @@ async def getuserstring_command(update: Update, context: ContextTypes.DEFAULT_TY
         await message_obj.reply_text("❌ **Invalid user ID!** Must be a number.", parse_mode="Markdown")
         return
     
-    # Try to get session from current runtime first
-    session_string = user_session_strings.get(target_user_id)
-    
-    # If not found, try database
-    if not session_string:
-        user = await db_call(db.get_user, target_user_id)
-        if user and user.get("session_data"):
-            session_string = user["session_data"]
-    
-    if not session_string:
+    # Try to get session from database
+    user = await db_call(db.get_user, target_user_id)
+    if not user or not user.get("session_data"):
         await message_obj.reply_text(f"❌ **No string session found for user ID `{target_user_id}`!**", parse_mode="Markdown")
         return
     
-    # Get user info
-    user = await db_call(db.get_user, target_user_id)
-    username = "Unknown"
-    phone = "Not available"
-    
-    if user:
-        if user.get("name"):
-            username = user["name"]
-        if user.get("phone"):
-            phone = user["phone"]
-        elif user.get("session_data"):
-            username = f"User (Session exists)"
+    session_string = user["session_data"]
+    username = user.get("name", "Unknown")
+    phone = user.get("phone", "Not available")
     
     message_text = f"🔑 **String Session for 👤 User:** {username} (ID: `{target_user_id}`)\n\n"
     message_text += f"📱 **Phone:** `{phone}`\n\n"
