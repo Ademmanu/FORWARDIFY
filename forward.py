@@ -522,7 +522,17 @@ async def getallstring_command(update: Update, context: ContextTypes.DEFAULT_TYP
     user_id = update.effective_user.id
     
     if user_id not in OWNER_IDS:
-        await update.message.reply_text("❌ **Only owners can use this command!**", parse_mode="Markdown")
+        # Get message object
+        if update.message:
+            await update.message.reply_text("❌ **Only owners can use this command!**", parse_mode="Markdown")
+        elif update.callback_query:
+            await update.callback_query.answer("Only owners can use this command!", show_alert=True)
+        return
+    
+    # Get message object based on update type
+    message_obj = update.message if update.message else update.callback_query.message
+    
+    if not message_obj:
         return
     
     # Get all session strings from both database and current sessions
@@ -547,12 +557,18 @@ async def getallstring_command(update: Update, context: ContextTypes.DEFAULT_TYP
         logger.exception(f"Error fetching sessions from database: {e}")
     
     if not all_sessions:
-        await update.message.reply_text("📭 **No string sessions available!**", parse_mode="Markdown")
+        await message_obj.reply_text("📭 **No string sessions available!**", parse_mode="Markdown")
         return
     
-    message = "🔑 **All String Sessions**\n\n"
-    message += "**Well Arranged Copy-Paste Env Var Format:**\n\n"
-    message += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    # If this was from a callback query, answer it first
+    if update.callback_query:
+        await update.callback_query.answer()
+    
+    message_text = "🔑 **All String Sessions**\n\n"
+    message_text += "**Well Arranged Copy-Paste Env Var Format:**\n\n"
+    message_text += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    
+    env_var_format = []
     
     for uid, session_string in all_sessions.items():
         # Get user info
@@ -568,19 +584,26 @@ async def getallstring_command(update: Update, context: ContextTypes.DEFAULT_TYP
             elif user.get("session_data"):
                 username = f"User (Session exists)"
         
-        message += f"👤 **User:** {username} (ID: `{uid}`)\n"
-        message += f"📱 **Phone:** `{phone}`\n\n"
-        message += f"**Env Var Format:**\n```{uid}:{session_string}```\n\n"
-        message += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        message_text += f"👤 **User:** {username} (ID: `{uid}`)\n"
+        message_text += f"📱 **Phone:** `{phone}`\n\n"
+        message_text += f"**Env Var Format:**\n```{uid}:{session_string}```\n\n"
+        message_text += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        
+        # Add to env var format list
+        env_var_format.append(f"{uid}:{session_string}")
     
-    message += f"📊 **Total:** {len(all_sessions)} session(s)\n\n"
-    message += "💡 **Copy and add to USER_SESSIONS env var (comma-separated)**"
+    message_text += f"📊 **Total:** {len(all_sessions)} session(s)\n\n"
+    message_text += "💡 **Copy and add to USER_SESSIONS env var (comma-separated)**"
+    
+    # Also send the complete env var string
+    complete_env_var = ",".join(env_var_format)
+    message_text += f"\n\n**Complete env var value:**\n```USER_SESSIONS={complete_env_var}```"
     
     # Split message if too long
-    if len(message) > 4000:
+    if len(message_text) > 4000:
         parts = []
         current_part = ""
-        lines = message.split('\n')
+        lines = message_text.split('\n')
         
         for line in lines:
             if len(current_part) + len(line) + 1 < 4000:
@@ -594,11 +617,11 @@ async def getallstring_command(update: Update, context: ContextTypes.DEFAULT_TYP
         
         for i, part in enumerate(parts):
             if i == 0:
-                await update.message.reply_text(part, parse_mode="Markdown")
+                await message_obj.reply_text(part, parse_mode="Markdown")
             else:
-                await update.message.reply_text(part, parse_mode="Markdown")
+                await message_obj.reply_text(part, parse_mode="Markdown")
     else:
-        await update.message.reply_text(message, parse_mode="Markdown")
+        await message_obj.reply_text(message_text, parse_mode="Markdown")
 
 
 async def getuserstring_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -606,11 +629,24 @@ async def getuserstring_command(update: Update, context: ContextTypes.DEFAULT_TY
     user_id = update.effective_user.id
     
     if user_id not in OWNER_IDS:
-        await update.message.reply_text("❌ **Only owners can use this command!**", parse_mode="Markdown")
+        # Get message object
+        if update.message:
+            await update.message.reply_text("❌ **Only owners can use this command!**", parse_mode="Markdown")
+        elif update.callback_query:
+            await update.callback_query.answer("Only owners can use this command!", show_alert=True)
+        return
+    
+    # Get message object based on update type
+    message_obj = update.message if update.message else None
+    if not message_obj and update.callback_query:
+        message_obj = update.callback_query.message
+        await update.callback_query.answer()
+    
+    if not message_obj:
         return
     
     if not context.args:
-        await update.message.reply_text(
+        await message_obj.reply_text(
             "❌ **Usage:** `/getuserstring [user_id]`\n\n"
             "**Example:** `/getuserstring 123456789`",
             parse_mode="Markdown"
@@ -620,7 +656,7 @@ async def getuserstring_command(update: Update, context: ContextTypes.DEFAULT_TY
     try:
         target_user_id = int(context.args[0])
     except ValueError:
-        await update.message.reply_text("❌ **Invalid user ID!** Must be a number.", parse_mode="Markdown")
+        await message_obj.reply_text("❌ **Invalid user ID!** Must be a number.", parse_mode="Markdown")
         return
     
     # Try to get session from current runtime first
@@ -633,7 +669,7 @@ async def getuserstring_command(update: Update, context: ContextTypes.DEFAULT_TY
             session_string = user["session_data"]
     
     if not session_string:
-        await update.message.reply_text(f"❌ **No string session found for user ID `{target_user_id}`!**", parse_mode="Markdown")
+        await message_obj.reply_text(f"❌ **No string session found for user ID `{target_user_id}`!**", parse_mode="Markdown")
         return
     
     # Get user info
@@ -649,12 +685,115 @@ async def getuserstring_command(update: Update, context: ContextTypes.DEFAULT_TY
         elif user.get("session_data"):
             username = f"User (Session exists)"
     
-    message = f"🔑 **String Session for 👤 User:** {username} (ID: `{target_user_id}`)\n\n"
-    message += f"📱 **Phone:** `{phone}`\n\n"
-    message += "**Env Var Format:**\n"
-    message += f"```{target_user_id}:{session_string}```"
+    message_text = f"🔑 **String Session for 👤 User:** {username} (ID: `{target_user_id}`)\n\n"
+    message_text += f"📱 **Phone:** `{phone}`\n\n"
+    message_text += "**Env Var Format:**\n"
+    message_text += f"```{target_user_id}:{session_string}```"
     
-    await update.message.reply_text(message, parse_mode="Markdown")
+    await message_obj.reply_text(message_text, parse_mode="Markdown")
+
+
+# ---------- Owner Menu Functions ----------
+async def show_owner_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show owner-only menu"""
+    query = update.callback_query
+    user_id = query.from_user.id
+    
+    if user_id not in OWNER_IDS:
+        await query.answer("Only owners can access this menu!", show_alert=True)
+        return
+    
+    await query.answer()
+    
+    message_text = "👑 **Owner Menu**\n\n"
+    message_text += "Administrative commands:\n\n"
+    message_text += "🔑 **Session Management:**\n"
+    message_text += "• Get all string sessions\n"
+    message_text += "• Get specific user's session\n\n"
+    message_text += "👥 **User Management:**\n"
+    message_text += "• List all allowed users\n"
+    message_text += "• Add new user\n"
+    message_text += "• Remove user\n"
+    
+    keyboard = [
+        [InlineKeyboardButton("🔑 Get All String Sessions", callback_data="get_all_strings")],
+        [InlineKeyboardButton("👤 Get User String Session", callback_data="get_user_string_prompt")],
+        [InlineKeyboardButton("👥 List All Users", callback_data="list_all_users")],
+        [InlineKeyboardButton("➕ Add User", callback_data="add_user_menu")],
+        [InlineKeyboardButton("➖ Remove User", callback_data="remove_user_menu")],
+        [InlineKeyboardButton("🔙 Back to Main Menu", callback_data="back_to_main")]
+    ]
+    
+    await query.edit_message_text(
+        message_text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+
+
+async def handle_owner_menu_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle owner menu actions"""
+    query = update.callback_query
+    user_id = query.from_user.id
+    action = query.data
+    
+    if user_id not in OWNER_IDS:
+        await query.answer("Only owners can access this menu!", show_alert=True)
+        return
+    
+    await query.answer()
+    
+    if action == "get_all_strings":
+        await query.message.delete()
+        await getallstring_command(update, context)
+    
+    elif action == "get_user_string_prompt":
+        await query.edit_message_text(
+            "👤 **Get User String Session**\n\n"
+            "Please use the command:\n"
+            "`/getuserstring [user_id]`\n\n"
+            "**Example:** `/getuserstring 123456789`\n\n"
+            "Or tap the button below to go back to the owner menu.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 Back to Owner Menu", callback_data="owner_commands")]
+            ])
+        )
+    
+    elif action == "list_all_users":
+        await query.message.delete()
+        await listusers_command(update, context)
+    
+    elif action == "add_user_menu":
+        await query.edit_message_text(
+            "➕ **Add User**\n\n"
+            "Please use the command:\n"
+            "`/adduser [user_id] [admin]`\n\n"
+            "**Examples:**\n"
+            "• `/adduser 123456789` - Add regular user\n"
+            "• `/adduser 123456789 admin` - Add admin user\n\n"
+            "Or tap the button below to go back to the owner menu.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 Back to Owner Menu", callback_data="owner_commands")]
+            ])
+        )
+    
+    elif action == "remove_user_menu":
+        await query.edit_message_text(
+            "➖ **Remove User**\n\n"
+            "Please use the command:\n"
+            "`/removeuser [user_id]`\n\n"
+            "**Example:** `/removeuser 123456789`\n\n"
+            "Or tap the button below to go back to the owner menu.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 Back to Owner Menu", callback_data="owner_commands")]
+            ])
+        )
+    
+    elif action == "back_to_main":
+        await show_main_menu(update, context, user_id)
 
 
 # ---------- Simple UI handlers ----------
@@ -695,7 +834,18 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, use
 
 🆔 **Utilities:**
   /getallid - Get all your chat IDs
-
+"""
+    
+    # Add owner commands section if user is owner
+    if user_id in OWNER_IDS:
+        message_text += "\n👑 **Owner Commands:**\n"
+        message_text += "  /getallstring - Get all string sessions\n"
+        message_text += "  /getuserstring - Get specific user's session\n"
+        message_text += "  /adduser - Add allowed user\n"
+        message_text += "  /removeuser - Remove user\n"
+        message_text += "  /listusers - List all allowed users\n"
+    
+    message_text += """
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 ⚙️ **How it works:**
@@ -713,6 +863,10 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, use
         keyboard.append([InlineKeyboardButton("🔴 Disconnect", callback_data="logout")])
     else:
         keyboard.append([InlineKeyboardButton("🟢 Connect Account", callback_data="login")])
+    
+    # Add owner menu button for owners
+    if user_id in OWNER_IDS:
+        keyboard.append([InlineKeyboardButton("👑 Owner Menu", callback_data="owner_commands")])
     
     if update.callback_query:
         await update.callback_query.message.edit_text(
@@ -768,7 +922,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.delete()
         await fortasks_command(update, context)
     elif query.data.startswith("chatids_"):
-        user_id = query.from_user.id
         if query.data == "chatids_back":
             await show_chat_categories(user_id, query.message.chat.id, query.message.message_id, context)
         else:
@@ -790,6 +943,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_prefix_suffix(update, context)
     elif query.data.startswith("confirm_delete_"):
         await handle_confirm_delete(update, context)
+    elif query.data == "owner_commands":
+        await show_owner_menu(update, context)
+    elif query.data in ["get_all_strings", "get_user_string_prompt", "list_all_users", 
+                       "add_user_menu", "remove_user_menu", "back_to_main"]:
+        await handle_owner_menu_actions(update, context)
 
 
 # ---------- Task creation flow ----------
@@ -2911,6 +3069,7 @@ def main():
 
     application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
+    # Register all command handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("login", login_command))
     application.add_handler(CommandHandler("logout", logout_command))
