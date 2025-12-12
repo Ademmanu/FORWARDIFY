@@ -8,7 +8,6 @@ import re
 import time
 import signal
 import threading
-import random
 from typing import Dict, List, Optional, Tuple, Set, Callable, Any
 from collections import OrderedDict, defaultdict
 from telethon import TelegramClient, events
@@ -26,8 +25,9 @@ from telegram.ext import (
 from database import Database
 from webserver import start_server_thread, register_monitoring
 
-# =================== CONFIGURATION ===================
+# =================== CONFIGURATION & OPTIMIZATION ===================
 
+# Optimized logging configuration - reduce I/O overhead
 logging.getLogger("telethon").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.basicConfig(
@@ -37,14 +37,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger("forward")
 
+# Environment variables with optimized defaults
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 
-# Pre-compiled regex patterns
-WORD_PATTERN = re.compile(r'\S+')
-NUMERIC_PATTERN = re.compile(r'^\d+$')
-ALPHABETIC_PATTERN = re.compile(r'^[A-Za-z]+$')
+# Pre-compile regex patterns for performance
 EMOJI_PATTERN = re.compile(
     "["
     "\U0001F600-\U0001F64F"
@@ -56,39 +54,45 @@ EMOJI_PATTERN = re.compile(
     "]+", flags=re.UNICODE
 )
 
-# User sessions from environment
+WORD_PATTERN = re.compile(r'\S+')
+NUMERIC_PATTERN = re.compile(r'^\d+$')
+ALPHABETIC_PATTERN = re.compile(r'^[A-Za-z]+$')
+
+# Cache for string sessions from environment
 USER_SESSIONS = {}
 user_sessions_env = os.getenv("USER_SESSIONS", "").strip()
 if user_sessions_env:
     for session_entry in user_sessions_env.split(","):
-        if ":" in session_entry:
-            try:
-                user_id_str, session_string = session_entry.split(":", 1)
-                USER_SESSIONS[int(user_id_str.strip())] = session_string.strip()
-            except ValueError:
-                continue
+        if not session_entry or ":" not in session_entry:
+            continue
+        try:
+            user_id_str, session_string = session_entry.split(":", 1)
+            user_id = int(user_id_str.strip())
+            USER_SESSIONS[user_id] = session_string.strip()
+        except ValueError:
+            continue
 
-# User ID sets
+# User ID sets for fast membership testing
 OWNER_IDS = set()
 owner_env = os.getenv("OWNER_IDS", "").strip()
 if owner_env:
-    OWNER_IDS.update(int(p) for p in owner_env.split(",") if p.strip().isdigit())
+    OWNER_IDS.update(int(part) for part in owner_env.split(",") if part.strip().isdigit())
 
 ALLOWED_USERS = set()
 allowed_env = os.getenv("ALLOWED_USERS", "").strip()
 if allowed_env:
-    ALLOWED_USERS.update(int(p) for p in allowed_env.split(",") if p.strip().isdigit())
+    ALLOWED_USERS.update(int(part) for part in allowed_env.split(",") if part.strip().isdigit())
 
-# Performance tuning for 50+ users
-SEND_WORKER_COUNT = int(os.getenv("SEND_WORKER_COUNT", "8"))
-SEND_QUEUE_MAXSIZE = int(os.getenv("SEND_QUEUE_MAXSIZE", "2000"))
+# Performance tuning parameters with memory optimization
+SEND_WORKER_COUNT = int(os.getenv("SEND_WORKER_COUNT", "4"))  # Reduced for memory
+SEND_QUEUE_MAXSIZE = int(os.getenv("SEND_QUEUE_MAXSIZE", "1000"))  # Smaller queue
 TARGET_RESOLVE_RETRY_SECONDS = int(os.getenv("TARGET_RESOLVE_RETRY_SECONDS", "15"))
-MAX_CONCURRENT_USERS = int(os.getenv("MAX_CONCURRENT_USERS", "50"))
-SEND_CONCURRENCY_PER_USER = int(os.getenv("SEND_CONCURRENCY_PER_USER", "1"))
+MAX_CONCURRENT_USERS = int(os.getenv("MAX_CONCURRENT_USERS", "20"))
+SEND_CONCURRENCY_PER_USER = int(os.getenv("SEND_CONCURRENCY_PER_USER", "2"))
 SEND_RATE_PER_USER = float(os.getenv("SEND_RATE_PER_USER", "3.0"))
-TARGET_ENTITY_CACHE_SIZE = int(os.getenv("TARGET_ENTITY_CACHE_SIZE", "50"))
+TARGET_ENTITY_CACHE_SIZE = int(os.getenv("TARGET_ENTITY_CACHE_SIZE", "100"))
 
-# =================== GLOBAL STATE ===================
+# =================== GLOBAL STATE & CACHES ===================
 
 db = Database()
 
@@ -100,7 +104,7 @@ user_session_strings: Dict[int, str] = {}
 phone_verification_states: Dict[int, Dict] = {}
 task_creation_states: Dict[int, Dict[str, Any]] = {}
 
-# Caches
+# Enhanced cache with LRU eviction
 tasks_cache: Dict[int, List[Dict]] = {}
 target_entity_cache: Dict[int, OrderedDict] = {}
 handler_registered: Dict[int, Callable] = {}
@@ -117,11 +121,11 @@ MAIN_LOOP: Optional[asyncio.AbstractEventLoop] = None
 
 # Memory management
 _last_gc_run = 0
-GC_INTERVAL = 300  # 5 minutes
+GC_INTERVAL = 600  # 10 minutes
 
-# Authorization cache
+# Authorization cache for faster checks
 _auth_cache: Dict[int, Tuple[bool, float]] = {}
-_AUTH_CACHE_TTL = 300
+_AUTH_CACHE_TTL = 300  # 5 minutes
 
 UNAUTHORIZED_MESSAGE = """🚫 **Access Denied!** 
 
@@ -134,7 +138,7 @@ Or
 🗨️ **Message Developer:** [HEMMY](https://t.me/justmemmy)
 """
 
-# =================== UTILITY FUNCTIONS ===================
+# =================== OPTIMIZED UTILITY FUNCTIONS ===================
 
 def _clean_phone_number(text: str) -> str:
     """Fast phone number cleaning"""
@@ -153,7 +157,7 @@ def _set_cached_auth(user_id: int, allowed: bool):
     _auth_cache[user_id] = (allowed, time.time())
 
 async def db_call(func, *args, **kwargs):
-    """Database call wrapper"""
+    """Optimized database call wrapper"""
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, functools.partial(func, *args, **kwargs))
 
@@ -162,7 +166,9 @@ async def optimized_gc():
     global _last_gc_run
     current_time = time.time()
     if current_time - _last_gc_run > GC_INTERVAL:
-        gc.collect(2)
+        collected = gc.collect(2)  # Generation 2 collection
+        if collected > 1000:
+            logger.debug(f"GC collected {collected} objects")
         _last_gc_run = current_time
 
 # =================== CACHE MANAGEMENT ===================
@@ -173,7 +179,7 @@ def _ensure_user_target_cache(user_id: int):
         target_entity_cache[user_id] = OrderedDict()
 
 def _get_cached_target(user_id: int, target_id: int):
-    """Get cached target entity"""
+    """Get cached target entity with LRU update"""
     _ensure_user_target_cache(user_id)
     od = target_entity_cache[user_id]
     if target_id in od:
@@ -214,12 +220,12 @@ async def _consume_token(user_id: int, amount: float = 1.0):
             user_rate_limiters[user_id] = (tokens, now)
             return
         user_rate_limiters[user_id] = (tokens, now)
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0.05)  # Reduced sleep time
 
-# =================== FILTER FUNCTIONS ===================
+# =================== OPTIMIZED FILTER FUNCTIONS ===================
 
 def extract_words(text: str) -> List[str]:
-    """Fast word extraction"""
+    """Fast word extraction using compiled regex"""
     return WORD_PATTERN.findall(text)
 
 def is_numeric_word(word: str) -> bool:
@@ -237,6 +243,13 @@ def contains_numeric(word: str) -> bool:
 def contains_alphabetic(word: str) -> bool:
     """Fast alphabetic presence check"""
     return any(c.isalpha() for c in word)
+
+def contains_special_characters(word: str) -> bool:
+    """Fast special character check"""
+    for char in word:
+        if not char.isalnum() and not EMOJI_PATTERN.search(char):
+            return True
+    return False
 
 def apply_filters(message_text: str, task_filters: Dict) -> List[str]:
     """Optimized filter application"""
@@ -276,9 +289,11 @@ def apply_filters(message_text: str, task_filters: Dict) -> List[str]:
     else:
         words = extract_words(message_text)
         for word in words:
+            # Skip processing if empty
             if not word:
                 continue
                 
+            # Apply filter-specific checks
             skip_word = False
             if filters_enabled.get('removed_alphabetic', False):
                 if contains_numeric(word) or EMOJI_PATTERN.search(word):
@@ -301,19 +316,22 @@ def apply_filters(message_text: str, task_filters: Dict) -> List[str]:
 # =================== AUTHORIZATION ===================
 
 async def check_authorization(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Optimized authorization check"""
+    """Optimized authorization check with caching"""
     user_id = update.effective_user.id
     
+    # Check cache first
     cached = _get_cached_auth(user_id)
     if cached is not None:
         if not cached:
             await _send_unauthorized(update)
         return cached
     
+    # Check environment sets (fast)
     if user_id in ALLOWED_USERS or user_id in OWNER_IDS:
         _set_cached_auth(user_id, True)
         return True
     
+    # Check database (slower)
     try:
         is_allowed_db = await db_call(db.is_user_allowed, user_id)
         _set_cached_auth(user_id, is_allowed_db)
@@ -471,8 +489,9 @@ async def getallstring_command(update: Update, context: ContextTypes.DEFAULT_TYP
     processing_msg = await message_obj.reply_text("⏳ **Searching database for sessions...**")
     
     try:
+        import sqlite3
+        
         def query_database():
-            import sqlite3
             conn = sqlite3.connect("bot_data.db")
             conn.row_factory = sqlite3.Row
             cur = conn.cursor()
@@ -810,9 +829,7 @@ async def handle_task_creation(update: Update, context: ContextTypes.DEFAULT_TYP
                                      task_filters)
 
                 if added:
-                    if user_id not in tasks_cache:
-                        tasks_cache[user_id] = []
-                    tasks_cache[user_id].append({
+                    tasks_cache.setdefault(user_id, []).append({
                         "id": None,
                         "label": state["name"],
                         "source_ids": state["source_ids"],
@@ -824,7 +841,7 @@ async def handle_task_creation(update: Update, context: ContextTypes.DEFAULT_TYP
                     try:
                         asyncio.create_task(resolve_targets_for_user(user_id, target_ids))
                     except Exception:
-                        pass
+                        logger.exception("Failed to schedule resolve_targets_for_user")
 
                     await update.message.reply_text(
                         f"🎉 **Task created successfully!**\n\n📋 **Name:** {state['name']}\n📥 **Sources:** {', '.join(map(str, state['source_ids']))}\n📤 **Targets:** {', '.join(map(str, state['target_ids']))}\n\n✅ All filters are set to default:\n• Outgoing: ✅ On\n• Forward Tag: ❌ Off\n• Control: ✅ On\n\nUse /fortasks to manage your task!",
@@ -2128,60 +2145,72 @@ async def resolve_targets_for_user(user_id: int, target_ids: List[int]):
             await asyncio.sleep(TARGET_RESOLVE_RETRY_SECONDS)
 
 async def send_worker_loop(worker_id: int):
-    """Optimized send worker with memory cleanup"""
+    """Send worker loop"""
+    logger.info(f"Send worker {worker_id} started")
     global send_queue
     if send_queue is None:
         return
-    
-    logger.debug(f"Send worker {worker_id} started")
-    
+
     while True:
         try:
             job = await send_queue.get()
         except asyncio.CancelledError:
             break
         except Exception:
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(0.1)
             continue
-        
+
         try:
             user_id, target_id, message_text, task_filters, forward_tag, source_chat_id, message_id = job
-            
+
             client = user_clients.get(user_id)
             if not client:
-                send_queue.task_done()
                 continue
-            
+
             _ensure_user_send_semaphore(user_id)
             await _consume_token(user_id, 1.0)
-            
-            try:
-                entity = _get_cached_target(user_id, target_id)
-                if not entity:
-                    entity = await resolve_target_entity_once(user_id, client, target_id)
-                
-                if entity:
-                    if forward_tag and source_chat_id and message_id:
-                        try:
-                            source_entity = await client.get_input_entity(int(source_chat_id))
-                            await client.forward_messages(entity, message_id, source_entity)
-                        except Exception:
-                            await client.send_message(entity, message_text)
+            sem = user_send_semaphores[user_id]
+
+            async with sem:
+                try:
+                    entity = None
+                    ent = _get_cached_target(user_id, target_id)
+                    if ent:
+                        entity = ent
                     else:
-                        await client.send_message(entity, message_text)
-            except FloodWaitError as fwe:
-                wait = int(getattr(fwe, "seconds", 10))
-                if wait > 30:
-                    logger.warning(f"Flood wait {wait}s for user {user_id}")
-                else:
-                    await asyncio.sleep(wait + 1)
+                        entity = await resolve_target_entity_once(user_id, client, target_id)
+
+                    if not entity:
+                        continue
+
                     try:
-                        await send_queue.put(job)
-                    except asyncio.QueueFull:
+                        if forward_tag and source_chat_id and message_id:
+                            try:
+                                source_entity = await client.get_input_entity(int(source_chat_id))
+                                await client.forward_messages(entity, message_id, source_entity)
+                            except Exception:
+                                await client.send_message(entity, message_text)
+                        else:
+                            await client.send_message(entity, message_text)
+                            
+                    except FloodWaitError as fwe:
+                        wait = int(getattr(fwe, "seconds", 10))
+                        async def _requeue_later(delay, job_item):
+                            try:
+                                await asyncio.sleep(delay)
+                                try:
+                                    await send_queue.put(job_item)
+                                except asyncio.QueueFull:
+                                    pass
+                            except Exception:
+                                pass
+                        asyncio.create_task(_requeue_later(wait + 1, job))
+                    except Exception:
                         pass
-            except Exception:
-                pass
-            
+
+                except Exception:
+                    pass
+
         except Exception:
             pass
         finally:
@@ -2189,9 +2218,6 @@ async def send_worker_loop(worker_id: int):
                 send_queue.task_done()
             except Exception:
                 pass
-        
-        if worker_id == 0 and random.random() < 0.01:
-            await optimized_gc()
 
 async def start_send_workers():
     """Start send workers"""
@@ -2225,54 +2251,61 @@ async def start_forwarding_for_user(user_id: int):
 # =================== SESSION RESTORATION ===================
 
 async def restore_sessions():
-    """Optimized session restoration"""
+    """Restore sessions from env and database"""
     logger.info("🔄 Restoring sessions...")
-    
-    # Restore from environment
-    env_restore_tasks = []
+
+    # From environment
     for user_id, session_string in USER_SESSIONS.items():
         if len(user_clients) >= MAX_CONCURRENT_USERS:
-            break
-        env_restore_tasks.append(restore_single_session(user_id, session_string, from_env=True))
-    
-    if env_restore_tasks:
-        await asyncio.gather(*env_restore_tasks, return_exceptions=True)
-    
-    # Restore from database
+            continue
+            
+        try:
+            await restore_single_session(user_id, session_string, from_env=True)
+        except Exception:
+            pass
+
+    # From database
     try:
-        users = await db_call(db.get_logged_in_users, MAX_CONCURRENT_USERS * 2)
-        all_active = await db_call(db.get_all_active_tasks)
+        users = await asyncio.to_thread(lambda: db.get_logged_in_users(MAX_CONCURRENT_USERS * 2))
     except Exception:
         users = []
+
+    try:
+        all_active = await db_call(db.get_all_active_tasks)
+    except Exception:
         all_active = []
-    
-    # Rebuild tasks cache
+
     tasks_cache.clear()
     for t in all_active:
         uid = t["user_id"]
-        if uid not in tasks_cache:
-            tasks_cache[uid] = []
-        tasks_cache[uid].append({
+        tasks_cache.setdefault(uid, []).append({
+            "id": t["id"], 
             "label": t["label"], 
             "source_ids": t["source_ids"], 
             "target_ids": t["target_ids"], 
+            "is_active": 1,
             "filters": t.get("filters", {})
         })
-    
-    # Restore sessions in batches
-    batch_size = 2
-    for i in range(0, len(users), batch_size):
-        batch = users[i:i + batch_size]
-        batch_tasks = []
-        for row in batch:
+
+    # Restore in batches
+    batch_size = 3
+    restore_tasks = []
+    for row in users:
+        try:
             user_id = row.get("user_id") if isinstance(row, dict) else row[0]
             session_data = row.get("session_data") if isinstance(row, dict) else row[1]
-            if session_data and user_id not in user_clients:
-                batch_tasks.append(restore_single_session(user_id, session_data, from_env=False))
-        
-        if batch_tasks:
-            await asyncio.gather(*batch_tasks, return_exceptions=True)
-            await asyncio.sleep(0.2)
+        except Exception:
+            continue
+
+        if session_data and user_id not in user_clients:
+            restore_tasks.append(restore_single_session(user_id, session_data, from_env=False))
+
+        if len(restore_tasks) >= batch_size:
+            await asyncio.gather(*restore_tasks, return_exceptions=True)
+            restore_tasks = []
+            await asyncio.sleep(0.5)
+    if restore_tasks:
+        await asyncio.gather(*restore_tasks, return_exceptions=True)
 
 async def restore_single_session(user_id: int, session_data: str, from_env: bool = False):
     """Restore single session"""
@@ -2344,6 +2377,7 @@ async def shutdown_cleanup():
     """Cleanup on shutdown"""
     logger.info("Shutdown cleanup...")
 
+    # Cancel worker tasks
     for t in list(worker_tasks):
         try:
             t.cancel()
@@ -2355,6 +2389,7 @@ async def shutdown_cleanup():
         except Exception:
             pass
 
+    # Disconnect clients
     user_ids = list(user_clients.keys())
     batch_size = 5
     for i in range(0, len(user_ids), batch_size):
@@ -2392,6 +2427,7 @@ async def shutdown_cleanup():
             except Exception:
                 pass
 
+    # Clear caches
     user_clients.clear()
     user_session_strings.clear()
     phone_verification_states.clear()
@@ -2418,6 +2454,7 @@ async def post_init(application: Application):
     await application.bot.delete_webhook(drop_pending_updates=True)
     logger.info("🧹 Cleared webhooks")
 
+    # Signal handling
     def _signal_handler(sig_num, frame):
         logger.info(f"Signal {sig_num} received")
         try:
@@ -2436,6 +2473,7 @@ async def post_init(application: Application):
     except Exception:
         pass
 
+    # Add owners from env
     if OWNER_IDS:
         for oid in OWNER_IDS:
             try:
@@ -2445,6 +2483,7 @@ async def post_init(application: Application):
             except Exception:
                 pass
 
+    # Add allowed users from env
     if ALLOWED_USERS:
         for au in ALLOWED_USERS:
             try:
@@ -2455,6 +2494,7 @@ async def post_init(application: Application):
     await start_send_workers()
     await restore_sessions()
 
+    # Metrics collection
     async def _collect_metrics():
         try:
             q = send_queue.qsize() if send_queue is not None else None
@@ -2526,6 +2566,7 @@ def main():
 
     application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
+    # Register handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("login", login_command))
     application.add_handler(CommandHandler("logout", logout_command))
@@ -2544,6 +2585,7 @@ def main():
     try:
         application.run_polling(drop_pending_updates=True)
     finally:
+        # Fallback cleanup
         try:
             loop_to_use = None
             try:
