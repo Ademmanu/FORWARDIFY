@@ -31,7 +31,7 @@ class Database:
             conn.execute("PRAGMA synchronous=NORMAL;")
             conn.execute("PRAGMA temp_store=MEMORY;")
             conn.execute("PRAGMA cache_size=-1000;")  # Reduced cache size for memory efficiency
-            conn.execute("PRAGMA mmap_size=268435456;")  # 256MB mmap for better performance
+            conn.execute("PRAGMA mmap_size=268435456;")  # 256MB mmap for better performance (best-effort)
         except Exception:
             # best-effort - don't fail if environment doesn't allow these pragmas
             pass
@@ -96,6 +96,7 @@ class Database:
             """
             )
 
+            # NOTE: Added updated_at column to forwarding_tasks so update_task_filters works without error.
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS forwarding_tasks (
@@ -107,6 +108,7 @@ class Database:
                     filters TEXT,
                     is_active INTEGER DEFAULT 1,
                     created_at TEXT DEFAULT (datetime('now')),
+                    updated_at TEXT DEFAULT (datetime('now')),
                     FOREIGN KEY (user_id) REFERENCES users (user_id),
                     UNIQUE(user_id, label)
                 )
@@ -124,6 +126,12 @@ class Database:
                 )
             """
             )
+
+            # indexes for faster counts/queries (small storage cost, big perf win)
+            try:
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_forwarding_tasks_user_active ON forwarding_tasks (user_id, is_active)")
+            except Exception:
+                pass
 
             conn.commit()
             # REMOVED: self.close_connection() - Keep connection open for subsequent operations
@@ -223,7 +231,7 @@ class Database:
                         "forward_tag": False,
                         "control": True
                     }
-                
+
                 cur.execute(
                     """
                     INSERT INTO forwarding_tasks (user_id, label, source_ids, target_ids, filters)
@@ -280,7 +288,7 @@ class Database:
             cur = conn.cursor()
             cur.execute(
                 """
-                SELECT id, label, source_ids, target_ids, filters, is_active, created_at
+                SELECT id, label, source_ids, target_ids, filters, is_active, created_at, updated_at
                 FROM forwarding_tasks
                 WHERE user_id = ? AND is_active = 1
                 ORDER BY created_at DESC
@@ -294,7 +302,7 @@ class Database:
                     filters_data = json.loads(row["filters"]) if row["filters"] else {}
                 except (json.JSONDecodeError, TypeError):
                     filters_data = {}
-                    
+
                 tasks.append(
                     {
                         "id": row["id"],
@@ -304,6 +312,7 @@ class Database:
                         "filters": filters_data,
                         "is_active": row["is_active"],
                         "created_at": row["created_at"],
+                        "updated_at": row.get("updated_at", None) if isinstance(row, dict) else None,
                     }
                 )
 
@@ -330,7 +339,7 @@ class Database:
                     filters_data = json.loads(row["filters"]) if row["filters"] else {}
                 except (json.JSONDecodeError, TypeError):
                     filters_data = {}
-                    
+
                 tasks.append(
                     {
                         "user_id": row["user_id"],
@@ -474,7 +483,7 @@ class Database:
             row = cur.fetchone()
             if not row:
                 return {"has_phone": False, "is_logged_in": False}
-            
+
             has_phone = row["phone"] is not None and row["phone"] != ""
             return {"has_phone": has_phone, "is_logged_in": bool(row["is_logged_in"])}
         except Exception as e:
