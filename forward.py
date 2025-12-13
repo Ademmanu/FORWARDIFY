@@ -84,13 +84,13 @@ if allowed_env:
     ALLOWED_USERS.update(int(part) for part in allowed_env.split(",") if part.strip().isdigit())
 
 # Performance tuning parameters with memory optimization
-SEND_WORKER_COUNT = int(os.getenv("SEND_WORKER_COUNT", "4"))  # Reduced for memory
-SEND_QUEUE_MAXSIZE = int(os.getenv("SEND_QUEUE_MAXSIZE", "1000"))  # Smaller queue
+SEND_WORKER_COUNT = int(os.getenv("SEND_WORKER_COUNT", "10"))
+SEND_QUEUE_MAXSIZE = int(os.getenv("SEND_QUEUE_MAXSIZE", "800"))
 TARGET_RESOLVE_RETRY_SECONDS = int(os.getenv("TARGET_RESOLVE_RETRY_SECONDS", "15"))
-MAX_CONCURRENT_USERS = int(os.getenv("MAX_CONCURRENT_USERS", "20"))
+MAX_CONCURRENT_USERS = max(50, int(os.getenv("MAX_CONCURRENT_USERS", "50")))
 SEND_CONCURRENCY_PER_USER = int(os.getenv("SEND_CONCURRENCY_PER_USER", "2"))
-SEND_RATE_PER_USER = float(os.getenv("SEND_RATE_PER_USER", "3.0"))
-TARGET_ENTITY_CACHE_SIZE = int(os.getenv("TARGET_ENTITY_CACHE_SIZE", "100"))
+SEND_RATE_PER_USER = float(os.getenv("SEND_RATE_PER_USER", "3.5"))
+TARGET_ENTITY_CACHE_SIZE = int(os.getenv("TARGET_ENTITY_CACHE_SIZE", "50"))
 
 # =================== GLOBAL STATE & CACHES ===================
 
