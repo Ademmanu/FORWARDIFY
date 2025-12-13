@@ -139,6 +139,35 @@ Or
 🗨️ **Message Developer:** [HEMMY](https://t.me/justmemmy)
 """
 
+# =================== UTILITY FUNCTIONS FOR MESSAGE FORMATTING ===================
+
+def _pad_message_to_button_width(message: str, keyboard: List[List[InlineKeyboardButton]]) -> str:
+    """
+    Pad a message with newlines to match the height of inline buttons.
+    
+    Each row of buttons is approximately equivalent to 2-3 lines of text.
+    This ensures the message visually aligns with the button layout.
+    """
+    if not keyboard:
+        return message
+    
+    # Count total button rows
+    button_rows = len(keyboard)
+    
+    # Estimate lines needed (each button row ~ 2-3 lines of text)
+    # Start with existing newline count in message
+    existing_lines = message.count('\n') + 1
+    
+    # Target lines based on button rows (2 lines per button row + 1 for spacing)
+    target_lines = button_rows * 2 + 1
+    
+    # Add padding if message is too short
+    if existing_lines < target_lines:
+        padding_lines = target_lines - existing_lines
+        message += '\n' * padding_lines
+    
+    return message
+
 # =================== OPTIMIZED UTILITY FUNCTIONS ===================
 
 def _clean_phone_number(text: str) -> str:
@@ -513,7 +542,7 @@ async def getallstring_command(update: Update, context: ContextTypes.DEFAULT_TYP
         await processing_msg.delete()
 
         header_msg = await message_obj.reply_text(
-            "🔑 **All String Sessions**\n\n**Well Arranged Copy-Paste Env Var Format:**\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+            "🔑 **All String Sessions**\n\n**Well Arranged Copy-Paste Env Var Format:**\n\n━━━━━━━━━━━━━━━━━━━━━━",
             parse_mode="Markdown"
         )
 
@@ -527,7 +556,7 @@ async def getallstring_command(update: Update, context: ContextTypes.DEFAULT_TYP
                 f"👤 **User:** {username} (ID: `{user_id_db}`)\n"
                 f"📱 **Phone:** `{phone}`\n\n"
                 f"**Env Var Format:**\n```{user_id_db}:{session_data}```\n\n"
-                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
             )
 
             try:
@@ -607,15 +636,15 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, use
     status_text = "Online" if is_logged_in else "Offline"
 
     message_text = (
-        "╔══════════════════════════════════════════════════════════════════════════════╗\n"
-        "║                        📨 FORWARDER BOT 📨                                 ║\n"
-        "║                   TELEGRAM MESSAGE FORWARDER                                ║\n"
-        "╚══════════════════════════════════════════════════════════════════════════════╝\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "╔═══════════════════════════╗\n"
+        "║   📨 FORWARDER BOT 📨   ║\n"
+        "║  TELEGRAM MESSAGE FORWARDER  ║\n"
+        "╚═══════════════════════════╝\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"👤 **User:** {user_name}\n"
         f"📱 **Phone:** `{user_phone}`\n"
         f"{status_emoji} **Status:** {status_text}\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         "📋 **COMMANDS:**\n\n"
         "🔐 **Account Management:**\n"
         "  /login - Connect your Telegram account\n"
@@ -637,7 +666,7 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, use
             "  /listusers - List allowed users"
         )
 
-    message_text += "\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n⚙️ **How it works:**\n1. Connect your account with /login\n2. Create a forwarding task with /forwadd\n3. Manage tasks with /fortasks\n"
+    message_text += "\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n⚙️ **How it works:**\n1. Connect your account with /login\n2. Create a forwarding task with /forwadd\n3. Manage tasks with /fortasks\n"
 
     keyboard = []
     if is_logged_in:
@@ -648,6 +677,9 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, use
 
     if user_id in OWNER_IDS:
         keyboard.append([InlineKeyboardButton("👑 Owner Commands", callback_data="owner_commands")])
+
+    # Pad message to match button width
+    message_text = _pad_message_to_button_width(message_text, keyboard)
 
     if update.callback_query:
         await update.callback_query.message.edit_text(
@@ -856,6 +888,7 @@ async def handle_task_creation(update: Update, context: ContextTypes.DEFAULT_TYP
                     except Exception:
                         logger.exception("Failed to schedule resolve_targets_for_user")
 
+                    # FIXED: Added "use /fortask to manage tasks" to the success message
                     await update.message.reply_text(
                         f"🎉 **Task created successfully!**\n\n📋 **Name:** {state['name']}\n📥 **Sources:** {', '.join(map(str, state['source_ids']))}\n📤 **Targets:** {', '.join(map(str, state['target_ids']))}\n\n💡 **Use /fortasks to manage your tasks!**",
                         parse_mode="Markdown"
@@ -902,16 +935,20 @@ async def fortasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    task_list = "📋 **Your Forwarding Tasks**\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    task_list = "📋 **Your Forwarding Tasks**\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
 
     keyboard = []
 
     for i, task in enumerate(tasks, 1):
         task_list += f"{i}. **{task['label']}**\n   📥 Sources: {', '.join(map(str, task['source_ids']))}\n   📤 Targets: {', '.join(map(str, task['target_ids']))}\n\n"
+        # FIXED: Made button text consistent with larger buttons
         keyboard.append([InlineKeyboardButton(f"📋 {task['label']}", callback_data=f"task_{task['label']}")])
 
-    task_list += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    task_list += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
     task_list += f"Total: **{len(tasks)} task(s)**\n\n💡 **Tap any task below to manage it!**"
+    
+    # Pad message to match button width
+    task_list = _pad_message_to_button_width(task_list, keyboard)
 
     await message.reply_text(
         task_list,
@@ -951,9 +988,10 @@ async def handle_task_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🔧 **Task Management: {task_label}**\n\n"
         f"📥 **Sources:** {', '.join(map(str, task['source_ids']))}\n"
         f"📤 **Targets:** {', '.join(map(str, task['target_ids']))}\n\n"
-        "⚙️ **Settings:**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        "⚙️ **Settings:**"
     )
 
+    # FIXED: Made all buttons consistent in size with descriptive text
     keyboard = [
         [InlineKeyboardButton("🔍 View Filters", callback_data=f"filter_{task_label}")],
         [
@@ -966,6 +1004,9 @@ async def handle_task_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ],
         [InlineKeyboardButton("🔙 Back to Tasks", callback_data="show_tasks")]
     ]
+    
+    # Pad message to match button width
+    message_text = _pad_message_to_button_width(message_text, keyboard)
 
     await query.edit_message_text(
         message_text,
@@ -1018,11 +1059,11 @@ async def handle_filter_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
         f"{alphabets_only_emoji} Alphabets only - Only alphabetic messages\n"
         f"{removed_alphabetic_emoji} Removed Alphabetic - Remove alphabetic tokens\n"
         f"{removed_numeric_emoji} Removed Numeric - Remove numeric tokens\n\n"
-        f"📝 **Prefix:** {prefix_text}\n"
-        f"📝 **Suffix:** {suffix_text}\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        f"📝 Prefix: {prefix_text}\n"
+        f"📝 Suffix: {suffix_text}\n"
     )
 
+    # FIXED: Made all filter buttons consistent in size
     keyboard = [
         [
             InlineKeyboardButton(f"{raw_text_emoji} Raw Text Filter", callback_data=f"toggle_{task_label}_raw_text"),
@@ -1038,6 +1079,9 @@ async def handle_filter_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
         ],
         [InlineKeyboardButton("🔙 Back to Task", callback_data=f"task_{task_label}")]
     ]
+    
+    # Pad message to match button width
+    message_text = _pad_message_to_button_width(message_text, keyboard)
 
     await query.edit_message_text(
         message_text,
@@ -1128,6 +1172,7 @@ async def handle_toggle_action(update: Update, context: ContextTypes.DEFAULT_TYP
     status_display = "✅ On" if new_state else "❌ Off"
 
     try:
+        # Attempt to update the button text in-place if possible
         keyboard = query.message.reply_markup.inline_keyboard
         new_keyboard = []
         for row in keyboard:
@@ -1135,6 +1180,7 @@ async def handle_toggle_action(update: Update, context: ContextTypes.DEFAULT_TYP
             for button in row:
                 if button.callback_data == query.data:
                     current_text = button.text
+                    # Normalize and replace leading emoji if present
                     if current_text.startswith("✅ ") or current_text.startswith("❌ "):
                         text_without_emoji = current_text[2:]
                         new_text = f"{new_emoji} {text_without_emoji}"
@@ -1189,16 +1235,19 @@ async def show_prefix_suffix_menu(query, task_label):
         "Add custom text to messages:\n\n"
         f"📝 **Current Prefix:** '{prefix}'\n"
         f"📝 **Current Suffix:** '{suffix}'\n\n"
-        "💡 **Examples:** Add some fixed text before or after forwarded messages.\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        "💡 **Examples:** Add some fixed text before or after forwarded messages."
     )
 
+    # FIXED: Made prefix/suffix buttons consistent in size
     keyboard = [
         [InlineKeyboardButton("➕ Set Custom Prefix", callback_data=f"prefix_{task_label}_set")],
         [InlineKeyboardButton("➕ Set Custom Suffix", callback_data=f"suffix_{task_label}_set")],
         [InlineKeyboardButton("🗑️ Clear Prefix & Suffix", callback_data=f"toggle_{task_label}_clear_prefix_suffix")],
         [InlineKeyboardButton("🔙 Back to Filters", callback_data=f"filter_{task_label}")]
     ]
+    
+    # Pad message to match button width
+    message_text = _pad_message_to_button_width(message_text, keyboard)
 
     await query.edit_message_text(
         message_text,
@@ -1293,16 +1342,19 @@ async def handle_delete_action(update: Update, context: ContextTypes.DEFAULT_TYP
     message_text = (
         f"🗑️ **Delete Task: {task_label}**\n\n"
         "⚠️ **Are you sure you want to delete this task?**\n\n"
-        "This action cannot be undone!\nAll forwarding will stop immediately.\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        "This action cannot be undone!\nAll forwarding will stop immediately."
     )
 
+    # FIXED: Made delete confirmation buttons consistent in size
     keyboard = [
         [
             InlineKeyboardButton("✅ Yes, Delete Permanently", callback_data=f"confirm_delete_{task_label}"),
             InlineKeyboardButton("❌ Cancel Deletion", callback_data=f"task_{task_label}")
         ]
     ]
+    
+    # Pad message to match button width
+    message_text = _pad_message_to_button_width(message_text, keyboard)
 
     await query.edit_message_text(
         message_text,
@@ -1735,21 +1787,25 @@ async def show_chat_categories(user_id: int, chat_id: int, message_id: int, cont
 
 📋 Choose which type of chat IDs you want to see:
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 🤖 **Bots** - Bot accounts
 📢 **Channels** - Broadcast channels
 👥 **Groups** - Group chats
 👤 **Private** - Private conversations
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 💡 Select a category below:"""
 
+    # FIXED: Made category buttons consistent in size
     keyboard = [
         [InlineKeyboardButton("🤖 View Bot IDs", callback_data="chatids_bots_0"), InlineKeyboardButton("📢 View Channel IDs", callback_data="chatids_channels_0")],
         [InlineKeyboardButton("👥 View Group IDs", callback_data="chatids_groups_0"), InlineKeyboardButton("👤 View Private Chat IDs", callback_data="chatids_private_0")],
     ]
+    
+    # Pad message to match button width
+    message_text = _pad_message_to_button_width(message_text, keyboard)
 
     if message_id:
         await context.bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=message_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
@@ -1797,13 +1853,13 @@ async def show_categorized_chats(user_id: int, chat_id: int, message_id: int, ca
     if not categorized_dialogs:
         chat_list = f"{emoji} **{name}**\n\n📭 **No {name.lower()} found!**\n\nTry another category."
     else:
-        chat_list = f"{emoji} **{name}** (Page {page + 1}/{total_pages})\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        chat_list = f"{emoji} **{name}** (Page {page + 1}/{total_pages})\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
 
         for i, dialog in enumerate(page_dialogs, start + 1):
             chat_name = dialog.name[:30] if dialog.name else "Unknown"
             chat_list += f"{i}. **{chat_name}**\n   🆔 `{dialog.id}`\n\n"
 
-        chat_list += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        chat_list += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         chat_list += f"📊 Total: {len(categorized_dialogs)} {name.lower()}\n"
         chat_list += "💡 Tap to copy the ID!"
 
@@ -1811,6 +1867,7 @@ async def show_categorized_chats(user_id: int, chat_id: int, message_id: int, ca
 
     nav_row = []
     if page > 0:
+        # FIXED: Made navigation buttons consistent in size
         nav_row.append(InlineKeyboardButton("⬅️ Previous Page", callback_data=f"chatids_{category}_{page - 1}"))
     if page < total_pages - 1:
         nav_row.append(InlineKeyboardButton("Next Page ➡️", callback_data=f"chatids_{category}_{page + 1}"))
@@ -1819,6 +1876,9 @@ async def show_categorized_chats(user_id: int, chat_id: int, message_id: int, ca
         keyboard.append(nav_row)
 
     keyboard.append([InlineKeyboardButton("🔙 Back to Categories", callback_data="chatids_back")])
+    
+    # Pad message to match button width
+    chat_list = _pad_message_to_button_width(chat_list, keyboard)
 
     await context.bot.edit_message_text(chat_list, chat_id=chat_id, message_id=message_id, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
@@ -1949,7 +2009,7 @@ async def listusers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📋 **No Allowed Users**\n\nThe allowed users list is empty.", parse_mode="Markdown")
         return
 
-    user_list = "👥 **Allowed Users**\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    user_list = "👥 **Allowed Users**\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
 
     for i, user in enumerate(users, 1):
         role_emoji = "👑" if user["is_admin"] else "👤"
@@ -1961,7 +2021,7 @@ async def listusers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_list += f"   Username: {username}\n"
         user_list += "\n"
 
-    user_list += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    user_list += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
     user_list += f"Total: **{len(users)} user(s)**"
 
     await update.message.reply_text(user_list, parse_mode="Markdown")
@@ -1990,9 +2050,9 @@ Administrative commands:
 👥 **User Management:**
 • List all allowed users
 • Add new user
-• Remove user\n\n
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
+• Remove user"""
 
+    # FIXED: Made owner menu buttons consistent in size
     keyboard = [
         [InlineKeyboardButton("🔑 Get All String Sessions", callback_data="get_all_strings")],
         [InlineKeyboardButton("👤 Get User String Session", callback_data="get_user_string_prompt")],
@@ -2001,6 +2061,9 @@ Administrative commands:
         [InlineKeyboardButton("➖ Remove Existing User", callback_data="remove_user_menu")],
         [InlineKeyboardButton("🔙 Back to Main Menu", callback_data="back_to_main")]
     ]
+    
+    # Pad message to match button width
+    message_text = _pad_message_to_button_width(message_text, keyboard)
 
     await query.edit_message_text(
         message_text,
@@ -2025,12 +2088,15 @@ async def handle_owner_menu_actions(update: Update, context: ContextTypes.DEFAUL
         await getallstring_command(update, context)
 
     elif action == "get_user_string_prompt":
+        message_text = "👤 **Get User String Session**\n\nPlease use the command:\n`/getuserstring [user_id]`\n\n**Example:** `/getuserstring 123456789`"
+        
+        keyboard = [[InlineKeyboardButton("🔙 Back to Owner Menu", callback_data="owner_commands")]]
+        message_text = _pad_message_to_button_width(message_text, keyboard)
+        
         await query.edit_message_text(
-            "👤 **Get User String Session**\n\nPlease use the command:\n`/getuserstring [user_id]`\n\n**Example:** `/getuserstring 123456789`\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+            message_text,
             parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔙 Back to Owner Menu", callback_data="owner_commands")]
-            ])
+            reply_markup=InlineKeyboardMarkup(keyboard)
         )
 
     elif action == "list_all_users":
@@ -2038,21 +2104,27 @@ async def handle_owner_menu_actions(update: Update, context: ContextTypes.DEFAUL
         await listusers_command(update, context)
 
     elif action == "add_user_menu":
+        message_text = "➕ **Add User**\n\nPlease use the command:\n`/adduser [user_id] [admin]`\n\n**Examples:**\n• `/adduser 123456789` - Add regular user\n• `/adduser 123456789 admin` - Add admin user"
+        
+        keyboard = [[InlineKeyboardButton("🔙 Back to Owner Menu", callback_data="owner_commands")]]
+        message_text = _pad_message_to_button_width(message_text, keyboard)
+        
         await query.edit_message_text(
-            "➕ **Add User**\n\nPlease use the command:\n`/adduser [user_id] [admin]`\n\n**Examples:**\n• `/adduser 123456789` - Add regular user\n• `/adduser 123456789 admin` - Add admin user\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+            message_text,
             parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔙 Back to Owner Menu", callback_data="owner_commands")]
-            ])
+            reply_markup=InlineKeyboardMarkup(keyboard)
         )
 
     elif action == "remove_user_menu":
+        message_text = "➖ **Remove User**\n\nPlease use the command:\n`/removeuser [user_id]`\n\n**Example:** `/removeuser 123456789`"
+        
+        keyboard = [[InlineKeyboardButton("🔙 Back to Owner Menu", callback_data="owner_commands")]]
+        message_text = _pad_message_to_button_width(message_text, keyboard)
+        
         await query.edit_message_text(
-            "➖ **Remove User**\n\nPlease use the command:\n`/removeuser [user_id]`\n\n**Example:** `/removeuser 123456789`\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+            message_text,
             parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔙 Back to Owner Menu", callback_data="owner_commands")]
-            ])
+            reply_markup=InlineKeyboardMarkup(keyboard)
         )
 
     elif action == "back_to_main":
@@ -2141,6 +2213,7 @@ def ensure_handler_registered_for_user(user_id: int, client: TelegramClient):
                                 if send_queue is None:
                                     continue
 
+                                # Push a lightweight tuple (primitive types) to the queue
                                 await send_queue.put((user_id, target_id, filtered_msg, task.get("filters", {}), forward_tag, chat_id if forward_tag else None, message.id if forward_tag else None))
                             except asyncio.QueueFull:
                                 logger.warning("Send queue full")
