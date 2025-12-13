@@ -27,18 +27,19 @@ class Database:
 
     def _apply_pragmas(self, conn: sqlite3.Connection):
         try:
+            # Best-effort performance pragmas; don't fail if unsupported in environment
             conn.execute("PRAGMA journal_mode=WAL;")
             conn.execute("PRAGMA synchronous=NORMAL;")
             conn.execute("PRAGMA temp_store=MEMORY;")
             conn.execute("PRAGMA cache_size=-1000;")  # Reduced cache size for memory efficiency
-            conn.execute("PRAGMA mmap_size=268435456;")  # 256MB mmap for better performance
+            conn.execute("PRAGMA mmap_size=268435456;")  # 256MB mmap for better performance where available
         except Exception:
             # best-effort - don't fail if environment doesn't allow these pragmas
             pass
 
     def _create_connection(self) -> sqlite3.Connection:
+        # Allow connections to be used across threads but manage them as thread-local
         conn = sqlite3.connect(self.db_path, timeout=30, check_same_thread=False)
-        # use sqlite3.Row for named column access; conversion of datetime kept off
         conn.row_factory = sqlite3.Row
         self._apply_pragmas(conn)
         return conn
@@ -46,12 +47,12 @@ class Database:
     def get_connection(self) -> sqlite3.Connection:
         """
         Return a thread-local connection (create if missing).
-        FIXED: Don't close connections aggressively during normal operations
+        Keep connection open for the thread to avoid repeated connect/disconnect churn.
         """
         conn = getattr(_thread_local, "conn", None)
         if conn:
             try:
-                # cheap check to ensure connection is alive
+                # lightweight liveness check
                 conn.execute("SELECT 1")
                 return conn
             except Exception:
@@ -107,6 +108,7 @@ class Database:
                     filters TEXT,
                     is_active INTEGER DEFAULT 1,
                     created_at TEXT DEFAULT (datetime('now')),
+                    updated_at TEXT DEFAULT (datetime('now')),
                     FOREIGN KEY (user_id) REFERENCES users (user_id),
                     UNIQUE(user_id, label)
                 )
@@ -126,7 +128,7 @@ class Database:
             )
 
             conn.commit()
-            # REMOVED: self.close_connection() - Keep connection open for subsequent operations
+            # Keep connection open for subsequent operations to avoid churn
 
     def get_user(self, user_id: int) -> Optional[Dict]:
         conn = self.get_connection()
@@ -149,7 +151,6 @@ class Database:
         except Exception as e:
             logger.exception("Error in get_user for %s: %s", user_id, e)
             raise
-        # REMOVED: finally: self.close_connection() - Keep connection open
 
     def save_user(
         self,
@@ -200,7 +201,6 @@ class Database:
         except Exception as e:
             logger.exception("Error in save_user for %s: %s", user_id, e)
             raise
-        # REMOVED: finally: self.close_connection() - Keep connection open
 
     def add_forwarding_task(self, user_id: int, label: str, source_ids: List[int], target_ids: List[int], filters: Optional[Dict[str, Any]] = None) -> bool:
         conn = self.get_connection()
@@ -223,7 +223,7 @@ class Database:
                         "forward_tag": False,
                         "control": True
                     }
-                
+
                 cur.execute(
                     """
                     INSERT INTO forwarding_tasks (user_id, label, source_ids, target_ids, filters)
@@ -238,7 +238,6 @@ class Database:
         except Exception as e:
             logger.exception("Error in add_forwarding_task for %s: %s", user_id, e)
             raise
-        # REMOVED: finally: self.close_connection() - Keep connection open
 
     def update_task_filters(self, user_id: int, label: str, filters: Dict[str, Any]) -> bool:
         """Update filters for a specific task"""
@@ -259,7 +258,6 @@ class Database:
         except Exception as e:
             logger.exception("Error in update_task_filters for %s, task %s: %s", user_id, label, e)
             raise
-        # REMOVED: finally: self.close_connection() - Keep connection open
 
     def remove_forwarding_task(self, user_id: int, label: str) -> bool:
         conn = self.get_connection()
@@ -272,7 +270,6 @@ class Database:
         except Exception as e:
             logger.exception("Error in remove_forwarding_task for %s: %s", user_id, e)
             raise
-        # REMOVED: finally: self.close_connection() - Keep connection open
 
     def get_user_tasks(self, user_id: int) -> List[Dict]:
         conn = self.get_connection()
@@ -294,7 +291,7 @@ class Database:
                     filters_data = json.loads(row["filters"]) if row["filters"] else {}
                 except (json.JSONDecodeError, TypeError):
                     filters_data = {}
-                    
+
                 tasks.append(
                     {
                         "id": row["id"],
@@ -311,7 +308,6 @@ class Database:
         except Exception as e:
             logger.exception("Error in get_user_tasks for %s: %s", user_id, e)
             raise
-        # REMOVED: finally: self.close_connection() - Keep connection open
 
     def get_all_active_tasks(self) -> List[Dict]:
         conn = self.get_connection()
@@ -330,7 +326,7 @@ class Database:
                     filters_data = json.loads(row["filters"]) if row["filters"] else {}
                 except (json.JSONDecodeError, TypeError):
                     filters_data = {}
-                    
+
                 tasks.append(
                     {
                         "user_id": row["user_id"],
@@ -345,7 +341,6 @@ class Database:
         except Exception as e:
             logger.exception("Error in get_all_active_tasks: %s", e)
             raise
-        # REMOVED: finally: self.close_connection() - Keep connection open
 
     def is_user_allowed(self, user_id: int) -> bool:
         conn = self.get_connection()
@@ -356,7 +351,6 @@ class Database:
         except Exception as e:
             logger.exception("Error in is_user_allowed for %s: %s", user_id, e)
             raise
-        # REMOVED: finally: self.close_connection() - Keep connection open
 
     def is_user_admin(self, user_id: int) -> bool:
         conn = self.get_connection()
@@ -368,7 +362,6 @@ class Database:
         except Exception as e:
             logger.exception("Error in is_user_admin for %s: %s", user_id, e)
             raise
-        # REMOVED: finally: self.close_connection() - Keep connection open
 
     def add_allowed_user(self, user_id: int, username: Optional[str] = None, is_admin: bool = False, added_by: Optional[int] = None) -> bool:
         conn = self.get_connection()
@@ -389,7 +382,6 @@ class Database:
         except Exception as e:
             logger.exception("Error in add_allowed_user for %s: %s", user_id, e)
             raise
-        # REMOVED: finally: self.close_connection() - Keep connection open
 
     def remove_allowed_user(self, user_id: int) -> bool:
         conn = self.get_connection()
@@ -402,7 +394,6 @@ class Database:
         except Exception as e:
             logger.exception("Error in remove_allowed_user for %s: %s", user_id, e)
             raise
-        # REMOVED: finally: self.close_connection() - Keep connection open
 
     def get_all_allowed_users(self) -> List[Dict]:
         conn = self.get_connection()
@@ -430,7 +421,6 @@ class Database:
         except Exception as e:
             logger.exception("Error in get_all_allowed_users: %s", e)
             raise
-        # REMOVED: finally: self.close_connection() - Keep connection open
 
     def get_logged_in_users(self, limit: Optional[int] = None) -> List[Dict]:
         """
@@ -453,7 +443,6 @@ class Database:
             rows = cur.fetchall()
             result = []
             for r in rows:
-                # sqlite3.Row supports dict-like access
                 try:
                     user_id = r["user_id"]
                     session_data = r["session_data"]
@@ -474,7 +463,7 @@ class Database:
             row = cur.fetchone()
             if not row:
                 return {"has_phone": False, "is_logged_in": False}
-            
+
             has_phone = row["phone"] is not None and row["phone"] != ""
             return {"has_phone": has_phone, "is_logged_in": bool(row["is_logged_in"])}
         except Exception as e:
