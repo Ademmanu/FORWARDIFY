@@ -154,12 +154,20 @@ def _pad_message_to_button_width(message: str, keyboard: List[List[InlineKeyboar
     # Count total button rows
     button_rows = len(keyboard)
     
-    # Estimate lines needed (each button row ~ 2-3 lines of text)
-    # Start with existing newline count in message
+    # Calculate average button text length per row to estimate width
+    avg_button_chars = 0
+    for row in keyboard:
+        row_chars = sum(len(btn.text) for btn in row)
+        avg_button_chars = max(avg_button_chars, row_chars)
+    
+    # Estimate lines needed based on button rows and text width
+    # Each button row ~ 2-3 lines of text, plus consider text width
     existing_lines = message.count('\n') + 1
     
-    # Target lines based on button rows (2 lines per button row + 1 for spacing)
-    target_lines = button_rows * 2 + 1
+    # Target lines: base on button rows with width consideration
+    # More buttons/chars per row = more lines needed
+    width_factor = min(3, max(1, avg_button_chars / 20))  # Scale factor based on button width
+    target_lines = int(button_rows * 2.5 * width_factor) + 1
     
     # Add padding if message is too short
     if existing_lines < target_lines:
