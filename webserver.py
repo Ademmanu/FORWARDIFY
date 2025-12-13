@@ -193,4 +193,4 @@ def run_server():
 def start_server_thread():
     server_thread = threading.Thread(target=run_server, daemon=True)
     server_thread.start()
-    print("🌐 Web server started on port 5000")
+    logger.info("🌐 Web server started on port 5000")
