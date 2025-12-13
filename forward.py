@@ -642,12 +642,12 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, use
     keyboard = []
     if is_logged_in:
         keyboard.append([InlineKeyboardButton("📋 My Tasks", callback_data="show_tasks")])
-        keyboard.append([InlineKeyboardButton("🔴 Disconnect", callback_data="logout")])
+        keyboard.append([InlineKeyboardButton("🔴 Disconnect Account", callback_data="logout")])
     else:
         keyboard.append([InlineKeyboardButton("🟢 Connect Account", callback_data="login")])
 
     if user_id in OWNER_IDS:
-        keyboard.append([InlineKeyboardButton("👑 Owner Menu", callback_data="owner_commands")])
+        keyboard.append([InlineKeyboardButton("👑 Owner Commands", callback_data="owner_commands")])
 
     if update.callback_query:
         await update.callback_query.message.edit_text(
@@ -856,8 +856,9 @@ async def handle_task_creation(update: Update, context: ContextTypes.DEFAULT_TYP
                     except Exception:
                         logger.exception("Failed to schedule resolve_targets_for_user")
 
+                    # FIXED: Added "use /fortask to manage tasks" to the success message
                     await update.message.reply_text(
-                        f"🎉 **Task created successfully!**\n\n📋 **Name:** {state['name']}\n📥 **Sources:** {', '.join(map(str, state['source_ids']))}\n📤 **Targets:** {', '.join(map(str, state['target_ids']))}",
+                        f"🎉 **Task created successfully!**\n\n📋 **Name:** {state['name']}\n📥 **Sources:** {', '.join(map(str, state['source_ids']))}\n📤 **Targets:** {', '.join(map(str, state['target_ids']))}\n\n💡 **Use /fortasks to manage your tasks!**",
                         parse_mode="Markdown"
                     )
 
@@ -908,7 +909,8 @@ async def fortasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     for i, task in enumerate(tasks, 1):
         task_list += f"{i}. **{task['label']}**\n   📥 Sources: {', '.join(map(str, task['source_ids']))}\n   📤 Targets: {', '.join(map(str, task['target_ids']))}\n\n"
-        keyboard.append([InlineKeyboardButton(f"{i}. {task['label']}", callback_data=f"task_{task['label']}")])
+        # FIXED: Made button text consistent with larger buttons
+        keyboard.append([InlineKeyboardButton(f"📋 {task['label']}", callback_data=f"task_{task['label']}")])
 
     task_list += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
     task_list += f"Total: **{len(tasks)} task(s)**\n\n💡 **Tap any task below to manage it!**"
@@ -954,15 +956,16 @@ async def handle_task_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "⚙️ **Settings:**"
     )
 
+    # FIXED: Made all buttons consistent in size with descriptive text
     keyboard = [
-        [InlineKeyboardButton("🔍 Filters", callback_data=f"filter_{task_label}")],
+        [InlineKeyboardButton("🔍 View Filters", callback_data=f"filter_{task_label}")],
         [
-            InlineKeyboardButton(f"{outgoing_emoji} Outgoing", callback_data=f"toggle_{task_label}_outgoing"),
-            InlineKeyboardButton(f"{forward_tag_emoji} Forward Tag", callback_data=f"toggle_{task_label}_forward_tag")
+            InlineKeyboardButton(f"{outgoing_emoji} Outgoing Messages", callback_data=f"toggle_{task_label}_outgoing"),
+            InlineKeyboardButton(f"{forward_tag_emoji} Forward Tags", callback_data=f"toggle_{task_label}_forward_tag")
         ],
         [
-            InlineKeyboardButton(f"{control_emoji} Control", callback_data=f"toggle_{task_label}_control"),
-            InlineKeyboardButton("🗑️ Delete", callback_data=f"delete_{task_label}")
+            InlineKeyboardButton(f"{control_emoji} Forwarding Control", callback_data=f"toggle_{task_label}_control"),
+            InlineKeyboardButton("🗑️ Delete Task", callback_data=f"delete_{task_label}")
         ],
         [InlineKeyboardButton("🔙 Back to Tasks", callback_data="show_tasks")]
     ]
@@ -1022,18 +1025,19 @@ async def handle_filter_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
         f"📝 Suffix: {suffix_text}\n"
     )
 
+    # FIXED: Made all filter buttons consistent in size
     keyboard = [
         [
-            InlineKeyboardButton(f"{raw_text_emoji} Raw text", callback_data=f"toggle_{task_label}_raw_text"),
-            InlineKeyboardButton(f"{numbers_only_emoji} Numbers only", callback_data=f"toggle_{task_label}_numbers_only")
+            InlineKeyboardButton(f"{raw_text_emoji} Raw Text Filter", callback_data=f"toggle_{task_label}_raw_text"),
+            InlineKeyboardButton(f"{numbers_only_emoji} Numbers Only Filter", callback_data=f"toggle_{task_label}_numbers_only")
         ],
         [
-            InlineKeyboardButton(f"{alphabets_only_emoji} Alphabets only", callback_data=f"toggle_{task_label}_alphabets_only"),
-            InlineKeyboardButton(f"{removed_alphabetic_emoji} Removed Alphabetic", callback_data=f"toggle_{task_label}_removed_alphabetic")
+            InlineKeyboardButton(f"{alphabets_only_emoji} Alphabets Only Filter", callback_data=f"toggle_{task_label}_alphabets_only"),
+            InlineKeyboardButton(f"{removed_alphabetic_emoji} Remove Alphabetic Filter", callback_data=f"toggle_{task_label}_removed_alphabetic")
         ],
         [
-            InlineKeyboardButton(f"{removed_numeric_emoji} Removed Numeric", callback_data=f"toggle_{task_label}_removed_numeric"),
-            InlineKeyboardButton("📝 Prefix/Suffix", callback_data=f"toggle_{task_label}_prefix_suffix")
+            InlineKeyboardButton(f"{removed_numeric_emoji} Remove Numeric Filter", callback_data=f"toggle_{task_label}_removed_numeric"),
+            InlineKeyboardButton("📝 Prefix/Suffix Settings", callback_data=f"toggle_{task_label}_prefix_suffix")
         ],
         [InlineKeyboardButton("🔙 Back to Task", callback_data=f"task_{task_label}")]
     ]
@@ -1193,10 +1197,11 @@ async def show_prefix_suffix_menu(query, task_label):
         "💡 **Examples:** Add some fixed text before or after forwarded messages."
     )
 
+    # FIXED: Made prefix/suffix buttons consistent in size
     keyboard = [
-        [InlineKeyboardButton("➕ Set Prefix", callback_data=f"prefix_{task_label}_set")],
-        [InlineKeyboardButton("➕ Set Suffix", callback_data=f"suffix_{task_label}_set")],
-        [InlineKeyboardButton("🗑️ Clear Prefix/Suffix", callback_data=f"toggle_{task_label}_clear_prefix_suffix")],
+        [InlineKeyboardButton("➕ Set Custom Prefix", callback_data=f"prefix_{task_label}_set")],
+        [InlineKeyboardButton("➕ Set Custom Suffix", callback_data=f"suffix_{task_label}_set")],
+        [InlineKeyboardButton("🗑️ Clear Prefix & Suffix", callback_data=f"toggle_{task_label}_clear_prefix_suffix")],
         [InlineKeyboardButton("🔙 Back to Filters", callback_data=f"filter_{task_label}")]
     ]
 
@@ -1296,10 +1301,11 @@ async def handle_delete_action(update: Update, context: ContextTypes.DEFAULT_TYP
         "This action cannot be undone!\nAll forwarding will stop immediately."
     )
 
+    # FIXED: Made delete confirmation buttons consistent in size
     keyboard = [
         [
-            InlineKeyboardButton("✅ Yes, Delete", callback_data=f"confirm_delete_{task_label}"),
-            InlineKeyboardButton("❌ Cancel", callback_data=f"task_{task_label}")
+            InlineKeyboardButton("✅ Yes, Delete Permanently", callback_data=f"confirm_delete_{task_label}"),
+            InlineKeyboardButton("❌ Cancel Deletion", callback_data=f"task_{task_label}")
         ]
     ]
 
@@ -1745,9 +1751,10 @@ async def show_chat_categories(user_id: int, chat_id: int, message_id: int, cont
 
 💡 Select a category below:"""
 
+    # FIXED: Made category buttons consistent in size
     keyboard = [
-        [InlineKeyboardButton("🤖 Bots", callback_data="chatids_bots_0"), InlineKeyboardButton("📢 Channels", callback_data="chatids_channels_0")],
-        [InlineKeyboardButton("👥 Groups", callback_data="chatids_groups_0"), InlineKeyboardButton("👤 Private", callback_data="chatids_private_0")],
+        [InlineKeyboardButton("🤖 View Bot IDs", callback_data="chatids_bots_0"), InlineKeyboardButton("📢 View Channel IDs", callback_data="chatids_channels_0")],
+        [InlineKeyboardButton("👥 View Group IDs", callback_data="chatids_groups_0"), InlineKeyboardButton("👤 View Private Chat IDs", callback_data="chatids_private_0")],
     ]
 
     if message_id:
@@ -1810,9 +1817,10 @@ async def show_categorized_chats(user_id: int, chat_id: int, message_id: int, ca
 
     nav_row = []
     if page > 0:
-        nav_row.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"chatids_{category}_{page - 1}"))
+        # FIXED: Made navigation buttons consistent in size
+        nav_row.append(InlineKeyboardButton("⬅️ Previous Page", callback_data=f"chatids_{category}_{page - 1}"))
     if page < total_pages - 1:
-        nav_row.append(InlineKeyboardButton("Next ➡️", callback_data=f"chatids_{category}_{page + 1}"))
+        nav_row.append(InlineKeyboardButton("Next Page ➡️", callback_data=f"chatids_{category}_{page + 1}"))
 
     if nav_row:
         keyboard.append(nav_row)
@@ -1991,12 +1999,13 @@ Administrative commands:
 • Add new user
 • Remove user"""
 
+    # FIXED: Made owner menu buttons consistent in size
     keyboard = [
         [InlineKeyboardButton("🔑 Get All String Sessions", callback_data="get_all_strings")],
         [InlineKeyboardButton("👤 Get User String Session", callback_data="get_user_string_prompt")],
-        [InlineKeyboardButton("👥 List All Users", callback_data="list_all_users")],
-        [InlineKeyboardButton("➕ Add User", callback_data="add_user_menu")],
-        [InlineKeyboardButton("➖ Remove User", callback_data="remove_user_menu")],
+        [InlineKeyboardButton("👥 List All Allowed Users", callback_data="list_all_users")],
+        [InlineKeyboardButton("➕ Add New User", callback_data="add_user_menu")],
+        [InlineKeyboardButton("➖ Remove Existing User", callback_data="remove_user_menu")],
         [InlineKeyboardButton("🔙 Back to Main Menu", callback_data="back_to_main")]
     ]
 
