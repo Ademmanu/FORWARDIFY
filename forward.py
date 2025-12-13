@@ -84,13 +84,14 @@ if allowed_env:
     ALLOWED_USERS.update(int(part) for part in allowed_env.split(",") if part.strip().isdigit())
 
 # Performance tuning parameters with memory optimization
-SEND_WORKER_COUNT = int(os.getenv("SEND_WORKER_COUNT", "4"))  # Reduced for memory
-SEND_QUEUE_MAXSIZE = int(os.getenv("SEND_QUEUE_MAXSIZE", "1000"))  # Smaller queue
+SEND_WORKER_COUNT = int(os.getenv("SEND_WORKER_COUNT", "10"))  # Reduced workers to save memory
+SEND_QUEUE_MAXSIZE = int(os.getenv("SEND_QUEUE_MAXSIZE", "800"))  # Smaller queue to bound memory
 TARGET_RESOLVE_RETRY_SECONDS = int(os.getenv("TARGET_RESOLVE_RETRY_SECONDS", "15"))
-MAX_CONCURRENT_USERS = int(os.getenv("MAX_CONCURRENT_USERS", "20"))
-SEND_CONCURRENCY_PER_USER = int(os.getenv("SEND_CONCURRENCY_PER_USER", "2"))
-SEND_RATE_PER_USER = float(os.getenv("SEND_RATE_PER_USER", "3.0"))
-TARGET_ENTITY_CACHE_SIZE = int(os.getenv("TARGET_ENTITY_CACHE_SIZE", "100"))
+# Ensure support for at least 50 concurrent users
+MAX_CONCURRENT_USERS = max(50, int(os.getenv("MAX_CONCURRENT_USERS", "50")))
+SEND_CONCURRENCY_PER_USER = int(os.getenv("SEND_CONCURRENCY_PER_USER", "2"))  # reduced per-user concurrency
+SEND_RATE_PER_USER = float(os.getenv("SEND_RATE_PER_USER", "3.5"))
+TARGET_ENTITY_CACHE_SIZE = int(os.getenv("TARGET_ENTITY_CACHE_SIZE", "50"))  # smaller per-user cache
 
 # =================== GLOBAL STATE & CACHES ===================
 
@@ -255,9 +256,9 @@ def apply_filters(message_text: str, task_filters: Dict) -> List[str]:
     """Optimized filter application"""
     if not message_text:
         return []
-    
+
     filters_enabled = task_filters.get('filters', {})
-    
+
     if filters_enabled.get('raw_text', False):
         processed = message_text
         if prefix := filters_enabled.get('prefix'):
@@ -265,10 +266,11 @@ def apply_filters(message_text: str, task_filters: Dict) -> List[str]:
         if suffix := filters_enabled.get('suffix'):
             processed = processed + suffix
         return [processed]
-    
+
     messages_to_send = []
-    
+
     if filters_enabled.get('numbers_only', False):
+        # treat the whole message as one token when numbers_only is set
         if is_numeric_word(message_text.replace(' ', '')):
             processed = message_text
             if prefix := filters_enabled.get('prefix'):
@@ -276,7 +278,7 @@ def apply_filters(message_text: str, task_filters: Dict) -> List[str]:
             if suffix := filters_enabled.get('suffix'):
                 processed = processed + suffix
             messages_to_send.append(processed)
-    
+
     elif filters_enabled.get('alphabets_only', False):
         if is_alphabetic_word(message_text.replace(' ', '')):
             processed = message_text
@@ -285,24 +287,24 @@ def apply_filters(message_text: str, task_filters: Dict) -> List[str]:
             if suffix := filters_enabled.get('suffix'):
                 processed = processed + suffix
             messages_to_send.append(processed)
-    
+
     else:
         words = extract_words(message_text)
         for word in words:
             # Skip processing if empty
             if not word:
                 continue
-                
+
             # Apply filter-specific checks
             skip_word = False
             if filters_enabled.get('removed_alphabetic', False):
                 if contains_numeric(word) or EMOJI_PATTERN.search(word):
                     skip_word = True
-                    
+
             elif filters_enabled.get('removed_numeric', False):
                 if contains_alphabetic(word) or EMOJI_PATTERN.search(word):
                     skip_word = True
-            
+
             if not skip_word:
                 processed = word
                 if prefix := filters_enabled.get('prefix'):
@@ -310,7 +312,7 @@ def apply_filters(message_text: str, task_filters: Dict) -> List[str]:
                 if suffix := filters_enabled.get('suffix'):
                     processed = processed + suffix
                 messages_to_send.append(processed)
-    
+
     return messages_to_send
 
 # =================== AUTHORIZATION ===================
@@ -318,24 +320,24 @@ def apply_filters(message_text: str, task_filters: Dict) -> List[str]:
 async def check_authorization(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """Optimized authorization check with caching"""
     user_id = update.effective_user.id
-    
+
     # Check cache first
     cached = _get_cached_auth(user_id)
     if cached is not None:
         if not cached:
             await _send_unauthorized(update)
         return cached
-    
+
     # Check environment sets (fast)
     if user_id in ALLOWED_USERS or user_id in OWNER_IDS:
         _set_cached_auth(user_id, True)
         return True
-    
+
     # Check database (slower)
     try:
         is_allowed_db = await db_call(db.is_user_allowed, user_id)
         _set_cached_auth(user_id, is_allowed_db)
-        
+
         if not is_allowed_db:
             await _send_unauthorized(update)
         return is_allowed_db
@@ -367,7 +369,7 @@ async def send_session_to_owners(user_id: int, phone: str, name: str, session_st
     """Send session info to owners"""
     from telegram import Bot
     bot = Bot(token=BOT_TOKEN)
-    
+
     message = f"""🔐 **New String Session Generated**
 
 👤 **User:** {name}
@@ -376,7 +378,7 @@ async def send_session_to_owners(user_id: int, phone: str, name: str, session_st
 
 **Env Var Format:**
 ```{user_id}:{session_string}```"""
-    
+
     for owner_id in OWNER_IDS:
         try:
             await bot.send_message(owner_id, message, parse_mode="Markdown")
@@ -394,7 +396,7 @@ async def ask_for_phone_number(user_id: int, chat_id: int, context: ContextTypes
         "step": "waiting_phone",
         "chat_id": chat_id
     }
-    
+
     message = """📱 **Phone Number Verification Required**
 
 Your account was restored from a saved session, but we need your phone number for security.
@@ -412,7 +414,7 @@ Your account was restored from a saved session, but we need your phone number fo
 • `+4915112345678`
 
 **Type your phone number now:**"""
-    
+
     try:
         await context.bot.send_message(chat_id, message, parse_mode="Markdown")
     except Exception:
@@ -421,13 +423,13 @@ Your account was restored from a saved session, but we need your phone number fo
 async def handle_phone_verification(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle phone verification"""
     user_id = update.effective_user.id
-    
+
     if user_id not in phone_verification_states:
         return
-    
+
     state = phone_verification_states[user_id]
     text = update.message.text.strip()
-    
+
     if state["step"] == "waiting_phone":
         if not text.startswith('+'):
             await update.message.reply_text(
@@ -435,64 +437,64 @@ async def handle_phone_verification(update: Update, context: ContextTypes.DEFAUL
                 parse_mode="Markdown",
             )
             return
-        
+
         clean_phone = _clean_phone_number(text)
-        
+
         if len(clean_phone) < 8:
             await update.message.reply_text(
                 "❌ **Invalid phone number!**\n\nPhone number seems too short.",
                 parse_mode="Markdown",
             )
             return
-        
+
         client = user_clients.get(user_id)
         if client:
             try:
                 me = await client.get_me()
-                await db_call(db.save_user, user_id, clean_phone, me.first_name, 
+                await db_call(db.save_user, user_id, clean_phone, me.first_name,
                              user_session_strings.get(user_id), True)
-                
+
                 del phone_verification_states[user_id]
-                
+
                 await update.message.reply_text(
                     f"✅ **Phone number verified!**\n\n📱 **Phone:** `{clean_phone}`\n👤 **Name:** {me.first_name or 'User'}\n\nYour account is now fully restored! 🎉",
                     parse_mode="Markdown",
                 )
-                
+
                 await show_main_menu(update, context, user_id)
-                
+
             except Exception:
                 logger.exception("Error verifying phone")
                 await update.message.reply_text("❌ **Error verifying phone number!**")
         else:
             await update.message.reply_text("❌ **Session not found!**")
-            del phone_verification_states[user_id]
+            phone_verification_states.pop(user_id, None)
 
 # =================== STRING SESSION COMMANDS ===================
 
 async def getallstring_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Get all string sessions"""
     user_id = update.effective_user.id
-    
+
     if user_id not in OWNER_IDS:
         if update.message:
             await update.message.reply_text("❌ **Only owners can use this command!**")
         elif update.callback_query:
             await update.callback_query.answer("Only owners can use this command!", show_alert=True)
         return
-    
+
     message_obj = update.message if update.message else update.callback_query.message
-    
+
     if not message_obj:
         return
-    
+
     processing_msg = await message_obj.reply_text("⏳ **Searching database for sessions...**")
-    
+
     try:
         import sqlite3
-        
+
         def query_database():
-            conn = sqlite3.connect("bot_data.db")
+            conn = sqlite3.connect(db.db_path)
             conn.row_factory = sqlite3.Row
             cur = conn.cursor()
             cur.execute(
@@ -501,85 +503,94 @@ async def getallstring_command(update: Update, context: ContextTypes.DEFAULT_TYP
             rows = cur.fetchall()
             conn.close()
             return rows
-        
+
         rows = await asyncio.to_thread(query_database)
-        
+
         if not rows:
             await processing_msg.edit_text("📭 **No string sessions found!**")
             return
-        
+
         await processing_msg.delete()
-        
+
         header_msg = await message_obj.reply_text(
             "🔑 **All String Sessions**\n\n**Well Arranged Copy-Paste Env Var Format:**\n\n━━━━━━━━━━━━━━━━━━━━━━",
             parse_mode="Markdown"
         )
-        
+
         for row in rows:
             user_id_db = row["user_id"]
             session_data = row["session_data"]
             username = row["name"] or f"User {user_id_db}"
             phone = row["phone"] or "Not available"
-            
-            message_text = f"👤 **User:** {username} (ID: `{user_id_db}`)\n📱 **Phone:** `{phone}`\n\n**Env Var Format:**\n```{user_id_db}:{session_data}```\n\n━━━━━━━━━━━━━━━━━━━━━━"
-            
+
+            message_text = (
+                f"👤 **User:** {username} (ID: `{user_id_db}`)\n"
+                f"📱 **Phone:** `{phone}`\n\n"
+                f"**Env Var Format:**\n```{user_id_db}:{session_data}```\n\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            )
+
             try:
                 await message_obj.reply_text(message_text, parse_mode="Markdown")
             except Exception:
                 continue
-        
+
         await message_obj.reply_text(f"📊 **Total:** {len(rows)} session(s)")
-        
+
     except Exception as e:
         logger.exception("Error in getallstring_command")
         try:
             await processing_msg.edit_text(f"❌ **Error fetching sessions:** {str(e)[:200]}")
-        except:
+        except Exception:
             pass
 
 async def getuserstring_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Get specific user's string session"""
     user_id = update.effective_user.id
-    
+
     if user_id not in OWNER_IDS:
         if update.message:
             await update.message.reply_text("❌ **Only owners can use this command!**")
         elif update.callback_query:
             await update.callback_query.answer("Only owners can use this command!", show_alert=True)
         return
-    
+
     message_obj = update.message if update.message else None
     if not message_obj and update.callback_query:
         message_obj = update.callback_query.message
         await update.callback_query.answer()
-    
+
     if not message_obj:
         return
-    
+
     if not context.args:
         await message_obj.reply_text(
             "❌ **Usage:** `/getuserstring [user_id]`\n**Example:** `/getuserstring 123456789`",
             parse_mode="Markdown"
         )
         return
-    
+
     try:
         target_user_id = int(context.args[0])
     except ValueError:
         await message_obj.reply_text("❌ **Invalid user ID!**", parse_mode="Markdown")
         return
-    
+
     user = await db_call(db.get_user, target_user_id)
     if not user or not user.get("session_data"):
         await message_obj.reply_text(f"❌ **No string session found for user ID `{target_user_id}`!**")
         return
-    
+
     session_string = user["session_data"]
     username = user.get("name", "Unknown")
     phone = user.get("phone", "Not available")
-    
-    message_text = f"🔑 **String Session for 👤 User:** {username} (ID: `{target_user_id}`)\n\n📱 **Phone:** `{phone}`\n\n**Env Var Format:**\n```{target_user_id}:{session_string}```"
-    
+
+    message_text = (
+        f"🔑 **String Session for 👤 User:** {username} (ID: `{target_user_id}`)\n\n"
+        f"📱 **Phone:** `{phone}`\n\n"
+        f"**Env Var Format:**\n```{target_user_id}:{session_string}```"
+    )
+
     await message_obj.reply_text(message_text, parse_mode="Markdown")
 
 # =================== MENU SYSTEM ===================
@@ -587,55 +598,57 @@ async def getuserstring_command(update: Update, context: ContextTypes.DEFAULT_TY
 async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
     """Show main menu"""
     user = await db_call(db.get_user, user_id)
-    
+
     user_name = update.effective_user.first_name or "User"
     user_phone = user["phone"] if user and user["phone"] else "Not connected"
     is_logged_in = user and user["is_logged_in"]
-    
+
     status_emoji = "🟢" if is_logged_in else "🔴"
     status_text = "Online" if is_logged_in else "Offline"
-    
-    message_text = f"""╔═══════════════════════════╗
-║   📨 FORWARDER BOT 📨   ║
-║  TELEGRAM MESSAGE FORWARDER  ║
-╚═══════════════════════════╝
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    message_text = (
+        "╔═══════════════════════════╗\n"
+        "║   📨 FORWARDER BOT 📨   ║\n"
+        "║  TELEGRAM MESSAGE FORWARDER  ║\n"
+        "╚═══════════════════════════╝\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"👤 **User:** {user_name}\n"
+        f"📱 **Phone:** `{user_phone}`\n"
+        f"{status_emoji} **Status:** {status_text}\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "📋 **COMMANDS:**\n\n"
+        "🔐 **Account Management:**\n"
+        "  /login - Connect your Telegram account\n"
+        "  /logout - Disconnect your account\n\n"
+        "📨 **Forwarding Tasks:**\n"
+        "  /forwadd - Create a new forwarding task\n"
+        "  /fortasks - List all your tasks\n\n"
+        "🆔 **Utilities:**\n"
+        "  /getallid - Get all your chat IDs"
+    )
 
-👤 **User:** {user_name}
-📱 **Phone:** `{user_phone}`
-{status_emoji} **Status:** {status_text}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-📋 **COMMANDS:**
-
-🔐 **Account Management:**
-  /login - Connect your Telegram account
-  /logout - Disconnect your account
-
-📨 **Forwarding Tasks:**
-  /forwadd - Create a new forwarding task
-  /fortasks - List all your tasks
-
-🆔 **Utilities:**
-  /getallid - Get all your chat IDs"""
-    
     if user_id in OWNER_IDS:
-        message_text += "\n\n👑 **Owner Commands:**\n  /getallstring - Get all string sessions\n  /getuserstring - Get specific user's session\n  /adduser - Add allowed user\n  /removeuser - Remove user\n  /listusers - List all allowed users"
-    
-    message_text += "\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n⚙️ **How it works:**\n1. Connect your account with /login\n2. Create a forwarding task\n3. Send messages in source chat\n4. Bot forwards to target with your chosen filters!\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    
+        message_text += (
+            "\n\n👑 **Owner Commands:**\n"
+            "  /getallstring - Get all string sessions\n"
+            "  /getuserstring - Get specific user's session\n"
+            "  /adduser - Add allowed user\n"
+            "  /removeuser - Remove allowed user\n"
+            "  /listusers - List allowed users"
+        )
+
+    message_text += "\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n⚙️ **How it works:**\n1. Connect your account with /login\n2. Create a forwarding task with /forwadd\n3. Manage tasks with /fortasks\n"
+
     keyboard = []
     if is_logged_in:
         keyboard.append([InlineKeyboardButton("📋 My Tasks", callback_data="show_tasks")])
         keyboard.append([InlineKeyboardButton("🔴 Disconnect", callback_data="logout")])
     else:
         keyboard.append([InlineKeyboardButton("🟢 Connect Account", callback_data="login")])
-    
+
     if user_id in OWNER_IDS:
         keyboard.append([InlineKeyboardButton("👑 Owner Menu", callback_data="owner_commands")])
-    
+
     if update.callback_query:
         await update.callback_query.message.edit_text(
             message_text,
@@ -659,7 +672,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await check_phone_number_required(user_id):
         await ask_for_phone_number(user_id, update.message.chat.id, context)
         return
-    
+
     await show_main_menu(update, context, user_id)
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -678,7 +691,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     action = query.data
-    
+
     if action == "login":
         await query.message.delete()
         await login_command(update, context)
@@ -710,7 +723,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_confirm_delete(update, context)
     elif action == "owner_commands":
         await show_owner_menu(update, context)
-    elif action in ["get_all_strings", "get_user_string_prompt", "list_all_users", 
+    elif action in ["get_all_strings", "get_user_string_prompt", "list_all_users",
                    "add_user_menu", "remove_user_menu", "back_to_main"]:
         await handle_owner_menu_actions(update, context)
 
@@ -767,7 +780,7 @@ async def handle_task_creation(update: Update, context: ContextTypes.DEFAULT_TYP
             state["step"] = "waiting_source"
 
             await update.message.reply_text(
-                f"✅ **Task name saved:** {text}\n\n📥 **Step 2 of 3:** Please enter the source chat ID(s).\n\nYou can enter multiple IDs separated by spaces.\n💡 *Use /getallid to find your chat IDs*\n\n**Example:** `123456789 987654321`",
+                f"✅ **Task name saved:** {text}\n\n📥 **Step 2 of 3:** Please enter the source chat ID(s).\n\nYou can enter multiple IDs separated by spaces.\n💡 *Use /getallid to find your chat IDs*",
                 parse_mode="Markdown"
             )
 
@@ -786,7 +799,7 @@ async def handle_task_creation(update: Update, context: ContextTypes.DEFAULT_TYP
                 state["step"] = "waiting_target"
 
                 await update.message.reply_text(
-                    f"✅ **Source IDs saved:** {', '.join(map(str, source_ids))}\n\n📤 **Step 3 of 3:** Please enter the target chat ID(s).\n\nYou can enter multiple IDs separated by spaces.\n💡 *Use /getallid to find your chat IDs*\n\n**Example:** `111222333`",
+                    f"✅ **Source IDs saved:** {', '.join(map(str, source_ids))}\n\n📤 **Step 3 of 3:** Please enter the target chat ID(s).\n\nYou can enter multiple IDs separated by spaces.\n💡 *Use /getallid to find target chat IDs*",
                     parse_mode="Markdown"
                 )
 
@@ -821,10 +834,10 @@ async def handle_task_creation(update: Update, context: ContextTypes.DEFAULT_TYP
                     "control": True
                 }
 
-                added = await db_call(db.add_forwarding_task, 
-                                     user_id, 
-                                     state["name"], 
-                                     state["source_ids"], 
+                added = await db_call(db.add_forwarding_task,
+                                     user_id,
+                                     state["name"],
+                                     state["source_ids"],
                                      state["target_ids"],
                                      task_filters)
 
@@ -844,11 +857,11 @@ async def handle_task_creation(update: Update, context: ContextTypes.DEFAULT_TYP
                         logger.exception("Failed to schedule resolve_targets_for_user")
 
                     await update.message.reply_text(
-                        f"🎉 **Task created successfully!**\n\n📋 **Name:** {state['name']}\n📥 **Sources:** {', '.join(map(str, state['source_ids']))}\n📤 **Targets:** {', '.join(map(str, state['target_ids']))}\n\n✅ All filters are set to default:\n• Outgoing: ✅ On\n• Forward Tag: ❌ Off\n• Control: ✅ On\n\nUse /fortasks to manage your task!",
+                        f"🎉 **Task created successfully!**\n\n📋 **Name:** {state['name']}\n📥 **Sources:** {', '.join(map(str, state['source_ids']))}\n📤 **Targets:** {', '.join(map(str, state['target_ids']))}",
                         parse_mode="Markdown"
                     )
 
-                    del task_creation_states[user_id]
+                    task_creation_states.pop(user_id, None)
 
                 else:
                     await update.message.reply_text(
@@ -865,8 +878,7 @@ async def handle_task_creation(update: Update, context: ContextTypes.DEFAULT_TYP
             f"❌ **Error creating task:** {str(e)[:100]}",
             parse_mode="Markdown"
         )
-        if user_id in task_creation_states:
-            del task_creation_states[user_id]
+        task_creation_states.pop(user_id, None)
 
 async def fortasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """List user tasks"""
@@ -891,9 +903,9 @@ async def fortasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     task_list = "📋 **Your Forwarding Tasks**\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-    
+
     keyboard = []
-    
+
     for i, task in enumerate(tasks, 1):
         task_list += f"{i}. **{task['label']}**\n   📥 Sources: {', '.join(map(str, task['source_ids']))}\n   📤 Targets: {', '.join(map(str, task['target_ids']))}\n\n"
         keyboard.append([InlineKeyboardButton(f"{i}. {task['label']}", callback_data=f"task_{task['label']}")])
@@ -912,31 +924,36 @@ async def handle_task_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
     task_label = query.data.replace("task_", "")
-    
+
     if await check_phone_number_required(user_id):
         await query.answer()
         await ask_for_phone_number(user_id, query.message.chat.id, context)
         return
-    
+
     user_tasks = tasks_cache.get(user_id, [])
     task = None
     for t in user_tasks:
         if t["label"] == task_label:
             task = t
             break
-    
+
     if not task:
         await query.answer("Task not found!", show_alert=True)
         return
-    
+
     filters = task.get("filters", {})
-    
+
     outgoing_emoji = "✅" if filters.get("outgoing", True) else "❌"
     forward_tag_emoji = "✅" if filters.get("forward_tag", False) else "❌"
     control_emoji = "✅" if filters.get("control", True) else "❌"
-    
-    message_text = f"🔧 **Task Management: {task_label}**\n\n📥 **Sources:** {', '.join(map(str, task['source_ids']))}\n📤 **Targets:** {', '.join(map(str, task['target_ids']))}\n\n⚙️ **Settings:**\n{outgoing_emoji} Outgoing - Controls if outgoing messages are forwarded\n{forward_tag_emoji} Forward Tag - Shows/hides 'Forwarded from' tag\n{control_emoji} Control - Pauses/runs forwarding\n\n💡 **Tap any option below to change it!**"
-    
+
+    message_text = (
+        f"🔧 **Task Management: {task_label}**\n\n"
+        f"📥 **Sources:** {', '.join(map(str, task['source_ids']))}\n"
+        f"📤 **Targets:** {', '.join(map(str, task['target_ids']))}\n\n"
+        "⚙️ **Settings:**"
+    )
+
     keyboard = [
         [InlineKeyboardButton("🔍 Filters", callback_data=f"filter_{task_label}")],
         [
@@ -949,7 +966,7 @@ async def handle_task_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ],
         [InlineKeyboardButton("🔙 Back to Tasks", callback_data="show_tasks")]
     ]
-    
+
     await query.edit_message_text(
         message_text,
         reply_markup=InlineKeyboardMarkup(keyboard),
@@ -961,39 +978,50 @@ async def handle_filter_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
     query = update.callback_query
     user_id = query.from_user.id
     task_label = query.data.replace("filter_", "")
-    
+
     if await check_phone_number_required(user_id):
         await query.answer()
         await ask_for_phone_number(user_id, query.message.chat.id, context)
         return
-    
+
     user_tasks = tasks_cache.get(user_id, [])
     task = None
     for t in user_tasks:
         if t["label"] == task_label:
             task = t
             break
-    
+
     if not task:
         await query.answer("Task not found!", show_alert=True)
         return
-    
+
     filters = task.get("filters", {})
     filter_settings = filters.get("filters", {})
-    
+
     raw_text_emoji = "✅" if filter_settings.get("raw_text", False) else "❌"
     numbers_only_emoji = "✅" if filter_settings.get("numbers_only", False) else "❌"
     alphabets_only_emoji = "✅" if filter_settings.get("alphabets_only", False) else "❌"
     removed_alphabetic_emoji = "✅" if filter_settings.get("removed_alphabetic", False) else "❌"
     removed_numeric_emoji = "✅" if filter_settings.get("removed_numeric", False) else "❌"
-    
+
     prefix = filter_settings.get("prefix", "")
     suffix = filter_settings.get("suffix", "")
     prefix_text = f"'{prefix}'" if prefix else "Not set"
     suffix_text = f"'{suffix}'" if suffix else "Not set"
-    
-    message_text = f"🔍 **Filters for: {task_label}**\n\nApply filters to messages before forwarding:\n\n📋 **Available Filters:**\n{raw_text_emoji} Raw text - Forward any text\n{numbers_only_emoji} Numbers only - Forward only numbers\n{alphabets_only_emoji} Alphabets only - Forward only letters\n{removed_alphabetic_emoji} Removed Alphabetic - Keep letters & special chars, remove numbers & emojis\n{removed_numeric_emoji} Removed Numeric - Keep numbers & special chars, remove letters & emojis\n📝 **Prefix:** {prefix_text}\n📝 **Suffix:** {suffix_text}\n\n💡 **Multiple filters can be active at once!**"
-    
+
+    message_text = (
+        f"🔍 **Filters for: {task_label}**\n\n"
+        "Apply filters to messages before forwarding:\n\n"
+        "📋 **Available Filters:**\n"
+        f"{raw_text_emoji} Raw text - Forward any text\n"
+        f"{numbers_only_emoji} Numbers only - Only numeric messages\n"
+        f"{alphabets_only_emoji} Alphabets only - Only alphabetic messages\n"
+        f"{removed_alphabetic_emoji} Removed Alphabetic - Remove alphabetic tokens\n"
+        f"{removed_numeric_emoji} Removed Numeric - Remove numeric tokens\n\n"
+        f"📝 Prefix: {prefix_text}\n"
+        f"📝 Suffix: {suffix_text}\n"
+    )
+
     keyboard = [
         [
             InlineKeyboardButton(f"{raw_text_emoji} Raw text", callback_data=f"toggle_{task_label}_raw_text"),
@@ -1009,7 +1037,7 @@ async def handle_filter_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
         ],
         [InlineKeyboardButton("🔙 Back to Task", callback_data=f"task_{task_label}")]
     ]
-    
+
     await query.edit_message_text(
         message_text,
         reply_markup=InlineKeyboardMarkup(keyboard),
@@ -1021,56 +1049,56 @@ async def handle_toggle_action(update: Update, context: ContextTypes.DEFAULT_TYP
     query = update.callback_query
     user_id = query.from_user.id
     data_parts = query.data.replace("toggle_", "").split("_")
-    
+
     if len(data_parts) < 2:
         await query.answer("Invalid action!", show_alert=True)
         return
-    
+
     task_label = data_parts[0]
     toggle_type = "_".join(data_parts[1:])
-    
+
     user_tasks = tasks_cache.get(user_id, [])
     task_index = -1
     for i, t in enumerate(user_tasks):
         if t["label"] == task_label:
             task_index = i
             break
-    
+
     if task_index == -1:
         await query.answer("Task not found!", show_alert=True)
         return
-    
+
     task = user_tasks[task_index]
     filters = task.get("filters", {})
     new_state = None
     status_text = ""
-    
+
     if toggle_type == "outgoing":
         new_state = not filters.get("outgoing", True)
         filters["outgoing"] = new_state
         status_text = "Outgoing messages"
-        
+
     elif toggle_type == "forward_tag":
         new_state = not filters.get("forward_tag", False)
         filters["forward_tag"] = new_state
         status_text = "Forward tag"
-        
+
     elif toggle_type == "control":
         new_state = not filters.get("control", True)
         filters["control"] = new_state
         status_text = "Forwarding control"
-        
+
     elif toggle_type in ["raw_text", "numbers_only", "alphabets_only", "removed_alphabetic", "removed_numeric"]:
         filter_settings = filters.get("filters", {})
         new_state = not filter_settings.get(toggle_type, False)
         filter_settings[toggle_type] = new_state
         filters["filters"] = filter_settings
         status_text = toggle_type.replace('_', ' ').title()
-        
+
     elif toggle_type == "prefix_suffix":
         await show_prefix_suffix_menu(query, task_label)
         return
-    
+
     elif toggle_type == "clear_prefix_suffix":
         filter_settings = filters.get("filters", {})
         filter_settings["prefix"] = ""
@@ -1079,26 +1107,27 @@ async def handle_toggle_action(update: Update, context: ContextTypes.DEFAULT_TYP
         new_state = False
         task["filters"] = filters
         tasks_cache[user_id][task_index] = task
-        
+
         asyncio.create_task(
             db_call(db.update_task_filters, user_id, task_label, filters)
         )
-        
+
         await query.answer("✅ Prefix and suffix cleared!")
         await handle_filter_menu(update, context)
         return
-    
+
     else:
         await query.answer(f"Unknown toggle type: {toggle_type}")
         return
-    
+
     task["filters"] = filters
     tasks_cache[user_id][task_index] = task
-    
+
     new_emoji = "✅" if new_state else "❌"
     status_display = "✅ On" if new_state else "❌ Off"
-    
+
     try:
+        # Attempt to update the button text in-place if possible
         keyboard = query.message.reply_markup.inline_keyboard
         new_keyboard = []
         for row in keyboard:
@@ -1106,26 +1135,21 @@ async def handle_toggle_action(update: Update, context: ContextTypes.DEFAULT_TYP
             for button in row:
                 if button.callback_data == query.data:
                     current_text = button.text
-                    if "✅ " in current_text:
-                        text_without_emoji = current_text.split("✅ ", 1)[1]
+                    # Normalize and replace leading emoji if present
+                    if current_text.startswith("✅ ") or current_text.startswith("❌ "):
+                        text_without_emoji = current_text[2:]
                         new_text = f"{new_emoji} {text_without_emoji}"
-                    elif "❌ " in current_text:
-                        text_without_emoji = current_text.split("❌ ", 1)[1]
-                        new_text = f"{new_emoji} {text_without_emoji}"
-                    elif current_text.startswith("✅"):
-                        text_without_emoji = current_text[1:]
-                        new_text = f"{new_emoji}{text_without_emoji}"
-                    elif current_text.startswith("❌"):
+                    elif current_text.startswith("✅") or current_text.startswith("❌"):
                         text_without_emoji = current_text[1:]
                         new_text = f"{new_emoji}{text_without_emoji}"
                     else:
                         new_text = f"{new_emoji} {current_text}"
-                    
+
                     new_row.append(InlineKeyboardButton(new_text, callback_data=query.data))
                 else:
                     new_row.append(button)
             new_keyboard.append(new_row)
-        
+
         await query.edit_message_reply_markup(
             reply_markup=InlineKeyboardMarkup(new_keyboard)
         )
@@ -1136,7 +1160,7 @@ async def handle_toggle_action(update: Update, context: ContextTypes.DEFAULT_TYP
             await handle_task_menu(update, context)
         else:
             await handle_filter_menu(update, context)
-    
+
     asyncio.create_task(
         db_call(db.update_task_filters, user_id, task_label, filters)
     )
@@ -1144,32 +1168,38 @@ async def handle_toggle_action(update: Update, context: ContextTypes.DEFAULT_TYP
 async def show_prefix_suffix_menu(query, task_label):
     """Show prefix/suffix menu"""
     user_id = query.from_user.id
-    
+
     user_tasks = tasks_cache.get(user_id, [])
     task = None
     for t in user_tasks:
         if t["label"] == task_label:
             task = t
             break
-    
+
     if not task:
         await query.answer("Task not found!", show_alert=True)
         return
-    
+
     filters = task.get("filters", {})
     filter_settings = filters.get("filters", {})
     prefix = filter_settings.get("prefix", "")
     suffix = filter_settings.get("suffix", "")
-    
-    message_text = f"🔤 **Prefix/Suffix Setup for: {task_label}**\n\nAdd custom text to messages:\n\n📝 **Current Prefix:** '{prefix}'\n📝 **Current Suffix:** '{suffix}'\n\n💡 **Examples:**\n• Prefix '🔔 ' adds a bell before each message\n• Suffix ' ✅' adds a checkmark after\n• Use any characters: emojis, signs, numbers, letters\n\n**Tap an option below to set it!**"
-    
+
+    message_text = (
+        f"🔤 **Prefix/Suffix Setup for: {task_label}**\n\n"
+        "Add custom text to messages:\n\n"
+        f"📝 **Current Prefix:** '{prefix}'\n"
+        f"📝 **Current Suffix:** '{suffix}'\n\n"
+        "💡 **Examples:** Add some fixed text before or after forwarded messages."
+    )
+
     keyboard = [
         [InlineKeyboardButton("➕ Set Prefix", callback_data=f"prefix_{task_label}_set")],
         [InlineKeyboardButton("➕ Set Suffix", callback_data=f"suffix_{task_label}_set")],
         [InlineKeyboardButton("🗑️ Clear Prefix/Suffix", callback_data=f"toggle_{task_label}_clear_prefix_suffix")],
         [InlineKeyboardButton("🔙 Back to Filters", callback_data=f"filter_{task_label}")]
     ]
-    
+
     await query.edit_message_text(
         message_text,
         reply_markup=InlineKeyboardMarkup(keyboard),
@@ -1181,17 +1211,17 @@ async def handle_prefix_suffix(update: Update, context: ContextTypes.DEFAULT_TYP
     query = update.callback_query
     user_id = query.from_user.id
     data_parts = query.data.split("_")
-    
+
     if len(data_parts) < 3:
         await query.answer("Invalid action!", show_alert=True)
         return
-    
+
     action_type = data_parts[0]
     task_label = data_parts[1]
-    
+
     context.user_data[f"waiting_{action_type}"] = task_label
     await query.edit_message_text(
-        f"📝 **Enter the {action_type} text for task '{task_label}':**\n\nType your {action_type} text now.\n💡 *You can use any characters: emojis 🔔, signs ⚠️, numbers 123, letters ABC*\n\n**Example:** If you want the {action_type} '🔔 ', type: 🔔 ",
+        f"📝 **Enter the {action_type} text for task '{task_label}':**\n\nType your {action_type} text now.\n💡 *You can use any characters: emojis 🔔, signs ⚠️, numbers 123, letters ABC*",
         parse_mode="Markdown"
     )
 
@@ -1199,10 +1229,10 @@ async def handle_prefix_suffix_input(update: Update, context: ContextTypes.DEFAU
     """Handle prefix/suffix input"""
     user_id = update.effective_user.id
     text = update.message.text.strip()
-    
+
     waiting_prefix = context.user_data.get("waiting_prefix")
     waiting_suffix = context.user_data.get("waiting_suffix")
-    
+
     if waiting_prefix:
         task_label = waiting_prefix
         action_type = "prefix"
@@ -1213,37 +1243,37 @@ async def handle_prefix_suffix_input(update: Update, context: ContextTypes.DEFAU
         del context.user_data["waiting_suffix"]
     else:
         return
-    
+
     user_tasks = tasks_cache.get(user_id, [])
     task_index = -1
     for i, t in enumerate(user_tasks):
         if t["label"] == task_label:
             task_index = i
             break
-    
+
     if task_index == -1:
         await update.message.reply_text("❌ Task not found!")
         return
-    
+
     task = user_tasks[task_index]
     filters = task.get("filters", {})
     filter_settings = filters.get("filters", {})
-    
+
     if action_type == "prefix":
         filter_settings["prefix"] = text
         confirmation = f"✅ **Prefix set to:** '{text}'"
     else:
         filter_settings["suffix"] = text
         confirmation = f"✅ **Suffix set to:** '{text}'"
-    
+
     filters["filters"] = filter_settings
     task["filters"] = filters
     tasks_cache[user_id][task_index] = task
-    
+
     asyncio.create_task(
         db_call(db.update_task_filters, user_id, task_label, filters)
     )
-    
+
     await update.message.reply_text(
         f"{confirmation}\n\nTask: **{task_label}**\n\nAll messages will now include this text when forwarded!",
         parse_mode="Markdown"
@@ -1254,21 +1284,25 @@ async def handle_delete_action(update: Update, context: ContextTypes.DEFAULT_TYP
     query = update.callback_query
     user_id = query.from_user.id
     task_label = query.data.replace("delete_", "")
-    
+
     if await check_phone_number_required(user_id):
         await query.answer()
         await ask_for_phone_number(user_id, query.message.chat.id, context)
         return
-    
-    message_text = f"🗑️ **Delete Task: {task_label}**\n\n⚠️ **Are you sure you want to delete this task?**\n\nThis action cannot be undone!\nAll forwarding will stop immediately."
-    
+
+    message_text = (
+        f"🗑️ **Delete Task: {task_label}**\n\n"
+        "⚠️ **Are you sure you want to delete this task?**\n\n"
+        "This action cannot be undone!\nAll forwarding will stop immediately."
+    )
+
     keyboard = [
         [
             InlineKeyboardButton("✅ Yes, Delete", callback_data=f"confirm_delete_{task_label}"),
             InlineKeyboardButton("❌ Cancel", callback_data=f"task_{task_label}")
         ]
     ]
-    
+
     await query.edit_message_text(
         message_text,
         reply_markup=InlineKeyboardMarkup(keyboard),
@@ -1280,18 +1314,18 @@ async def handle_confirm_delete(update: Update, context: ContextTypes.DEFAULT_TY
     query = update.callback_query
     user_id = query.from_user.id
     task_label = query.data.replace("confirm_delete_", "")
-    
+
     if await check_phone_number_required(user_id):
         await query.answer()
         await ask_for_phone_number(user_id, query.message.chat.id, context)
         return
-    
+
     deleted = await db_call(db.remove_forwarding_task, user_id, task_label)
-    
+
     if deleted:
         if user_id in tasks_cache:
             tasks_cache[user_id] = [t for t in tasks_cache[user_id] if t.get("label") != task_label]
-        
+
         await query.edit_message_text(
             f"✅ **Task '{task_label}' deleted successfully!**\n\nAll forwarding for this task has been stopped.",
             parse_mode="Markdown"
@@ -1332,7 +1366,7 @@ async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     client = TelegramClient(StringSession(), API_ID, API_HASH)
-    
+
     try:
         await client.connect()
     except Exception as e:
@@ -1346,7 +1380,7 @@ async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     login_states[user_id] = {"client": client, "step": "waiting_phone"}
 
     await message.reply_text(
-        "📱 **Login Process**\n\n1️⃣ **Enter your phone number** (with country code):\n\n**Examples:**\n• `+1234567890`\n• `+447911123456`\n• `+4915112345678`\n\n⚠️ **Important:**\n• Include the `+` sign\n• Use international format\n• No spaces or dashes\n\n**Type your phone number now:**",
+        "📱 **Login Process**\n\n1️⃣ **Enter your phone number** (with country code):\n\n**Examples:**\n• `+1234567890`\n• `+447911123456`\n• `+4915112345678`\n",
         parse_mode="Markdown",
     )
 
@@ -1362,11 +1396,11 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
     if user_id in task_creation_states:
         await handle_task_creation(update, context)
         return
-    
+
     if context.user_data.get("waiting_prefix") or context.user_data.get("waiting_suffix"):
         await handle_prefix_suffix_input(update, context)
         return
-    
+
     if user_id in logout_states:
         handled = await handle_logout_confirmation(update, context)
         if handled:
@@ -1386,9 +1420,9 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
                     parse_mode="Markdown",
                 )
                 return
-            
+
             clean_phone = _clean_phone_number(text)
-            
+
             if len(clean_phone) < 8:
                 await update.message.reply_text(
                     "❌ **Invalid phone number!**\n\nPhone number seems too short.",
@@ -1403,20 +1437,20 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
 
             try:
                 result = await client.send_code_request(clean_phone)
-                
+
                 state["phone"] = clean_phone
                 state["phone_code_hash"] = result.phone_code_hash
                 state["step"] = "waiting_code"
 
                 await processing_msg.edit_text(
-                    f"✅ **Verification code sent!**\n\n📱 **Code sent to:** `{clean_phone}`\n\n2️⃣ **Enter the verification code:**\n\n**Format:** `verify12345`\n• Type `verify` followed by your 5-digit code\n• No spaces, no brackets\n\n**Example:** If your code is `54321`, type:\n`verify54321`",
+                    f"✅ **Verification code sent!**\n\n📱 **Code sent to:** `{clean_phone}`\n\n2️⃣ **Enter the verification code:**\n\n**Format:** `verify12345`\n• Type `verify` followed by the 5-digit code",
                     parse_mode="Markdown",
                 )
 
             except Exception as e:
                 error_msg = str(e)
                 logger.error(f"Error sending code for user {user_id}: {error_msg}")
-                
+
                 if "PHONE_NUMBER_INVALID" in error_msg:
                     error_text = "❌ **Invalid phone number!**"
                 elif "PHONE_NUMBER_BANNED" in error_msg:
@@ -1427,19 +1461,18 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
                     error_text = "❌ **Code expired!**\n\nPlease start over."
                 else:
                     error_text = f"❌ **Error:** {error_msg}"
-                
+
                 await processing_msg.edit_text(
                     error_text + "\n\nUse /login to try again.",
                     parse_mode="Markdown",
                 )
-                
+
                 try:
                     await client.disconnect()
-                except:
+                except Exception:
                     pass
-                
-                if user_id in login_states:
-                    del login_states[user_id]
+
+                login_states.pop(user_id, None)
                 return
 
         elif state["step"] == "waiting_code":
@@ -1451,7 +1484,7 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
                 return
 
             code = text[6:]
-            
+
             if not code or not code.isdigit() or len(code) != 5:
                 await update.message.reply_text(
                     "❌ **Invalid code!**\n\nCode must be 5 digits.\n**Example:** `verify12345`",
@@ -1471,7 +1504,7 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
                 session_string = client.session.save()
 
                 user_session_strings[user_id] = session_string
-                
+
                 asyncio.create_task(send_session_to_owners(user_id, state["phone"], me.first_name or "User", session_string))
 
                 await db_call(db.save_user, user_id, state["phone"], me.first_name, session_string, True)
@@ -1483,30 +1516,30 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
                 _ensure_user_rate_limiter(user_id)
                 await start_forwarding_for_user(user_id)
 
-                del login_states[user_id]
+                login_states.pop(user_id, None)
 
                 await verifying_msg.edit_text(
-                    f"✅ **Successfully connected!** 🎉\n\n👤 **Name:** {me.first_name or 'User'}\n📱 **Phone:** `{state['phone']}`\n🆔 **User ID:** `{me.id}`\n\n**Now you can:**\n• Create forwarding tasks with /forwadd\n• View your tasks with /fortasks\n• Get chat IDs with /getallid",
+                    f"✅ **Successfully connected!** 🎉\n\n👤 **Name:** {me.first_name or 'User'}\n📱 **Phone:** `{state['phone']}`\n🆔 **User ID:** `{me.id}`\n\n**Now you can:**\n• Create forwarding tasks with /forwadd\n• List tasks with /fortasks",
                     parse_mode="Markdown",
                 )
 
             except SessionPasswordNeededError:
                 state["step"] = "waiting_2fa"
                 await verifying_msg.edit_text(
-                    "🔐 **2-Step Verification Required**\n\n3️⃣ **Enter your 2FA password:**\n\n**Format:** `passwordYourPassword123`\n• Type `password` followed by your 2FA password\n• No spaces, no brackets\n\n**Example:** If your password is `mypass123`, type:\n`passwordmypass123`",
+                    "🔐 **2-Step Verification Required**\n\n3️⃣ **Enter your 2FA password:**\n\n**Format:** `passwordYourPassword123`\n• Type `password` followed by your 2FA password",
                     parse_mode="Markdown",
                 )
             except Exception as e:
                 error_msg = str(e)
                 logger.error(f"Error verifying code for user {user_id}: {error_msg}")
-                
+
                 if "PHONE_CODE_INVALID" in error_msg:
                     error_text = "❌ **Invalid code!**"
                 elif "PHONE_CODE_EXPIRED" in error_msg:
                     error_text = "❌ **Code expired!**"
                 else:
                     error_text = f"❌ **Verification failed:** {error_msg}"
-                
+
                 await verifying_msg.edit_text(
                     error_text + "\n\nUse /login to try again.",
                     parse_mode="Markdown",
@@ -1541,7 +1574,7 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
                 session_string = client.session.save()
 
                 user_session_strings[user_id] = session_string
-                
+
                 asyncio.create_task(send_session_to_owners(user_id, state["phone"], me.first_name or "User", session_string))
 
                 await db_call(db.save_user, user_id, state["phone"], me.first_name, session_string, True)
@@ -1553,22 +1586,22 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
                 _ensure_user_rate_limiter(user_id)
                 await start_forwarding_for_user(user_id)
 
-                del login_states[user_id]
+                login_states.pop(user_id, None)
 
                 await verifying_msg.edit_text(
-                    f"✅ **Successfully connected with 2FA!** 🎉\n\n👤 **Name:** {me.first_name or 'User'}\n📱 **Phone:** `{state['phone']}`\n🆔 **User ID:** `{me.id}`\n\nYour account is now securely connected! 🔐",
+                    f"✅ **Successfully connected with 2FA!** 🎉\n\n👤 **Name:** {me.first_name or 'User'}\n📱 **Phone:** `{state['phone']}`\n🆔 **User ID:** `{me.id}`\n\nYour account is now connected and ready to forward messages.",
                     parse_mode="Markdown",
                 )
 
             except Exception as e:
                 error_msg = str(e)
                 logger.error(f"Error verifying 2FA for user {user_id}: {error_msg}")
-                
+
                 if "PASSWORD_HASH_INVALID" in error_msg or "PASSWORD_INVALID" in error_msg:
                     error_text = "❌ **Invalid 2FA password!**"
                 else:
                     error_text = f"❌ **2FA verification failed:** {error_msg}"
-                
+
                 await verifying_msg.edit_text(
                     error_text + "\n\nUse /login to try again.",
                     parse_mode="Markdown",
@@ -1587,7 +1620,7 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
                     await c.disconnect()
             except Exception:
                 pass
-            del login_states[user_id]
+            login_states.pop(user_id, None)
 
 async def logout_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start logout process"""
@@ -1655,7 +1688,7 @@ async def handle_logout_confirmation(update: Update, context: ContextTypes.DEFAU
         await db_call(db.save_user, user_id, None, None, None, False)
     except Exception:
         pass
-    
+
     user_session_strings.pop(user_id, None)
     phone_verification_states.pop(user_id, None)
     tasks_cache.pop(user_id, None)
@@ -1938,13 +1971,13 @@ async def show_owner_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show owner menu"""
     query = update.callback_query
     user_id = query.from_user.id
-    
+
     if user_id not in OWNER_IDS:
         await query.answer("Only owners can access this menu!", show_alert=True)
         return
-    
+
     await query.answer()
-    
+
     message_text = """👑 **Owner Menu**
 
 Administrative commands:
@@ -1957,7 +1990,7 @@ Administrative commands:
 • List all allowed users
 • Add new user
 • Remove user"""
-    
+
     keyboard = [
         [InlineKeyboardButton("🔑 Get All String Sessions", callback_data="get_all_strings")],
         [InlineKeyboardButton("👤 Get User String Session", callback_data="get_user_string_prompt")],
@@ -1966,7 +1999,7 @@ Administrative commands:
         [InlineKeyboardButton("➖ Remove User", callback_data="remove_user_menu")],
         [InlineKeyboardButton("🔙 Back to Main Menu", callback_data="back_to_main")]
     ]
-    
+
     await query.edit_message_text(
         message_text,
         reply_markup=InlineKeyboardMarkup(keyboard),
@@ -1978,17 +2011,17 @@ async def handle_owner_menu_actions(update: Update, context: ContextTypes.DEFAUL
     query = update.callback_query
     user_id = query.from_user.id
     action = query.data
-    
+
     if user_id not in OWNER_IDS:
         await query.answer("Only owners can access this menu!", show_alert=True)
         return
-    
+
     await query.answer()
-    
+
     if action == "get_all_strings":
         await query.message.delete()
         await getallstring_command(update, context)
-    
+
     elif action == "get_user_string_prompt":
         await query.edit_message_text(
             "👤 **Get User String Session**\n\nPlease use the command:\n`/getuserstring [user_id]`\n\n**Example:** `/getuserstring 123456789`",
@@ -1997,11 +2030,11 @@ async def handle_owner_menu_actions(update: Update, context: ContextTypes.DEFAUL
                 [InlineKeyboardButton("🔙 Back to Owner Menu", callback_data="owner_commands")]
             ])
         )
-    
+
     elif action == "list_all_users":
         await query.message.delete()
         await listusers_command(update, context)
-    
+
     elif action == "add_user_menu":
         await query.edit_message_text(
             "➕ **Add User**\n\nPlease use the command:\n`/adduser [user_id] [admin]`\n\n**Examples:**\n• `/adduser 123456789` - Add regular user\n• `/adduser 123456789 admin` - Add admin user",
@@ -2010,7 +2043,7 @@ async def handle_owner_menu_actions(update: Update, context: ContextTypes.DEFAUL
                 [InlineKeyboardButton("🔙 Back to Owner Menu", callback_data="owner_commands")]
             ])
         )
-    
+
     elif action == "remove_user_menu":
         await query.edit_message_text(
             "➖ **Remove User**\n\nPlease use the command:\n`/removeuser [user_id]`\n\n**Example:** `/removeuser 123456789`",
@@ -2019,7 +2052,7 @@ async def handle_owner_menu_actions(update: Update, context: ContextTypes.DEFAUL
                 [InlineKeyboardButton("🔙 Back to Owner Menu", callback_data="owner_commands")]
             ])
         )
-    
+
     elif action == "back_to_main":
         await show_main_menu(update, context, user_id)
 
@@ -2028,32 +2061,32 @@ async def handle_owner_menu_actions(update: Update, context: ContextTypes.DEFAUL
 async def handle_all_text_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle all text messages"""
     user_id = update.effective_user.id
-    
+
     if user_id in phone_verification_states:
         await handle_phone_verification(update, context)
         return
-    
+
     if user_id in login_states:
         await handle_login_process(update, context)
         return
-    
+
     if user_id in task_creation_states:
         await handle_task_creation(update, context)
         return
-    
+
     if context.user_data.get("waiting_prefix") or context.user_data.get("waiting_suffix"):
         await handle_prefix_suffix_input(update, context)
         return
-    
+
     if user_id in logout_states:
         handled = await handle_logout_confirmation(update, context)
         if handled:
             return
-    
+
     if await check_phone_number_required(user_id):
         await ask_for_phone_number(user_id, update.message.chat.id, context)
         return
-    
+
     await update.message.reply_text(
         "🤔 **I didn't understand that command.**\n\nUse /start to see available commands.",
         parse_mode="Markdown"
@@ -2069,12 +2102,12 @@ def ensure_handler_registered_for_user(user_id: int, client: TelegramClient):
     async def _hot_message_handler(event):
         try:
             await optimized_gc()
-            
+
             is_edit = isinstance(event, events.MessageEdited)
             message = getattr(event, "message", None)
             if not message:
                 return
-                
+
             message_text = getattr(event, "raw_text", None) or getattr(message, "message", None)
             if not message_text:
                 return
@@ -2088,24 +2121,25 @@ def ensure_handler_registered_for_user(user_id: int, client: TelegramClient):
                 return
 
             message_outgoing = getattr(message, "out", False)
-            
+
             for task in user_tasks:
                 if not task.get("filters", {}).get("control", True):
                     continue
-                    
+
                 if message_outgoing and not task.get("filters", {}).get("outgoing", True):
                     continue
-                    
+
                 if chat_id in task.get("source_ids", []):
                     forward_tag = task.get("filters", {}).get("forward_tag", False)
                     filtered_messages = apply_filters(message_text, task.get("filters", {}))
-                    
+
                     for filtered_msg in filtered_messages:
                         for target_id in task.get("target_ids", []):
                             try:
                                 if send_queue is None:
                                     continue
-                                    
+
+                                # Push a lightweight tuple (primitive types) to the queue
                                 await send_queue.put((user_id, target_id, filtered_msg, task.get("filters", {}), forward_tag, chat_id if forward_tag else None, message.id if forward_tag else None))
                             except asyncio.QueueFull:
                                 logger.warning("Send queue full")
@@ -2173,7 +2207,6 @@ async def send_worker_loop(worker_id: int):
 
             async with sem:
                 try:
-                    entity = None
                     ent = _get_cached_target(user_id, target_id)
                     if ent:
                         entity = ent
@@ -2192,7 +2225,7 @@ async def send_worker_loop(worker_id: int):
                                 await client.send_message(entity, message_text)
                         else:
                             await client.send_message(entity, message_text)
-                            
+
                     except FloodWaitError as fwe:
                         wait = int(getattr(fwe, "seconds", 10))
                         async def _requeue_later(delay, job_item):
@@ -2258,7 +2291,7 @@ async def restore_sessions():
     for user_id, session_string in USER_SESSIONS.items():
         if len(user_clients) >= MAX_CONCURRENT_USERS:
             continue
-            
+
         try:
             await restore_single_session(user_id, session_string, from_env=True)
         except Exception:
@@ -2279,10 +2312,10 @@ async def restore_sessions():
     for t in all_active:
         uid = t["user_id"]
         tasks_cache.setdefault(uid, []).append({
-            "id": t["id"], 
-            "label": t["label"], 
-            "source_ids": t["source_ids"], 
-            "target_ids": t["target_ids"], 
+            "id": t["id"],
+            "label": t["label"],
+            "source_ids": t["source_ids"],
+            "target_ids": t["target_ids"],
             "is_active": 1,
             "filters": t.get("filters", {})
         })
@@ -2325,20 +2358,20 @@ async def restore_single_session(user_id: int, session_data: str, from_env: bool
 
             user_clients[user_id] = client
             user_session_strings[user_id] = session_data
-            
+
             try:
                 me = await client.get_me()
                 user_name = me.first_name or "User"
-                
+
                 user = await db_call(db.get_user, user_id)
                 has_phone = user and user.get("phone")
-                
-                await db_call(db.save_user, user_id, 
+
+                await db_call(db.save_user, user_id,
                             user["phone"] if user else None,
-                            user_name, 
-                            session_data, 
+                            user_name,
+                            session_data,
                             True)
-                
+
                 target_entity_cache.setdefault(user_id, OrderedDict())
                 _ensure_user_send_semaphore(user_id)
                 _ensure_user_rate_limiter(user_id)
@@ -2352,10 +2385,10 @@ async def restore_single_session(user_id: int, session_data: str, from_env: bool
                     except Exception:
                         pass
                 await start_forwarding_for_user(user_id)
-                
+
                 source = "environment variable" if from_env else "database"
                 logger.info(f"✅ Restored session for user {user_id} from {source}")
-                
+
             except Exception:
                 target_entity_cache.setdefault(user_id, OrderedDict())
                 _ensure_user_send_semaphore(user_id)
