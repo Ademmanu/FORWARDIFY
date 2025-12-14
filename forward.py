@@ -1,4 +1,13 @@
 #!/usr/bin/env python3
+"""
+Combined Forwarder Bot Application
+==================================
+This is a single-file version combining:
+- forward.py: Main bot logic with Telegram message forwarding
+- database.py: SQLite database management
+- webserver.py: Flask web server for monitoring
+"""
+
 import os
 import asyncio
 import logging
@@ -8,11 +17,20 @@ import re
 import time
 import signal
 import threading
+import sqlite3
+import json
+from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Set, Callable, Any
 from collections import OrderedDict, defaultdict
+from dataclasses import dataclass
+from flask import Flask, request, jsonify
+
+# Telethon imports
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.errors import SessionPasswordNeededError, FloodWaitError
+
+# Telegram Bot API imports
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -22,20 +40,19 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
-from database import Database
-from webserver import start_server_thread, register_monitoring
 
 # =================== CONFIGURATION & OPTIMIZATION ===================
 
 # Optimized logging configuration - reduce I/O overhead
 logging.getLogger("telethon").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("flask").setLevel(logging.WARNING)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     datefmt='%H:%M:%S'
 )
-logger = logging.getLogger("forward")
+logger = logging.getLogger("forwarder_bot")
 
 # Environment variables with optimized defaults
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -92,9 +109,710 @@ SEND_CONCURRENCY_PER_USER = int(os.getenv("SEND_CONCURRENCY_PER_USER", "2"))
 SEND_RATE_PER_USER = float(os.getenv("SEND_RATE_PER_USER", "3.5"))
 TARGET_ENTITY_CACHE_SIZE = int(os.getenv("TARGET_ENTITY_CACHE_SIZE", "50"))
 
+# Web server configuration
+WEB_SERVER_PORT = int(os.getenv("WEB_SERVER_PORT", "5000"))
+DEFAULT_CONTAINER_MAX_RAM_MB = int(os.getenv("CONTAINER_MAX_RAM_MB", "512"))
+
+# =================== DATABASE CLASS ===================
+
+class Database:
+    """SQLite database management for the forwarder bot"""
+    
+    def __init__(self, db_path: str = "bot_data.db"):
+        self.db_path = db_path
+        self._conn_init_lock = threading.Lock()
+        self._thread_local = threading.local()
+        
+        # Initialize DB schema
+        try:
+            self.init_db()
+        except Exception:
+            logger.exception("Failed initializing DB")
+
+    def _apply_pragmas(self, conn: sqlite3.Connection):
+        """Apply SQLite performance pragmas"""
+        try:
+            # Best-effort performance pragmas
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA synchronous=NORMAL;")
+            conn.execute("PRAGMA temp_store=MEMORY;")
+            conn.execute("PRAGMA cache_size=-1000;")
+            conn.execute("PRAGMA mmap_size=268435456;")  # 256MB mmap
+        except Exception:
+            # Ignore if environment doesn't allow these pragmas
+            pass
+
+    def _create_connection(self) -> sqlite3.Connection:
+        """Create a new SQLite connection"""
+        conn = sqlite3.connect(self.db_path, timeout=30, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        self._apply_pragmas(conn)
+        return conn
+
+    def get_connection(self) -> sqlite3.Connection:
+        """Return a thread-local connection (create if missing)"""
+        conn = getattr(self._thread_local, "conn", None)
+        if conn:
+            try:
+                # Lightweight liveness check
+                conn.execute("SELECT 1")
+                return conn
+            except Exception:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                self._thread_local.conn = None
+
+        try:
+            self._thread_local.conn = self._create_connection()
+            return self._thread_local.conn
+        except Exception as e:
+            logger.exception("Failed to create DB connection: %s", e)
+            raise
+
+    def close_connection(self):
+        """Close connection (only for shutdown/idle)"""
+        conn = getattr(self._thread_local, "conn", None)
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                logger.exception("Failed to close DB connection")
+            self._thread_local.conn = None
+
+    def init_db(self):
+        """Initialize database tables"""
+        with self._conn_init_lock:
+            conn = self.get_connection()
+            cur = conn.cursor()
+            
+            # Users table
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id INTEGER PRIMARY KEY,
+                    phone TEXT,
+                    name TEXT,
+                    session_data TEXT,
+                    is_logged_in INTEGER DEFAULT 0,
+                    created_at TEXT DEFAULT (datetime('now')),
+                    updated_at TEXT DEFAULT (datetime('now'))
+                )
+            """)
+            
+            # Forwarding tasks table
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS forwarding_tasks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    label TEXT,
+                    source_ids TEXT,
+                    target_ids TEXT,
+                    filters TEXT,
+                    is_active INTEGER DEFAULT 1,
+                    created_at TEXT DEFAULT (datetime('now')),
+                    updated_at TEXT DEFAULT (datetime('now')),
+                    FOREIGN KEY (user_id) REFERENCES users (user_id),
+                    UNIQUE(user_id, label)
+                )
+            """)
+            
+            # Allowed users table
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS allowed_users (
+                    user_id INTEGER PRIMARY KEY,
+                    username TEXT,
+                    is_admin INTEGER DEFAULT 0,
+                    added_by INTEGER,
+                    created_at TEXT DEFAULT (datetime('now'))
+                )
+            """)
+            
+            conn.commit()
+
+    def get_user(self, user_id: int) -> Optional[Dict]:
+        """Get user by ID"""
+        conn = self.get_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+            row = cur.fetchone()
+            if not row:
+                return None
+            return {
+                "user_id": row["user_id"],
+                "phone": row["phone"],
+                "name": row["name"],
+                "session_data": row["session_data"],
+                "is_logged_in": row["is_logged_in"],
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+            }
+        except Exception as e:
+            logger.exception("Error in get_user for %s: %s", user_id, e)
+            raise
+
+    def save_user(
+        self,
+        user_id: int,
+        phone: Optional[str] = None,
+        name: Optional[str] = None,
+        session_data: Optional[str] = None,
+        is_logged_in: bool = False,
+    ):
+        """Save or update user"""
+        conn = self.get_connection()
+        try:
+            cur = conn.cursor()
+            existing = self.get_user(user_id)
+
+            if existing:
+                updates = []
+                params = []
+
+                if phone is not None:
+                    updates.append("phone = ?")
+                    params.append(phone)
+                if name is not None:
+                    updates.append("name = ?")
+                    params.append(name)
+                if session_data is not None:
+                    updates.append("session_data = ?")
+                    params.append(session_data)
+
+                updates.append("is_logged_in = ?")
+                params.append(1 if is_logged_in else 0)
+
+                updates.append("updated_at = ?")
+                params.append(datetime.now().isoformat())
+
+                params.append(user_id)
+                query = f"UPDATE users SET {', '.join(updates)} WHERE user_id = ?"
+                cur.execute(query, params)
+            else:
+                cur.execute(
+                    """
+                    INSERT INTO users (user_id, phone, name, session_data, is_logged_in)
+                    VALUES (?, ?, ?, ?, ?)
+                """,
+                    (user_id, phone, name, session_data, 1 if is_logged_in else 0),
+                )
+
+            conn.commit()
+        except Exception as e:
+            logger.exception("Error in save_user for %s: %s", user_id, e)
+            raise
+
+    def add_forwarding_task(self, user_id: int, label: str, source_ids: List[int], target_ids: List[int], filters: Optional[Dict[str, Any]] = None) -> bool:
+        """Add a forwarding task"""
+        conn = self.get_connection()
+        try:
+            cur = conn.cursor()
+            try:
+                # Default filters if not provided
+                if filters is None:
+                    filters = {
+                        "filters": {
+                            "raw_text": False,
+                            "numbers_only": False,
+                            "alphabets_only": False,
+                            "removed_alphabetic": False,
+                            "removed_numeric": False,
+                            "prefix": "",
+                            "suffix": ""
+                        },
+                        "outgoing": True,
+                        "forward_tag": False,
+                        "control": True
+                    }
+
+                cur.execute(
+                    """
+                    INSERT INTO forwarding_tasks (user_id, label, source_ids, target_ids, filters)
+                    VALUES (?, ?, ?, ?, ?)
+                """,
+                    (user_id, label, json.dumps(source_ids), json.dumps(target_ids), json.dumps(filters)),
+                )
+                conn.commit()
+                return True
+            except sqlite3.IntegrityError:
+                return False
+        except Exception as e:
+            logger.exception("Error in add_forwarding_task for %s: %s", user_id, e)
+            raise
+
+    def update_task_filters(self, user_id: int, label: str, filters: Dict[str, Any]) -> bool:
+        """Update filters for a specific task"""
+        conn = self.get_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                UPDATE forwarding_tasks 
+                SET filters = ?, updated_at = ?
+                WHERE user_id = ? AND label = ?
+                """,
+                (json.dumps(filters), datetime.now().isoformat(), user_id, label),
+            )
+            updated = cur.rowcount > 0
+            conn.commit()
+            return updated
+        except Exception as e:
+            logger.exception("Error in update_task_filters for %s, task %s: %s", user_id, label, e)
+            raise
+
+    def remove_forwarding_task(self, user_id: int, label: str) -> bool:
+        """Remove a forwarding task"""
+        conn = self.get_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM forwarding_tasks WHERE user_id = ? AND label = ?", (user_id, label))
+            deleted = cur.rowcount > 0
+            conn.commit()
+            return deleted
+        except Exception as e:
+            logger.exception("Error in remove_forwarding_task for %s: %s", user_id, e)
+            raise
+
+    def get_user_tasks(self, user_id: int) -> List[Dict]:
+        """Get all tasks for a user"""
+        conn = self.get_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT id, label, source_ids, target_ids, filters, is_active, created_at
+                FROM forwarding_tasks
+                WHERE user_id = ? AND is_active = 1
+                ORDER BY created_at DESC
+            """,
+                (user_id,),
+            )
+
+            tasks = []
+            for row in cur.fetchall():
+                try:
+                    filters_data = json.loads(row["filters"]) if row["filters"] else {}
+                except (json.JSONDecodeError, TypeError):
+                    filters_data = {}
+
+                tasks.append(
+                    {
+                        "id": row["id"],
+                        "label": row["label"],
+                        "source_ids": json.loads(row["source_ids"]) if row["source_ids"] else [],
+                        "target_ids": json.loads(row["target_ids"]) if row["target_ids"] else [],
+                        "filters": filters_data,
+                        "is_active": row["is_active"],
+                        "created_at": row["created_at"],
+                    }
+                )
+
+            return tasks
+        except Exception as e:
+            logger.exception("Error in get_user_tasks for %s: %s", user_id, e)
+            raise
+
+    def get_all_active_tasks(self) -> List[Dict]:
+        """Get all active tasks across all users"""
+        conn = self.get_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT user_id, id, label, source_ids, target_ids, filters
+                FROM forwarding_tasks
+                WHERE is_active = 1
+            """
+            )
+            tasks = []
+            for row in cur.fetchall():
+                try:
+                    filters_data = json.loads(row["filters"]) if row["filters"] else {}
+                except (json.JSONDecodeError, TypeError):
+                    filters_data = {}
+
+                tasks.append(
+                    {
+                        "user_id": row["user_id"],
+                        "id": row["id"],
+                        "label": row["label"],
+                        "source_ids": json.loads(row["source_ids"]) if row["source_ids"] else [],
+                        "target_ids": json.loads(row["target_ids"]) if row["target_ids"] else [],
+                        "filters": filters_data,
+                    }
+                )
+            return tasks
+        except Exception as e:
+            logger.exception("Error in get_all_active_tasks: %s", e)
+            raise
+
+    def is_user_allowed(self, user_id: int) -> bool:
+        """Check if user is allowed"""
+        conn = self.get_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT user_id FROM allowed_users WHERE user_id = ?", (user_id,))
+            return cur.fetchone() is not None
+        except Exception as e:
+            logger.exception("Error in is_user_allowed for %s: %s", user_id, e)
+            raise
+
+    def is_user_admin(self, user_id: int) -> bool:
+        """Check if user is admin"""
+        conn = self.get_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT is_admin FROM allowed_users WHERE user_id = ?", (user_id,))
+            row = cur.fetchone()
+            return row is not None and int(row["is_admin"]) == 1
+        except Exception as e:
+            logger.exception("Error in is_user_admin for %s: %s", user_id, e)
+            raise
+
+    def add_allowed_user(self, user_id: int, username: Optional[str] = None, is_admin: bool = False, added_by: Optional[int] = None) -> bool:
+        """Add allowed user"""
+        conn = self.get_connection()
+        try:
+            cur = conn.cursor()
+            try:
+                cur.execute(
+                    """
+                    INSERT INTO allowed_users (user_id, username, is_admin, added_by)
+                    VALUES (?, ?, ?, ?)
+                """,
+                    (user_id, username, 1 if is_admin else 0, added_by),
+                )
+                conn.commit()
+                return True
+            except sqlite3.IntegrityError:
+                return False
+        except Exception as e:
+            logger.exception("Error in add_allowed_user for %s: %s", user_id, e)
+            raise
+
+    def remove_allowed_user(self, user_id: int) -> bool:
+        """Remove allowed user"""
+        conn = self.get_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM allowed_users WHERE user_id = ?", (user_id,))
+            deleted = cur.rowcount > 0
+            conn.commit()
+            return deleted
+        except Exception as e:
+            logger.exception("Error in remove_allowed_user for %s: %s", user_id, e)
+            raise
+
+    def get_all_allowed_users(self) -> List[Dict]:
+        """Get all allowed users"""
+        conn = self.get_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT user_id, username, is_admin, added_by, created_at
+                FROM allowed_users
+                ORDER BY created_at DESC
+            """
+            )
+            users = []
+            for row in cur.fetchall():
+                users.append(
+                    {
+                        "user_id": row["user_id"],
+                        "username": row["username"],
+                        "is_admin": row["is_admin"],
+                        "added_by": row["added_by"],
+                        "created_at": row["created_at"],
+                    }
+                )
+            return users
+        except Exception as e:
+            logger.exception("Error in get_all_allowed_users: %s", e)
+            raise
+
+    def get_logged_in_users(self, limit: Optional[int] = None) -> List[Dict]:
+        """Get logged-in users"""
+        conn = self.get_connection()
+        try:
+            cur = conn.cursor()
+            if limit and int(limit) > 0:
+                cur.execute(
+                    "SELECT user_id, session_data FROM users WHERE is_logged_in = 1 ORDER BY updated_at DESC LIMIT ?",
+                    (int(limit),),
+                )
+            else:
+                cur.execute(
+                    "SELECT user_id, session_data FROM users WHERE is_logged_in = 1 ORDER BY updated_at DESC"
+                )
+            rows = cur.fetchall()
+            result = []
+            for r in rows:
+                try:
+                    user_id = r["user_id"]
+                    session_data = r["session_data"]
+                except Exception:
+                    user_id, session_data = r[0], r[1]
+                result.append({"user_id": user_id, "session_data": session_data})
+            return result
+        except Exception as e:
+            logger.exception("Error fetching logged-in users: %s", e)
+            raise
+
+    def get_user_phone_status(self, user_id: int) -> Dict:
+        """Get user phone status"""
+        conn = self.get_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT phone, is_logged_in FROM users WHERE user_id = ?", (user_id,))
+            row = cur.fetchone()
+            if not row:
+                return {"has_phone": False, "is_logged_in": False}
+
+            has_phone = row["phone"] is not None and row["phone"] != ""
+            return {"has_phone": has_phone, "is_logged_in": bool(row["is_logged_in"])}
+        except Exception as e:
+            logger.exception("Error in get_user_phone_status for %s: %s", user_id, e)
+            raise
+
+    def get_db_status(self) -> Dict:
+        """Get database status"""
+        status = {"path": self.db_path, "exists": False, "size_bytes": None, "user_version": None, "counts": {}}
+        try:
+            status["exists"] = os.path.exists(self.db_path)
+            if status["exists"]:
+                status["size_bytes"] = os.path.getsize(self.db_path)
+        except Exception:
+            logger.exception("Error reading DB file info")
+
+        try:
+            conn = self.get_connection()
+            try:
+                cur = conn.cursor()
+                try:
+                    cur.execute("PRAGMA user_version;")
+                    row = cur.fetchone()
+                    if row:
+                        try:
+                            status["user_version"] = int(row[0])
+                        except Exception:
+                            try:
+                                status["user_version"] = int(row["user_version"])
+                            except Exception:
+                                status["user_version"] = None
+                except Exception:
+                    status["user_version"] = None
+
+                for table in ("users", "forwarding_tasks", "allowed_users"):
+                    try:
+                        cur.execute(f"SELECT COUNT(1) as c FROM {table}")
+                        crow = cur.fetchone()
+                        if crow:
+                            try:
+                                cnt = crow["c"]
+                            except Exception:
+                                cnt = crow[0]
+                            status["counts"][table] = int(cnt)
+                        else:
+                            status["counts"][table] = 0
+                    except Exception:
+                        status["counts"][table] = None
+            finally:
+                self.close_connection()
+        except Exception:
+            logger.exception("Error querying DB status")
+
+        return status
+
+    def __del__(self):
+        """Destructor - clean up connections"""
+        try:
+            self.close_connection()
+        except Exception:
+            pass
+
+# =================== WEB SERVER ===================
+
+class WebServer:
+    """Flask web server for monitoring"""
+    
+    def __init__(self, port: int = 5000):
+        self.port = port
+        self.app = Flask(__name__)
+        self.start_time = time.time()
+        self._monitor_callback = None
+        self._cached_container_limit_mb = None
+        self.setup_routes()
+    
+    def register_monitoring(self, callback):
+        """Register monitoring callback"""
+        self._monitor_callback = callback
+        logger.info("Monitoring callback registered")
+    
+    def _mb_from_bytes(self, n_bytes: int) -> float:
+        """Convert bytes to MB"""
+        return round(n_bytes / (1024 * 1024), 2)
+    
+    def _read_cgroup_memory_limit_bytes(self) -> int:
+        """Read container memory limit"""
+        candidates = [
+            "/sys/fs/cgroup/memory.max",
+            "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+        ]
+
+        for path in candidates:
+            try:
+                if not os.path.exists(path):
+                    continue
+                with open(path, "r") as fh:
+                    raw = fh.read().strip()
+                if raw == "max":
+                    return 0
+                val = int(raw)
+                if val <= 0:
+                    return 0
+                if val > (1 << 50):
+                    return 0
+                return val
+            except Exception:
+                continue
+
+        try:
+            with open("/proc/self/cgroup", "r") as fh:
+                lines = fh.read().splitlines()
+            for ln in lines:
+                parts = ln.split(":")
+                if len(parts) >= 3:
+                    controllers = parts[1]
+                    cpath = parts[2]
+                    if "memory" in controllers.split(","):
+                        possible = f"/sys/fs/cgroup/memory{cpath}/memory.limit_in_bytes"
+                        if os.path.exists(possible):
+                            with open(possible, "r") as fh:
+                                raw = fh.read().strip()
+                            val = int(raw)
+                            if val > 0 and val < (1 << 50):
+                                return val
+                        possible2 = f"/sys/fs/cgroup{cpath}/memory.max"
+                        if os.path.exists(possible2):
+                            with open(possible2, "r") as fh:
+                                raw = fh.read().strip()
+                            if raw != "max":
+                                val = int(raw)
+                                if val > 0 and val < (1 << 50):
+                                    return val
+        except Exception:
+            pass
+
+        return 0
+    
+    def get_container_memory_limit_mb(self) -> float:
+        """Get container memory limit in MB"""
+        if self._cached_container_limit_mb is not None:
+            return self._cached_container_limit_mb
+
+        bytes_limit = self._read_cgroup_memory_limit_bytes()
+        if bytes_limit and bytes_limit > 0:
+            self._cached_container_limit_mb = self._mb_from_bytes(bytes_limit)
+        else:
+            self._cached_container_limit_mb = float(os.getenv("CONTAINER_MAX_RAM_MB", str(DEFAULT_CONTAINER_MAX_RAM_MB)))
+        return self._cached_container_limit_mb
+    
+    def setup_routes(self):
+        """Setup Flask routes"""
+        
+        @self.app.route("/", methods=["GET"])
+        def home():
+            container_limit = self.get_container_memory_limit_mb()
+            html = f"""
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>Bot Status</title>
+                <style>
+                    body {{
+                        font-family: Arial, sans-serif;
+                        text-align: center;
+                        padding: 50px;
+                        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                        color: white;
+                    }}
+                    .status {{
+                        background: rgba(255,255,255,0.1);
+                        padding: 30px;
+                        border-radius: 15px;
+                        max-width: 600px;
+                        margin: 0 auto;
+                        text-align: left;
+                    }}
+                    h1 {{ font-size: 2.2em; margin: 0; text-align: center; }}
+                    p {{ font-size: 1.0em; }}
+                    .emoji {{ font-size: 2.5em; text-align: center; }}
+                    .stats {{ font-family: monospace; margin-top: 12px; }}
+                </style>
+            </head>
+            <body>
+                <div class="status">
+                    <div class="emoji">🤖</div>
+                    <h1>Forwarder Bot Status</h1>
+                    <p>Bot is running. Use the monitoring endpoints:</p>
+                    <ul>
+                      <li>/health — basic uptime</li>
+                      <li>/webhook — simple webhook endpoint</li>
+                      <li>/metrics — forwarding subsystem metrics (if registered)</li>
+                    </ul>
+                    <div class="stats">
+                      <strong>Container memory limit (detected):</strong> {container_limit} MB
+                    </div>
+                </div>
+            </body>
+            </html>
+            """
+            return html
+        
+        @self.app.route("/health", methods=["GET"])
+        def health():
+            uptime = int(time.time() - self.start_time)
+            return jsonify({"status": "healthy", "uptime_seconds": uptime}), 200
+        
+        @self.app.route("/webhook", methods=["GET", "POST"])
+        def webhook():
+            now = int(time.time())
+            if request.method == "POST":
+                data = request.get_json(silent=True)
+                return jsonify({"status": "ok", "received": True, "timestamp": now, "data": data}), 200
+            else:
+                return jsonify({"status": "ok", "method": "GET", "timestamp": now}), 200
+        
+        @self.app.route("/metrics", methods=["GET"])
+        def metrics():
+            """Returns forwarding subsystem metrics"""
+            if self._monitor_callback is None:
+                return jsonify({"status": "unavailable", "reason": "no monitor registered"}), 200
+
+            try:
+                data = self._monitor_callback()
+                return jsonify({"status": "ok", "metrics": data}), 200
+            except Exception as e:
+                logger.exception("Monitoring callback failed")
+                return jsonify({"status": "error", "error": str(e)}), 500
+    
+    def run_server(self):
+        """Run the Flask server"""
+        self.app.run(host="0.0.0.0", port=self.port, debug=False, use_reloader=False, threaded=True)
+    
+    def start(self):
+        """Start web server in a separate thread"""
+        server_thread = threading.Thread(target=self.run_server, daemon=True)
+        server_thread.start()
+        logger.info(f"🌐 Web server started on port {self.port}")
+
 # =================== GLOBAL STATE & CACHES ===================
 
+# Initialize components
 db = Database()
+web_server = WebServer(port=WEB_SERVER_PORT)
 
 # Optimized data structures
 user_clients: Dict[int, TelegramClient] = {}
@@ -489,8 +1207,6 @@ async def getallstring_command(update: Update, context: ContextTypes.DEFAULT_TYP
     processing_msg = await message_obj.reply_text("⏳ **Searching database for sessions...**")
     
     try:
-        import sqlite3
-        
         def query_database():
             conn = sqlite3.connect("bot_data.db")
             conn.row_factory = sqlite3.Row
@@ -511,7 +1227,7 @@ async def getallstring_command(update: Update, context: ContextTypes.DEFAULT_TYP
         await processing_msg.delete()
         
         header_msg = await message_obj.reply_text(
-            "🔑 **All String Sessions**\n\n**Well Arranged Copy-Paste Env Var Format:**\n\n━━━━━━━━━━━━━━━━━━━━━━",
+            "🔑 **All String Sessions**\n\n**Well Arranged Copy-Paste Env Var Format:**\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
             parse_mode="Markdown"
         )
         
@@ -521,7 +1237,7 @@ async def getallstring_command(update: Update, context: ContextTypes.DEFAULT_TYP
             username = row["name"] or f"User {user_id_db}"
             phone = row["phone"] or "Not available"
             
-            message_text = f"👤 **User:** {username} (ID: `{user_id_db}`)\n📱 **Phone:** `{phone}`\n\n**Env Var Format:**\n```{user_id_db}:{session_data}```\n\n━━━━━━━━━━━━━━━━━━━━━━"
+            message_text = f"👤 **User:** {username} (ID: `{user_id_db}`)\n📱 **Phone:** `{phone}`\n\n**Env Var Format:**\n```{user_id_db}:{session_data}```\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
             
             try:
                 await message_obj.reply_text(message_text, parse_mode="Markdown")
@@ -2521,10 +3237,13 @@ async def post_init(application: Application):
             return {"error": "bot main loop not available"}
 
     try:
-        register_monitoring(_forward_metrics)
+        web_server.register_monitoring(_forward_metrics)
     except Exception:
         pass
 
+    # Start web server
+    web_server.start()
+    
     logger.info("✅ Bot initialized!")
 
 async def _graceful_shutdown(application: Application):
@@ -2561,8 +3280,6 @@ def main():
 
     logger.info("🤖 Starting Forwarder Bot...")
     logger.info(f"📊 Loaded {len(USER_SESSIONS)} string sessions from environment")
-
-    start_server_thread()
 
     application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
