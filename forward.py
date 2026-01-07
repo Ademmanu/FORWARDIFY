@@ -113,49 +113,125 @@ TARGET_ENTITY_CACHE_SIZE = int(os.getenv("TARGET_ENTITY_CACHE_SIZE", "50"))
 WEB_SERVER_PORT = int(os.getenv("WEB_SERVER_PORT", "5000"))
 DEFAULT_CONTAINER_MAX_RAM_MB = int(os.getenv("CONTAINER_MAX_RAM_MB", "512"))
 
-# =================== DATABASE CLASS ===================
+# =================== HYBRID DATABASE CLASS ===================
 
 class Database:
-    """SQLite database management for the forwarder bot"""
+    """Hybrid database management supporting both SQLite and PostgreSQL"""
     
-    def __init__(self, db_path: str = "bot_data.db"):
-        self.db_path = db_path
+    def __init__(self, db_type: str = None, **kwargs):
+        """
+        Initialize database connection
+        
+        Args:
+            db_type: 'sqlite' or 'postgresql'
+            **kwargs: Connection parameters
+        """
+        self.db_type = db_type or os.getenv("DB_TYPE", "sqlite").lower()
         self._conn_init_lock = threading.Lock()
         self._thread_local = threading.local()
+        
+        # Connection parameters
+        if self.db_type == "sqlite":
+            self.db_path = kwargs.get("db_path") or os.getenv("DB_PATH", "bot_data.db")
+        else:  # postgresql
+            self.host = kwargs.get("host") or os.getenv("DB_HOST")
+            self.port = kwargs.get("port") or int(os.getenv("DB_PORT", "5432"))
+            self.database = kwargs.get("database") or os.getenv("DB_NAME")
+            self.username = kwargs.get("username") or os.getenv("DB_USER")
+            self.password = kwargs.get("password") or os.getenv("DB_PASSWORD")
+        
+        # Validate PostgreSQL credentials
+        if self.db_type == "postgresql" and not all([self.host, self.database, self.username, self.password]):
+            logger.error("Missing PostgreSQL connection parameters. Falling back to SQLite.")
+            self.db_type = "sqlite"
+            self.db_path = "bot_data.db"
         
         # Initialize DB schema
         try:
             self.init_db()
-        except Exception:
-            logger.exception("Failed initializing DB")
+            logger.info(f"✅ Database initialized: {self.db_type.upper()}")
+        except Exception as e:
+            logger.exception(f"Failed initializing DB: {e}")
+            # Fallback to SQLite if PostgreSQL fails
+            if self.db_type == "postgresql":
+                logger.info("Falling back to SQLite...")
+                self.db_type = "sqlite"
+                self.db_path = "bot_data.db"
+                self.init_db()
 
-    def _apply_pragmas(self, conn: sqlite3.Connection):
+    def _create_connection(self):
+        """Create a new database connection based on type"""
+        if self.db_type == "sqlite":
+            return self._create_sqlite_connection()
+        else:  # postgresql
+            return self._create_postgres_connection()
+
+    def _create_sqlite_connection(self):
+        """Create SQLite connection"""
+        conn = sqlite3.connect(self.db_path, timeout=30, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        self._apply_sqlite_pragmas(conn)
+        return conn
+
+    def _create_postgres_connection(self):
+        """Create PostgreSQL connection"""
+        try:
+            import psycopg2
+            from psycopg2.extras import RealDictCursor
+            
+            conn = psycopg2.connect(
+                host=self.host,
+                port=self.port,
+                database=self.database,
+                user=self.username,
+                password=self.password,
+                sslmode='require',  # Northflank requires SSL
+                connect_timeout=30,
+                cursor_factory=RealDictCursor
+            )
+            return conn
+        except ImportError:
+            logger.error("psycopg2 not installed. Trying pg8000...")
+            try:
+                import pg8000
+                from pg8000.native import Connection
+                
+                conn = Connection(
+                    user=self.username,
+                    password=self.password,
+                    host=self.host,
+                    port=self.port,
+                    database=self.database,
+                    ssl=True
+                )
+                return conn
+            except ImportError:
+                logger.error("Neither psycopg2 nor pg8000 installed. Please add to requirements.txt")
+                raise
+
+    def _apply_sqlite_pragmas(self, conn: sqlite3.Connection):
         """Apply SQLite performance pragmas"""
         try:
-            # Best-effort performance pragmas
             conn.execute("PRAGMA journal_mode=WAL;")
             conn.execute("PRAGMA synchronous=NORMAL;")
             conn.execute("PRAGMA temp_store=MEMORY;")
             conn.execute("PRAGMA cache_size=-1000;")
             conn.execute("PRAGMA mmap_size=268435456;")  # 256MB mmap
         except Exception:
-            # Ignore if environment doesn't allow these pragmas
             pass
 
-    def _create_connection(self) -> sqlite3.Connection:
-        """Create a new SQLite connection"""
-        conn = sqlite3.connect(self.db_path, timeout=30, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        self._apply_pragmas(conn)
-        return conn
-
-    def get_connection(self) -> sqlite3.Connection:
+    def get_connection(self):
         """Return a thread-local connection (create if missing)"""
         conn = getattr(self._thread_local, "conn", None)
         if conn:
             try:
                 # Lightweight liveness check
-                conn.execute("SELECT 1")
+                if self.db_type == "sqlite":
+                    conn.execute("SELECT 1")
+                else:
+                    import psycopg2
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT 1")
                 return conn
             except Exception:
                 try:
@@ -188,45 +264,86 @@ class Database:
             cur = conn.cursor()
             
             # Users table
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-                    user_id INTEGER PRIMARY KEY,
-                    phone TEXT,
-                    name TEXT,
-                    session_data TEXT,
-                    is_logged_in INTEGER DEFAULT 0,
-                    created_at TEXT DEFAULT (datetime('now')),
-                    updated_at TEXT DEFAULT (datetime('now'))
-                )
-            """)
+            if self.db_type == "sqlite":
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS users (
+                        user_id INTEGER PRIMARY KEY,
+                        phone TEXT,
+                        name TEXT,
+                        session_data TEXT,
+                        is_logged_in INTEGER DEFAULT 0,
+                        created_at TEXT DEFAULT (datetime('now')),
+                        updated_at TEXT DEFAULT (datetime('now'))
+                    )
+                """)
+            else:  # PostgreSQL
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS users (
+                        user_id BIGINT PRIMARY KEY,
+                        phone TEXT,
+                        name TEXT,
+                        session_data TEXT,
+                        is_logged_in BOOLEAN DEFAULT FALSE,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
             
             # Forwarding tasks table
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS forwarding_tasks (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER,
-                    label TEXT,
-                    source_ids TEXT,
-                    target_ids TEXT,
-                    filters TEXT,
-                    is_active INTEGER DEFAULT 1,
-                    created_at TEXT DEFAULT (datetime('now')),
-                    updated_at TEXT DEFAULT (datetime('now')),
-                    FOREIGN KEY (user_id) REFERENCES users (user_id),
-                    UNIQUE(user_id, label)
-                )
-            """)
+            if self.db_type == "sqlite":
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS forwarding_tasks (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id INTEGER,
+                        label TEXT,
+                        source_ids TEXT,
+                        target_ids TEXT,
+                        filters TEXT,
+                        is_active INTEGER DEFAULT 1,
+                        created_at TEXT DEFAULT (datetime('now')),
+                        updated_at TEXT DEFAULT (datetime('now')),
+                        FOREIGN KEY (user_id) REFERENCES users (user_id),
+                        UNIQUE(user_id, label)
+                    )
+                """)
+            else:  # PostgreSQL
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS forwarding_tasks (
+                        id SERIAL PRIMARY KEY,
+                        user_id BIGINT,
+                        label TEXT,
+                        source_ids TEXT,
+                        target_ids TEXT,
+                        filters TEXT,
+                        is_active BOOLEAN DEFAULT TRUE,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        FOREIGN KEY (user_id) REFERENCES users (user_id),
+                        UNIQUE(user_id, label)
+                    )
+                """)
             
             # Allowed users table
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS allowed_users (
-                    user_id INTEGER PRIMARY KEY,
-                    username TEXT,
-                    is_admin INTEGER DEFAULT 0,
-                    added_by INTEGER,
-                    created_at TEXT DEFAULT (datetime('now'))
-                )
-            """)
+            if self.db_type == "sqlite":
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS allowed_users (
+                        user_id INTEGER PRIMARY KEY,
+                        username TEXT,
+                        is_admin INTEGER DEFAULT 0,
+                        added_by INTEGER,
+                        created_at TEXT DEFAULT (datetime('now'))
+                    )
+                """)
+            else:  # PostgreSQL
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS allowed_users (
+                        user_id BIGINT PRIMARY KEY,
+                        username TEXT,
+                        is_admin BOOLEAN DEFAULT FALSE,
+                        added_by BIGINT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
             
             conn.commit()
 
@@ -235,19 +352,30 @@ class Database:
         conn = self.get_connection()
         try:
             cur = conn.cursor()
-            cur.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+            if self.db_type == "sqlite":
+                cur.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+            else:
+                cur.execute("SELECT * FROM users WHERE user_id = %s", (user_id,))
+            
             row = cur.fetchone()
             if not row:
                 return None
-            return {
-                "user_id": row["user_id"],
-                "phone": row["phone"],
-                "name": row["name"],
-                "session_data": row["session_data"],
-                "is_logged_in": row["is_logged_in"],
-                "created_at": row["created_at"],
-                "updated_at": row["updated_at"],
-            }
+            
+            # Convert row to dict based on database type
+            if self.db_type == "sqlite":
+                return {
+                    "user_id": row["user_id"],
+                    "phone": row["phone"],
+                    "name": row["name"],
+                    "session_data": row["session_data"],
+                    "is_logged_in": bool(row["is_logged_in"]),
+                    "created_at": row["created_at"],
+                    "updated_at": row["updated_at"],
+                }
+            else:
+                # PostgreSQL returns dict-like object
+                return dict(row)
+                
         except Exception as e:
             logger.exception("Error in get_user for %s: %s", user_id, e)
             raise
@@ -271,32 +399,46 @@ class Database:
                 params = []
 
                 if phone is not None:
-                    updates.append("phone = ?")
+                    updates.append("phone = ?" if self.db_type == "sqlite" else "phone = %s")
                     params.append(phone)
                 if name is not None:
-                    updates.append("name = ?")
+                    updates.append("name = ?" if self.db_type == "sqlite" else "name = %s")
                     params.append(name)
                 if session_data is not None:
-                    updates.append("session_data = ?")
+                    updates.append("session_data = ?" if self.db_type == "sqlite" else "session_data = %s")
                     params.append(session_data)
 
-                updates.append("is_logged_in = ?")
-                params.append(1 if is_logged_in else 0)
+                updates.append("is_logged_in = ?" if self.db_type == "sqlite" else "is_logged_in = %s")
+                params.append(1 if is_logged_in else 0 if self.db_type == "sqlite" else is_logged_in)
 
-                updates.append("updated_at = ?")
-                params.append(datetime.now().isoformat())
+                updates.append("updated_at = ?" if self.db_type == "sqlite" else "updated_at = %s")
+                params.append(datetime.now().isoformat() if self.db_type == "sqlite" else datetime.now())
 
                 params.append(user_id)
-                query = f"UPDATE users SET {', '.join(updates)} WHERE user_id = ?"
+                
+                if self.db_type == "sqlite":
+                    query = f"UPDATE users SET {', '.join(updates)} WHERE user_id = ?"
+                else:
+                    query = f"UPDATE users SET {', '.join(updates)} WHERE user_id = %s"
+                    
                 cur.execute(query, params)
             else:
-                cur.execute(
-                    """
-                    INSERT INTO users (user_id, phone, name, session_data, is_logged_in)
-                    VALUES (?, ?, ?, ?, ?)
-                """,
-                    (user_id, phone, name, session_data, 1 if is_logged_in else 0),
-                )
+                if self.db_type == "sqlite":
+                    cur.execute(
+                        """
+                        INSERT INTO users (user_id, phone, name, session_data, is_logged_in)
+                        VALUES (?, ?, ?, ?, ?)
+                    """,
+                        (user_id, phone, name, session_data, 1 if is_logged_in else 0),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        INSERT INTO users (user_id, phone, name, session_data, is_logged_in)
+                        VALUES (%s, %s, %s, %s, %s)
+                    """,
+                        (user_id, phone, name, session_data, is_logged_in),
+                    )
 
             conn.commit()
         except Exception as e:
@@ -326,17 +468,28 @@ class Database:
                         "control": True
                     }
 
-                cur.execute(
-                    """
-                    INSERT INTO forwarding_tasks (user_id, label, source_ids, target_ids, filters)
-                    VALUES (?, ?, ?, ?, ?)
-                """,
-                    (user_id, label, json.dumps(source_ids), json.dumps(target_ids), json.dumps(filters)),
-                )
+                if self.db_type == "sqlite":
+                    cur.execute(
+                        """
+                        INSERT INTO forwarding_tasks (user_id, label, source_ids, target_ids, filters)
+                        VALUES (?, ?, ?, ?, ?)
+                    """,
+                        (user_id, label, json.dumps(source_ids), json.dumps(target_ids), json.dumps(filters)),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        INSERT INTO forwarding_tasks (user_id, label, source_ids, target_ids, filters)
+                        VALUES (%s, %s, %s, %s, %s)
+                    """,
+                        (user_id, label, json.dumps(source_ids), json.dumps(target_ids), json.dumps(filters)),
+                    )
                 conn.commit()
                 return True
-            except sqlite3.IntegrityError:
-                return False
+            except Exception as e:
+                if "unique constraint" in str(e).lower() or "duplicate" in str(e).lower():
+                    return False
+                raise
         except Exception as e:
             logger.exception("Error in add_forwarding_task for %s: %s", user_id, e)
             raise
@@ -346,14 +499,24 @@ class Database:
         conn = self.get_connection()
         try:
             cur = conn.cursor()
-            cur.execute(
-                """
-                UPDATE forwarding_tasks 
-                SET filters = ?, updated_at = ?
-                WHERE user_id = ? AND label = ?
-                """,
-                (json.dumps(filters), datetime.now().isoformat(), user_id, label),
-            )
+            if self.db_type == "sqlite":
+                cur.execute(
+                    """
+                    UPDATE forwarding_tasks 
+                    SET filters = ?, updated_at = ?
+                    WHERE user_id = ? AND label = ?
+                    """,
+                    (json.dumps(filters), datetime.now().isoformat(), user_id, label),
+                )
+            else:
+                cur.execute(
+                    """
+                    UPDATE forwarding_tasks 
+                    SET filters = %s, updated_at = %s
+                    WHERE user_id = %s AND label = %s
+                    """,
+                    (json.dumps(filters), datetime.now(), user_id, label),
+                )
             updated = cur.rowcount > 0
             conn.commit()
             return updated
@@ -366,7 +529,10 @@ class Database:
         conn = self.get_connection()
         try:
             cur = conn.cursor()
-            cur.execute("DELETE FROM forwarding_tasks WHERE user_id = ? AND label = ?", (user_id, label))
+            if self.db_type == "sqlite":
+                cur.execute("DELETE FROM forwarding_tasks WHERE user_id = ? AND label = ?", (user_id, label))
+            else:
+                cur.execute("DELETE FROM forwarding_tasks WHERE user_id = %s AND label = %s", (user_id, label))
             deleted = cur.rowcount > 0
             conn.commit()
             return deleted
@@ -379,34 +545,63 @@ class Database:
         conn = self.get_connection()
         try:
             cur = conn.cursor()
-            cur.execute(
-                """
-                SELECT id, label, source_ids, target_ids, filters, is_active, created_at
-                FROM forwarding_tasks
-                WHERE user_id = ? AND is_active = 1
-                ORDER BY created_at DESC
-            """,
-                (user_id,),
-            )
+            if self.db_type == "sqlite":
+                cur.execute(
+                    """
+                    SELECT id, label, source_ids, target_ids, filters, is_active, created_at
+                    FROM forwarding_tasks
+                    WHERE user_id = ? AND is_active = 1
+                    ORDER BY created_at DESC
+                """,
+                    (user_id,),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT id, label, source_ids, target_ids, filters, is_active, created_at
+                    FROM forwarding_tasks
+                    WHERE user_id = %s AND is_active = TRUE
+                    ORDER BY created_at DESC
+                """,
+                    (user_id,),
+                )
 
             tasks = []
-            for row in cur.fetchall():
+            rows = cur.fetchall()
+            
+            for row in rows:
                 try:
-                    filters_data = json.loads(row["filters"]) if row["filters"] else {}
-                except (json.JSONDecodeError, TypeError):
-                    filters_data = {}
-
-                tasks.append(
-                    {
-                        "id": row["id"],
-                        "label": row["label"],
-                        "source_ids": json.loads(row["source_ids"]) if row["source_ids"] else [],
-                        "target_ids": json.loads(row["target_ids"]) if row["target_ids"] else [],
-                        "filters": filters_data,
-                        "is_active": row["is_active"],
-                        "created_at": row["created_at"],
-                    }
-                )
+                    # Convert row based on database type
+                    if self.db_type == "sqlite":
+                        filters_data = json.loads(row["filters"]) if row["filters"] else {}
+                        tasks.append(
+                            {
+                                "id": row["id"],
+                                "label": row["label"],
+                                "source_ids": json.loads(row["source_ids"]) if row["source_ids"] else [],
+                                "target_ids": json.loads(row["target_ids"]) if row["target_ids"] else [],
+                                "filters": filters_data,
+                                "is_active": bool(row["is_active"]),
+                                "created_at": row["created_at"],
+                            }
+                        )
+                    else:
+                        row_dict = dict(row)
+                        filters_data = json.loads(row_dict["filters"]) if row_dict["filters"] else {}
+                        tasks.append(
+                            {
+                                "id": row_dict["id"],
+                                "label": row_dict["label"],
+                                "source_ids": json.loads(row_dict["source_ids"]) if row_dict["source_ids"] else [],
+                                "target_ids": json.loads(row_dict["target_ids"]) if row_dict["target_ids"] else [],
+                                "filters": filters_data,
+                                "is_active": bool(row_dict["is_active"]),
+                                "created_at": row_dict["created_at"].isoformat() if hasattr(row_dict["created_at"], 'isoformat') else str(row_dict["created_at"]),
+                            }
+                        )
+                except (json.JSONDecodeError, TypeError, KeyError) as e:
+                    logger.error("Error parsing task data: %s", e)
+                    continue
 
             return tasks
         except Exception as e:
@@ -418,30 +613,57 @@ class Database:
         conn = self.get_connection()
         try:
             cur = conn.cursor()
-            cur.execute(
+            if self.db_type == "sqlite":
+                cur.execute(
+                    """
+                    SELECT user_id, id, label, source_ids, target_ids, filters
+                    FROM forwarding_tasks
+                    WHERE is_active = 1
                 """
-                SELECT user_id, id, label, source_ids, target_ids, filters
-                FROM forwarding_tasks
-                WHERE is_active = 1
-            """
-            )
-            tasks = []
-            for row in cur.fetchall():
-                try:
-                    filters_data = json.loads(row["filters"]) if row["filters"] else {}
-                except (json.JSONDecodeError, TypeError):
-                    filters_data = {}
-
-                tasks.append(
-                    {
-                        "user_id": row["user_id"],
-                        "id": row["id"],
-                        "label": row["label"],
-                        "source_ids": json.loads(row["source_ids"]) if row["source_ids"] else [],
-                        "target_ids": json.loads(row["target_ids"]) if row["target_ids"] else [],
-                        "filters": filters_data,
-                    }
                 )
+            else:
+                cur.execute(
+                    """
+                    SELECT user_id, id, label, source_ids, target_ids, filters
+                    FROM forwarding_tasks
+                    WHERE is_active = TRUE
+                """
+                )
+            
+            tasks = []
+            rows = cur.fetchall()
+            
+            for row in rows:
+                try:
+                    if self.db_type == "sqlite":
+                        filters_data = json.loads(row["filters"]) if row["filters"] else {}
+                        tasks.append(
+                            {
+                                "user_id": row["user_id"],
+                                "id": row["id"],
+                                "label": row["label"],
+                                "source_ids": json.loads(row["source_ids"]) if row["source_ids"] else [],
+                                "target_ids": json.loads(row["target_ids"]) if row["target_ids"] else [],
+                                "filters": filters_data,
+                            }
+                        )
+                    else:
+                        row_dict = dict(row)
+                        filters_data = json.loads(row_dict["filters"]) if row_dict["filters"] else {}
+                        tasks.append(
+                            {
+                                "user_id": row_dict["user_id"],
+                                "id": row_dict["id"],
+                                "label": row_dict["label"],
+                                "source_ids": json.loads(row_dict["source_ids"]) if row_dict["source_ids"] else [],
+                                "target_ids": json.loads(row_dict["target_ids"]) if row_dict["target_ids"] else [],
+                                "filters": filters_data,
+                            }
+                        )
+                except (json.JSONDecodeError, TypeError, KeyError) as e:
+                    logger.error("Error parsing task data: %s", e)
+                    continue
+                    
             return tasks
         except Exception as e:
             logger.exception("Error in get_all_active_tasks: %s", e)
@@ -452,7 +674,10 @@ class Database:
         conn = self.get_connection()
         try:
             cur = conn.cursor()
-            cur.execute("SELECT user_id FROM allowed_users WHERE user_id = ?", (user_id,))
+            if self.db_type == "sqlite":
+                cur.execute("SELECT user_id FROM allowed_users WHERE user_id = ?", (user_id,))
+            else:
+                cur.execute("SELECT user_id FROM allowed_users WHERE user_id = %s", (user_id,))
             return cur.fetchone() is not None
         except Exception as e:
             logger.exception("Error in is_user_allowed for %s: %s", user_id, e)
@@ -463,9 +688,18 @@ class Database:
         conn = self.get_connection()
         try:
             cur = conn.cursor()
-            cur.execute("SELECT is_admin FROM allowed_users WHERE user_id = ?", (user_id,))
+            if self.db_type == "sqlite":
+                cur.execute("SELECT is_admin FROM allowed_users WHERE user_id = ?", (user_id,))
+            else:
+                cur.execute("SELECT is_admin FROM allowed_users WHERE user_id = %s", (user_id,))
             row = cur.fetchone()
-            return row is not None and int(row["is_admin"]) == 1
+            if not row:
+                return False
+                
+            if self.db_type == "sqlite":
+                return row["is_admin"] == 1
+            else:
+                return bool(row["is_admin"])
         except Exception as e:
             logger.exception("Error in is_user_admin for %s: %s", user_id, e)
             raise
@@ -476,17 +710,28 @@ class Database:
         try:
             cur = conn.cursor()
             try:
-                cur.execute(
-                    """
-                    INSERT INTO allowed_users (user_id, username, is_admin, added_by)
-                    VALUES (?, ?, ?, ?)
-                """,
-                    (user_id, username, 1 if is_admin else 0, added_by),
-                )
+                if self.db_type == "sqlite":
+                    cur.execute(
+                        """
+                        INSERT INTO allowed_users (user_id, username, is_admin, added_by)
+                        VALUES (?, ?, ?, ?)
+                    """,
+                        (user_id, username, 1 if is_admin else 0, added_by),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        INSERT INTO allowed_users (user_id, username, is_admin, added_by)
+                        VALUES (%s, %s, %s, %s)
+                    """,
+                        (user_id, username, is_admin, added_by),
+                    )
                 conn.commit()
                 return True
-            except sqlite3.IntegrityError:
-                return False
+            except Exception as e:
+                if "unique constraint" in str(e).lower() or "duplicate" in str(e).lower():
+                    return False
+                raise
         except Exception as e:
             logger.exception("Error in add_allowed_user for %s: %s", user_id, e)
             raise
@@ -496,7 +741,10 @@ class Database:
         conn = self.get_connection()
         try:
             cur = conn.cursor()
-            cur.execute("DELETE FROM allowed_users WHERE user_id = ?", (user_id,))
+            if self.db_type == "sqlite":
+                cur.execute("DELETE FROM allowed_users WHERE user_id = ?", (user_id,))
+            else:
+                cur.execute("DELETE FROM allowed_users WHERE user_id = %s", (user_id,))
             deleted = cur.rowcount > 0
             conn.commit()
             return deleted
@@ -516,17 +764,32 @@ class Database:
                 ORDER BY created_at DESC
             """
             )
+            
             users = []
-            for row in cur.fetchall():
-                users.append(
-                    {
-                        "user_id": row["user_id"],
-                        "username": row["username"],
-                        "is_admin": row["is_admin"],
-                        "added_by": row["added_by"],
-                        "created_at": row["created_at"],
-                    }
-                )
+            rows = cur.fetchall()
+            
+            for row in rows:
+                if self.db_type == "sqlite":
+                    users.append(
+                        {
+                            "user_id": row["user_id"],
+                            "username": row["username"],
+                            "is_admin": row["is_admin"],
+                            "added_by": row["added_by"],
+                            "created_at": row["created_at"],
+                        }
+                    )
+                else:
+                    row_dict = dict(row)
+                    users.append(
+                        {
+                            "user_id": row_dict["user_id"],
+                            "username": row_dict["username"],
+                            "is_admin": bool(row_dict["is_admin"]),
+                            "added_by": row_dict["added_by"],
+                            "created_at": row_dict["created_at"].isoformat() if hasattr(row_dict["created_at"], 'isoformat') else str(row_dict["created_at"]),
+                        }
+                    )
             return users
         except Exception as e:
             logger.exception("Error in get_all_allowed_users: %s", e)
@@ -538,20 +801,37 @@ class Database:
         try:
             cur = conn.cursor()
             if limit and int(limit) > 0:
-                cur.execute(
-                    "SELECT user_id, session_data FROM users WHERE is_logged_in = 1 ORDER BY updated_at DESC LIMIT ?",
-                    (int(limit),),
-                )
+                if self.db_type == "sqlite":
+                    cur.execute(
+                        "SELECT user_id, session_data FROM users WHERE is_logged_in = 1 ORDER BY updated_at DESC LIMIT ?",
+                        (int(limit),),
+                    )
+                else:
+                    cur.execute(
+                        "SELECT user_id, session_data FROM users WHERE is_logged_in = TRUE ORDER BY updated_at DESC LIMIT %s",
+                        (int(limit),),
+                    )
             else:
-                cur.execute(
-                    "SELECT user_id, session_data FROM users WHERE is_logged_in = 1 ORDER BY updated_at DESC"
-                )
+                if self.db_type == "sqlite":
+                    cur.execute(
+                        "SELECT user_id, session_data FROM users WHERE is_logged_in = 1 ORDER BY updated_at DESC"
+                    )
+                else:
+                    cur.execute(
+                        "SELECT user_id, session_data FROM users WHERE is_logged_in = TRUE ORDER BY updated_at DESC"
+                    )
+                    
             rows = cur.fetchall()
             result = []
             for r in rows:
                 try:
-                    user_id = r["user_id"]
-                    session_data = r["session_data"]
+                    if self.db_type == "sqlite":
+                        user_id = r["user_id"]
+                        session_data = r["session_data"]
+                    else:
+                        r_dict = dict(r)
+                        user_id = r_dict["user_id"]
+                        session_data = r_dict["session_data"]
                 except Exception:
                     user_id, session_data = r[0], r[1]
                 result.append({"user_id": user_id, "session_data": session_data})
@@ -565,24 +845,42 @@ class Database:
         conn = self.get_connection()
         try:
             cur = conn.cursor()
-            cur.execute("SELECT phone, is_logged_in FROM users WHERE user_id = ?", (user_id,))
+            if self.db_type == "sqlite":
+                cur.execute("SELECT phone, is_logged_in FROM users WHERE user_id = ?", (user_id,))
+            else:
+                cur.execute("SELECT phone, is_logged_in FROM users WHERE user_id = %s", (user_id,))
             row = cur.fetchone()
             if not row:
                 return {"has_phone": False, "is_logged_in": False}
 
-            has_phone = row["phone"] is not None and row["phone"] != ""
-            return {"has_phone": has_phone, "is_logged_in": bool(row["is_logged_in"])}
+            if self.db_type == "sqlite":
+                has_phone = row["phone"] is not None and row["phone"] != ""
+                return {"has_phone": has_phone, "is_logged_in": bool(row["is_logged_in"])}
+            else:
+                row_dict = dict(row)
+                has_phone = row_dict["phone"] is not None and row_dict["phone"] != ""
+                return {"has_phone": has_phone, "is_logged_in": bool(row_dict["is_logged_in"])}
         except Exception as e:
             logger.exception("Error in get_user_phone_status for %s: %s", user_id, e)
             raise
 
     def get_db_status(self) -> Dict:
         """Get database status"""
-        status = {"path": self.db_path, "exists": False, "size_bytes": None, "user_version": None, "counts": {}}
+        status = {
+            "type": self.db_type,
+            "exists": False,
+            "size_bytes": None,
+            "counts": {}
+        }
+        
         try:
-            status["exists"] = os.path.exists(self.db_path)
-            if status["exists"]:
-                status["size_bytes"] = os.path.getsize(self.db_path)
+            if self.db_type == "sqlite":
+                status["exists"] = os.path.exists(self.db_path)
+                if status["exists"]:
+                    status["size_bytes"] = os.path.getsize(self.db_path)
+            else:
+                status["exists"] = True  # PostgreSQL always "exists" once connected
+                status["size_bytes"] = "N/A for PostgreSQL"
         except Exception:
             logger.exception("Error reading DB file info")
 
@@ -590,27 +888,21 @@ class Database:
             conn = self.get_connection()
             try:
                 cur = conn.cursor()
-                try:
-                    cur.execute("PRAGMA user_version;")
-                    row = cur.fetchone()
-                    if row:
-                        try:
-                            status["user_version"] = int(row[0])
-                        except Exception:
-                            try:
-                                status["user_version"] = int(row["user_version"])
-                            except Exception:
-                                status["user_version"] = None
-                except Exception:
-                    status["user_version"] = None
-
+                
                 for table in ("users", "forwarding_tasks", "allowed_users"):
                     try:
-                        cur.execute(f"SELECT COUNT(1) as c FROM {table}")
+                        if self.db_type == "sqlite":
+                            cur.execute(f"SELECT COUNT(1) as c FROM {table}")
+                        else:
+                            cur.execute(f"SELECT COUNT(1) as c FROM {table}")
                         crow = cur.fetchone()
                         if crow:
                             try:
-                                cnt = crow["c"]
+                                if self.db_type == "sqlite":
+                                    cnt = crow["c"]
+                                else:
+                                    crow_dict = dict(crow)
+                                    cnt = list(crow_dict.values())[0] if crow_dict else 0
                             except Exception:
                                 cnt = crow[0]
                             status["counts"][table] = int(cnt)
