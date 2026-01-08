@@ -25,6 +25,12 @@ from collections import OrderedDict, defaultdict
 from dataclasses import dataclass
 from flask import Flask, request, jsonify
 
+# Add these imports near the top with other imports
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from urllib.parse import urlparse
+import urllib.parse
+
 # Telethon imports
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
