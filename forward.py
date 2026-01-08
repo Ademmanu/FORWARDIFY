@@ -101,12 +101,12 @@ if allowed_env:
     ALLOWED_USERS.update(int(part) for part in allowed_env.split(",") if part.strip().isdigit())
 
 # Performance tuning parameters with memory optimization
-SEND_WORKER_COUNT = int(os.getenv("SEND_WORKER_COUNT", "10"))
-SEND_QUEUE_MAXSIZE = int(os.getenv("SEND_QUEUE_MAXSIZE", "800"))
-TARGET_RESOLVE_RETRY_SECONDS = int(os.getenv("TARGET_RESOLVE_RETRY_SECONDS", "15"))
-MAX_CONCURRENT_USERS = max(50, int(os.getenv("MAX_CONCURRENT_USERS", "50")))
-SEND_CONCURRENCY_PER_USER = int(os.getenv("SEND_CONCURRENCY_PER_USER", "2"))
-SEND_RATE_PER_USER = float(os.getenv("SEND_RATE_PER_USER", "3.5"))
+SEND_WORKER_COUNT = int(os.getenv("SEND_WORKER_COUNT", "20"))
+SEND_QUEUE_MAXSIZE = int(os.getenv("SEND_QUEUE_MAXSIZE", "2000"))
+TARGET_RESOLVE_RETRY_SECONDS = int(os.getenv("TARGET_RESOLVE_RETRY_SECONDS", "3"))
+MAX_CONCURRENT_USERS = max(50, int(os.getenv("MAX_CONCURRENT_USERS", "100")))
+SEND_CONCURRENCY_PER_USER = int(os.getenv("SEND_CONCURRENCY_PER_USER", "15"))
+SEND_RATE_PER_USER = float(os.getenv("SEND_RATE_PER_USER", "10.0"))
 TARGET_ENTITY_CACHE_SIZE = int(os.getenv("TARGET_ENTITY_CACHE_SIZE", "50"))
 
 # Web server configuration
