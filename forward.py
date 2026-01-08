@@ -41,9 +41,9 @@ from telegram.ext import (
     filters,
 )
 
-# Database imports
-import psycopg2
-from psycopg2.extras import RealDictCursor
+# Database imports - UPDATED TO PSYCOPG3
+import psycopg
+from psycopg.rows import dict_row
 from urllib.parse import urlparse
 
 # =================== CONFIGURATION & OPTIMIZATION ===================
@@ -52,7 +52,6 @@ from urllib.parse import urlparse
 logging.getLogger("telethon").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("flask").setLevel(logging.WARNING)
-logging.getLogger("psycopg2").setLevel(logging.WARNING)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -160,7 +159,7 @@ class Database:
         self._apply_sqlite_pragmas(conn)
         return conn
     
-    def _create_postgres_connection(self) -> psycopg2.extensions.connection:
+    def _create_postgres_connection(self) -> psycopg.Connection:
         """Create a new PostgreSQL connection"""
         if not self.postgres_url:
             raise ValueError("DATABASE_URL not set for PostgreSQL")
@@ -175,23 +174,21 @@ class Database:
         host = parsed.hostname
         port = parsed.port or 5432
         
-        # For SSL, check if sslmode is in the query string
-        sslmode = 'require'
+        # Build connection string
+        conn_str = f"postgresql://{user}:{password}@{host}:{port}/{dbname}"
+        
+        # Add SSL mode if specified
         if parsed.query:
             params = dict(pair.split('=') for pair in parsed.query.split('&') if '=' in pair)
             sslmode = params.get('sslmode', 'require')
+            conn_str += f"?sslmode={sslmode}"
         
-        conn = psycopg2.connect(
-            dbname=dbname,
-            user=user,
-            password=password,
-            host=host,
-            port=port,
-            sslmode=sslmode,
-            cursor_factory=RealDictCursor,
-            connect_timeout=10
+        # Create connection
+        conn = psycopg.connect(
+            conn_str,
+            autocommit=False,
+            row_factory=dict_row
         )
-        conn.autocommit = False
         return conn
     
     def _apply_sqlite_pragmas(self, conn: sqlite3.Connection):
@@ -366,14 +363,17 @@ class Database:
                     row = cur.fetchone()
                     if not row:
                         return None
+                    # Convert datetime objects to ISO format strings
+                    created_at = row["created_at"]
+                    updated_at = row["updated_at"]
                     return {
                         "user_id": row["user_id"],
                         "phone": row["phone"],
                         "name": row["name"],
                         "session_data": row["session_data"],
                         "is_logged_in": row["is_logged_in"],
-                        "created_at": row["created_at"].isoformat() if row["created_at"] else None,
-                        "updated_at": row["updated_at"].isoformat() if row["updated_at"] else None,
+                        "created_at": created_at.isoformat() if created_at else None,
+                        "updated_at": updated_at.isoformat() if updated_at else None,
                     }
         except Exception as e:
             logger.exception("Error in get_user for %s: %s", user_id, e)
@@ -514,7 +514,7 @@ class Database:
                         cur.execute(
                             """
                             INSERT INTO forwarding_tasks (user_id, label, source_ids, target_ids, filters)
-                            VALUES (%s, %s, %s::jsonb, %s::jsonb, %s::jsonb)
+                            VALUES (%s, %s, %s, %s, %s)
                             ON CONFLICT (user_id, label) DO NOTHING
                             RETURNING id
                         """,
@@ -522,7 +522,7 @@ class Database:
                         )
                         conn.commit()
                         return cur.fetchone() is not None
-                    except psycopg2.errors.UniqueViolation:
+                    except psycopg.errors.UniqueViolation:
                         return False
                         
         except Exception as e:
@@ -551,7 +551,7 @@ class Database:
                     cur.execute(
                         """
                         UPDATE forwarding_tasks 
-                        SET filters = %s::jsonb, updated_at = CURRENT_TIMESTAMP
+                        SET filters = %s, updated_at = CURRENT_TIMESTAMP
                         WHERE user_id = %s AND label = %s
                         """,
                         (json.dumps(filters), user_id, label),
@@ -772,7 +772,7 @@ class Database:
                         )
                         conn.commit()
                         return cur.fetchone() is not None
-                    except psycopg2.errors.UniqueViolation:
+                    except psycopg.errors.UniqueViolation:
                         return False
         except Exception as e:
             logger.exception("Error in add_allowed_user for %s: %s", user_id, e)
