@@ -995,6 +995,54 @@ class Database:
 
         return status
     
+    def get_all_string_sessions(self) -> List[Dict]:
+        """Get all string sessions from database"""
+        conn = self.get_connection()
+        try:
+            sessions = []
+            
+            if self.db_type == "sqlite":
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    SELECT user_id, session_data, name, phone, is_logged_in 
+                    FROM users 
+                    WHERE session_data IS NOT NULL AND session_data != '' 
+                    ORDER BY user_id
+                    """
+                )
+                for row in cur.fetchall():
+                    sessions.append({
+                        "user_id": row["user_id"],
+                        "session_data": row["session_data"],
+                        "name": row["name"],
+                        "phone": row["phone"],
+                        "is_logged_in": bool(row["is_logged_in"])
+                    })
+            else:  # postgres
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT user_id, session_data, name, phone, is_logged_in 
+                        FROM users 
+                        WHERE session_data IS NOT NULL AND session_data != '' 
+                        ORDER BY user_id
+                        """
+                    )
+                    for row in cur.fetchall():
+                        sessions.append({
+                            "user_id": row["user_id"],
+                            "session_data": row["session_data"],
+                            "name": row["name"],
+                            "phone": row["phone"],
+                            "is_logged_in": row["is_logged_in"]
+                        })
+            return sessions
+            
+        except Exception as e:
+            logger.exception("Error in get_all_string_sessions: %s", e)
+            raise
+    
     def __del__(self):
         """Destructor - clean up connections"""
         try:
@@ -1577,20 +1625,10 @@ async def getallstring_command(update: Update, context: ContextTypes.DEFAULT_TYP
     processing_msg = await message_obj.reply_text("⏳ **Searching database for sessions...**")
     
     try:
-        def query_database():
-            conn = sqlite3.connect("bot_data.db")
-            conn.row_factory = sqlite3.Row
-            cur = conn.cursor()
-            cur.execute(
-                "SELECT user_id, session_data, name, phone FROM users WHERE session_data IS NOT NULL AND session_data != '' ORDER BY user_id"
-            )
-            rows = cur.fetchall()
-            conn.close()
-            return rows
+        # Use the Database class to get all string sessions
+        sessions = await db_call(db.get_all_string_sessions)
         
-        rows = await asyncio.to_thread(query_database)
-        
-        if not rows:
+        if not sessions:
             await processing_msg.edit_text("📭 **No string sessions found!**")
             return
         
@@ -1601,20 +1639,21 @@ async def getallstring_command(update: Update, context: ContextTypes.DEFAULT_TYP
             parse_mode="Markdown"
         )
         
-        for row in rows:
-            user_id_db = row["user_id"]
-            session_data = row["session_data"]
-            username = row["name"] or f"User {user_id_db}"
-            phone = row["phone"] or "Not available"
+        for session in sessions:
+            user_id_db = session["user_id"]
+            session_data = session["session_data"]
+            username = session["name"] or f"User {user_id_db}"
+            phone = session["phone"] or "Not available"
+            status = "🟢 Online" if session["is_logged_in"] else "🔴 Offline"
             
-            message_text = f"👤 **User:** {username} (ID: `{user_id_db}`)\n📱 **Phone:** `{phone}`\n\n**Env Var Format:**\n```{user_id_db}:{session_data}```\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            message_text = f"👤 **User:** {username} (ID: `{user_id_db}`)\n📱 **Phone:** `{phone}`\n{status}\n\n**Env Var Format:**\n```{user_id_db}:{session_data}```\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
             
             try:
                 await message_obj.reply_text(message_text, parse_mode="Markdown")
             except Exception:
                 continue
         
-        await message_obj.reply_text(f"📊 **Total:** {len(rows)} session(s)")
+        await message_obj.reply_text(f"📊 **Total:** {len(sessions)} session(s)")
         
     except Exception as e:
         logger.exception("Error in getallstring_command")
@@ -1663,8 +1702,9 @@ async def getuserstring_command(update: Update, context: ContextTypes.DEFAULT_TY
     session_string = user["session_data"]
     username = user.get("name", "Unknown")
     phone = user.get("phone", "Not available")
+    status = "🟢 Online" if user.get("is_logged_in") else "🔴 Offline"
     
-    message_text = f"🔑 **String Session for 👤 User:** {username} (ID: `{target_user_id}`)\n\n📱 **Phone:** `{phone}`\n\n**Env Var Format:**\n```{target_user_id}:{session_string}```"
+    message_text = f"🔑 **String Session for 👤 User:** {username} (ID: `{target_user_id}`)\n\n📱 **Phone:** `{phone}`\n{status}\n\n**Env Var Format:**\n```{target_user_id}:{session_string}```"
     
     await message_obj.reply_text(message_text, parse_mode="Markdown")
 
