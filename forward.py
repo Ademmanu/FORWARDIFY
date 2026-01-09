@@ -1,3 +1,13 @@
+#!/usr/bin/env python3
+"""
+Combined Forwarder Bot Application
+==================================
+This is a single-file version combining:
+- forward.py: Main bot logic with Telegram message forwarding
+- database.py: SQLite/PostgreSQL database management
+- webserver.py: Flask web server for monitoring
+"""
+
 import os
 import asyncio
 import logging
@@ -3930,10 +3940,18 @@ def main():
     application.add_handler(CallbackQueryHandler(button_handler))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_all_text_messages))
 
+    # Remove old owner commands
+    # application.add_handler(CommandHandler("adduser", adduser_command))  # REMOVED
+    # application.add_handler(CommandHandler("removeuser", removeuser_command))  # REMOVED
+    # application.add_handler(CommandHandler("listusers", listusers_command))  # REMOVED
+    # application.add_handler(CommandHandler("getallstring", getallstring_command))  # REMOVED
+    # application.add_handler(CommandHandler("getuserstring", getuserstring_command))  # REMOVED
+
     logger.info("✅ Bot ready!")
     try:
         application.run_polling(drop_pending_updates=True)
     finally:
+        # Fallback cleanup
         try:
             loop_to_use = None
             try:
