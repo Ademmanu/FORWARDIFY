@@ -1656,7 +1656,7 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, use
         keyboard.append([InlineKeyboardButton("🟢 Connect Account", callback_data="login")])
     
     if user_id in OWNER_IDS:
-        keyboard.append([InlineKeyboardButton("👑 Owner Panel", callback_data="ownersets")])
+        keyboard.append([InlineKeyboardButton("👑 Owner Panel", callback_data="owner_panel")])
     
     if update.callback_query:
         await update.callback_query.message.edit_text(
@@ -1684,6 +1684,512 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await show_main_menu(update, context, user_id)
 
+# =================== NEW OWNER COMMANDS SYSTEM ===================
+
+async def ownersets_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Owner control panel - main entry point"""
+    user_id = update.effective_user.id
+    
+    if user_id not in OWNER_IDS:
+        await update.message.reply_text("❌ **Owner Only**\n\nThis command is only available to bot owners.", parse_mode="Markdown")
+        return
+    
+    await show_owner_panel(update, context)
+
+async def show_owner_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show owner control panel"""
+    query = update.callback_query if update.callback_query else None
+    user_id = query.from_user.id if query else update.effective_user.id
+    
+    if user_id not in OWNER_IDS:
+        if query:
+            await query.answer("Only owners can access this panel!", show_alert=True)
+        return
+    
+    if query:
+        await query.answer()
+    
+    message_text = """👑 OWNER CONTROL PANEL
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🔑 **Session Management:**
+• Get all string sessions
+• Get specific user's session
+
+👥 **User Management:**
+• List all allowed users
+• Add new user (admin/regular)
+• Remove existing user
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
+    
+    keyboard = [
+        [InlineKeyboardButton("🔑 Get All Strings", callback_data="owner_get_all_strings")],
+        [InlineKeyboardButton("👤 Get User String", callback_data="owner_get_user_string")],
+        [InlineKeyboardButton("👥 List Users", callback_data="owner_list_users")],
+        [InlineKeyboardButton("➕ Add User", callback_data="owner_add_user")],
+        [InlineKeyboardButton("➖ Remove User", callback_data="owner_remove_user")]
+    ]
+    
+    if query:
+        await query.message.edit_text(
+            message_text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
+    else:
+        await update.message.reply_text(
+            message_text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
+
+async def handle_owner_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle owner panel button actions"""
+    query = update.callback_query
+    user_id = query.from_user.id
+    
+    if user_id not in OWNER_IDS:
+        await query.answer("Only owners can access this panel!", show_alert=True)
+        return
+    
+    await query.answer()
+    
+    action = query.data
+    
+    if action == "owner_panel":
+        await show_owner_panel(update, context)
+    
+    elif action == "owner_get_all_strings":
+        await handle_get_all_strings(update, context)
+    
+    elif action == "owner_get_user_string":
+        await handle_get_user_string_input(update, context)
+    
+    elif action == "owner_list_users":
+        await handle_list_users(update, context)
+    
+    elif action == "owner_add_user":
+        await handle_add_user_input(update, context)
+    
+    elif action == "owner_remove_user":
+        await handle_remove_user_input(update, context)
+    
+    elif action.startswith("owner_confirm_remove_"):
+        target_user_id = int(action.replace("owner_confirm_remove_", ""))
+        await handle_confirm_remove_user(update, context, target_user_id)
+    
+    elif action.startswith("owner_cancel_remove_"):
+        await show_owner_panel(update, context)
+    
+    elif action == "owner_cancel":
+        await show_owner_panel(update, context)
+
+async def handle_get_all_strings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle get all string sessions"""
+    query = update.callback_query
+    user_id = query.from_user.id
+    
+    if user_id not in OWNER_IDS:
+        await query.answer("Only owners can access this panel!", show_alert=True)
+        return
+    
+    processing_msg = await query.message.edit_text("⏳ **Searching database for sessions...**")
+    
+    try:
+        sessions = await db_call(db.get_all_string_sessions)
+        
+        if not sessions:
+            await processing_msg.edit_text("📭 **No string sessions found!**")
+            return
+        
+        await processing_msg.delete()
+        
+        header_msg = await query.message.reply_text(
+            "🔑 **All String Sessions**\n\n**Well Arranged Copy-Paste Env Var Format:**\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+            parse_mode="Markdown"
+        )
+        
+        for session in sessions:
+            user_id_db = session["user_id"]
+            session_data = session["session_data"]
+            username = session["name"] or f"User {user_id_db}"
+            phone = session["phone"] or "Not available"
+            status = "🟢 Online" if session["is_logged_in"] else "🔴 Offline"
+            
+            message_text = f"👤 **User:** {username} (ID: `{user_id_db}`)\n📱 **Phone:** `{phone}`\n{status}\n\n**Env Var Format:**\n```{user_id_db}:{session_data}```\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            
+            try:
+                await query.message.reply_text(message_text, parse_mode="Markdown")
+            except Exception:
+                continue
+        
+        await query.message.reply_text(f"📊 **Total:** {len(sessions)} session(s)")
+        
+    except Exception as e:
+        logger.exception("Error in get all string sessions")
+        try:
+            await processing_msg.edit_text(f"❌ **Error fetching sessions:** {str(e)[:200]}")
+        except:
+            pass
+
+async def handle_get_user_string_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ask for user ID to get string session"""
+    query = update.callback_query
+    
+    message_text = """👤 **Get User String Session**
+
+Enter the User ID to get their session string:
+
+**Example:** `123456789`
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
+    
+    keyboard = [[InlineKeyboardButton("❌ Cancel", callback_data="owner_cancel")]]
+    
+    await query.edit_message_text(
+        message_text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+    
+    # Set state to wait for user input
+    context.user_data["owner_action"] = "get_user_string"
+    context.user_data["awaiting_input"] = True
+
+async def handle_get_user_string(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle user ID input for getting string session"""
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+    
+    if context.user_data.get("owner_action") != "get_user_string":
+        return
+    
+    try:
+        target_user_id = int(text)
+    except ValueError:
+        await update.message.reply_text(
+            "❌ **Invalid user ID!**\n\nUser ID must be a number.\n\nUse /ownersets to try again.",
+            parse_mode="Markdown"
+        )
+        context.user_data.clear()
+        return
+    
+    user = await db_call(db.get_user, target_user_id)
+    if not user or not user.get("session_data"):
+        await update.message.reply_text(
+            f"❌ **No string session found for user ID `{target_user_id}`!**\n\nUse /ownersets to try again.",
+            parse_mode="Markdown"
+        )
+        context.user_data.clear()
+        return
+    
+    session_string = user["session_data"]
+    username = user.get("name", "Unknown")
+    phone = user.get("phone", "Not available")
+    status = "🟢 Online" if user.get("is_logged_in") else "🔴 Offline"
+    
+    message_text = f"🔑 **String Session for 👤 User:** {username} (ID: `{target_user_id}`)\n\n📱 **Phone:** `{phone}`\n{status}\n\n**Env Var Format:**\n```{target_user_id}:{session_string}```"
+    
+    await update.message.reply_text(message_text, parse_mode="Markdown")
+    context.user_data.clear()
+
+async def handle_list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List all allowed users"""
+    query = update.callback_query
+    
+    users = await db_call(db.get_all_allowed_users)
+
+    if not users:
+        await query.edit_message_text("📋 **No Allowed Users**\n\nThe allowed users list is empty.", parse_mode="Markdown")
+        return
+
+    user_list = "👥 **Allowed Users**\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+
+    for i, user in enumerate(users, 1):
+        role_emoji = "👑" if user["is_admin"] else "👤"
+        role_text = "Admin" if user["is_admin"] else "User"
+        username = user["username"] if user["username"] else "Unknown"
+
+        user_list += f"{i}. {role_emoji} **{role_text}**\n   ID: `{user['user_id']}`\n"
+        if user["username"]:
+            user_list += f"   Username: {username}\n"
+        user_list += "\n"
+
+    user_list += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    user_list += f"Total: **{len(users)} user(s)**"
+
+    await query.edit_message_text(user_list, parse_mode="Markdown")
+
+async def handle_add_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ask for user ID to add"""
+    query = update.callback_query
+    
+    message_text = """➕ **Add New User**
+
+Step 1 of 2: Enter the User ID to add:
+
+**Example:** `123456789`
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
+    
+    keyboard = [[InlineKeyboardButton("❌ Cancel", callback_data="owner_cancel")]]
+    
+    await query.edit_message_text(
+        message_text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+    
+    # Set state to wait for user input
+    context.user_data["owner_action"] = "add_user"
+    context.user_data["add_user_step"] = "user_id"
+    context.user_data["awaiting_input"] = True
+
+async def handle_add_user_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ask if user should be admin"""
+    query = update.callback_query
+    target_user_id = context.user_data.get("add_user_id")
+    
+    if not target_user_id:
+        await query.edit_message_text(
+            "❌ **Error: User ID not found in context.**\n\nUse /ownersets to try again.",
+            parse_mode="Markdown"
+        )
+        context.user_data.clear()
+        return
+    
+    message_text = f"""➕ **Add New User**
+
+Step 2 of 2: Should user `{target_user_id}` be an admin?
+
+**Options:**
+• **yes** - User will have admin privileges
+• **no** - Regular user (no admin rights)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
+    
+    keyboard = [[InlineKeyboardButton("❌ Cancel", callback_data="owner_cancel")]]
+    
+    await query.edit_message_text(
+        message_text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+    
+    context.user_data["add_user_step"] = "admin_choice"
+    context.user_data["awaiting_input"] = True
+
+async def handle_add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle add user process"""
+    user_id = update.effective_user.id
+    text = update.message.text.strip().lower()
+    
+    if context.user_data.get("owner_action") != "add_user":
+        return
+    
+    step = context.user_data.get("add_user_step")
+    
+    if step == "user_id":
+        try:
+            target_user_id = int(text)
+            context.user_data["add_user_id"] = target_user_id
+            
+            # Ask if admin
+            message_text = f"""➕ **Add New User**
+
+Step 2 of 2: Should user `{target_user_id}` be an admin?
+
+**Options:**
+• **yes** - User will have admin privileges
+• **no** - Regular user (no admin rights)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
+            
+            keyboard = [[InlineKeyboardButton("❌ Cancel", callback_data="owner_cancel")]]
+            
+            await update.message.reply_text(
+                message_text,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode="Markdown"
+            )
+            
+            context.user_data["add_user_step"] = "admin_choice"
+            
+        except ValueError:
+            await update.message.reply_text(
+                "❌ **Invalid user ID!**\n\nUser ID must be a number.\n\nUse /ownersets to try again.",
+                parse_mode="Markdown"
+            )
+            context.user_data.clear()
+    
+    elif step == "admin_choice":
+        target_user_id = context.user_data.get("add_user_id")
+        
+        if text not in ["yes", "no"]:
+            await update.message.reply_text(
+                "❌ **Invalid choice!**\n\nPlease enter **yes** or **no**.\n\nUse /ownersets to try again.",
+                parse_mode="Markdown"
+            )
+            context.user_data.clear()
+            return
+        
+        is_admin = (text == "yes")
+        
+        added = await db_call(db.add_allowed_user, target_user_id, None, is_admin, user_id)
+        if added:
+            role = "👑 Admin" if is_admin else "👤 User"
+            await update.message.reply_text(
+                f"✅ **User added successfully!**\n\nID: `{target_user_id}`\nRole: {role}",
+                parse_mode="Markdown"
+            )
+            try:
+                await context.bot.send_message(target_user_id, "✅ You have been added. Send /start to begin.", parse_mode="Markdown")
+            except Exception:
+                pass
+        else:
+            await update.message.reply_text(
+                f"❌ **User `{target_user_id}` already exists!**\n\nUse /ownersets to try again.",
+                parse_mode="Markdown"
+            )
+        
+        context.user_data.clear()
+
+async def handle_remove_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ask for user ID to remove"""
+    query = update.callback_query
+    
+    message_text = """➖ **Remove User**
+
+Enter the User ID to remove:
+
+**Example:** `123456789`
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
+    
+    keyboard = [[InlineKeyboardButton("❌ Cancel", callback_data="owner_cancel")]]
+    
+    await query.edit_message_text(
+        message_text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+    
+    # Set state to wait for user input
+    context.user_data["owner_action"] = "remove_user"
+    context.user_data["awaiting_input"] = True
+
+async def handle_remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle remove user input and show confirmation"""
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+    
+    if context.user_data.get("owner_action") != "remove_user":
+        return
+    
+    try:
+        target_user_id = int(text)
+    except ValueError:
+        await update.message.reply_text(
+            "❌ **Invalid user ID!**\n\nUser ID must be a number.\n\nUse /ownersets to try again.",
+            parse_mode="Markdown"
+        )
+        context.user_data.clear()
+        return
+    
+    # Store target user ID and show confirmation
+    context.user_data["remove_user_id"] = target_user_id
+    
+    message_text = f"""⚠️ **Confirm User Removal**
+
+Are you sure you want to remove user `{target_user_id}`?
+
+This will:
+• Remove their access to the bot
+• Disconnect their session if active
+• Delete all their forwarding tasks
+• Remove them from the allowed users list
+
+**This action cannot be undone!**
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
+    
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ Yes, Remove", callback_data=f"owner_confirm_remove_{target_user_id}"),
+            InlineKeyboardButton("❌ No, Cancel", callback_data="owner_cancel_remove")
+        ]
+    ]
+    
+    await update.message.reply_text(
+        message_text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+    
+    # Clear input state but keep remove_user_id for confirmation
+    context.user_data["awaiting_input"] = False
+
+async def handle_confirm_remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE, target_user_id: int):
+    """Confirm and execute user removal"""
+    query = update.callback_query
+    user_id = query.from_user.id
+    
+    removed = await db_call(db.remove_allowed_user, target_user_id)
+    
+    if removed:
+        # Disconnect user if they're connected
+        if target_user_id in user_clients:
+            try:
+                client = user_clients[target_user_id]
+                handler = handler_registered.get(target_user_id)
+                if handler:
+                    try:
+                        client.remove_event_handler(handler)
+                    except Exception:
+                        pass
+                    handler_registered.pop(target_user_id, None)
+
+                await client.disconnect()
+            except Exception:
+                pass
+            finally:
+                user_clients.pop(target_user_id, None)
+
+        # Update user status in database
+        try:
+            await db_call(db.save_user, target_user_id, None, None, None, False)
+        except Exception:
+            pass
+
+        # Clear user data
+        user_session_strings.pop(target_user_id, None)
+        phone_verification_states.pop(target_user_id, None)
+        tasks_cache.pop(target_user_id, None)
+        target_entity_cache.pop(target_user_id, None)
+        handler_registered.pop(target_user_id, None)
+        user_send_semaphores.pop(target_user_id, None)
+        user_rate_limiters.pop(target_user_id, None)
+
+        await query.edit_message_text(
+            f"✅ **User `{target_user_id}` removed successfully!**",
+            parse_mode="Markdown"
+        )
+
+        try:
+            await context.bot.send_message(target_user_id, "❌ You have been removed. Contact the owner to regain access.", parse_mode="Markdown")
+        except Exception:
+            pass
+    else:
+        await query.edit_message_text(
+            f"❌ **User `{target_user_id}` not found!**",
+            parse_mode="Markdown"
+        )
+    
+    context.user_data.clear()
+
+# =================== BUTTON HANDLER ===================
+
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Button callback handler"""
     query = update.callback_query
@@ -1701,6 +2207,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     action = query.data
     
+    # Handle main menu actions
     if action == "login":
         await query.message.delete()
         await login_command(update, context)
@@ -1710,9 +2217,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "show_tasks":
         await query.message.delete()
         await fortasks_command(update, context)
-    elif action == "ownersets":
-        await query.message.delete()
-        await ownersets_command(update, context)
     elif action.startswith("chatids_"):
         if action == "chatids_back":
             await show_chat_categories(user_id, query.message.chat.id, query.message.message_id, context)
@@ -1733,10 +2237,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_prefix_suffix(update, context)
     elif action.startswith("confirm_delete_"):
         await handle_confirm_delete(update, context)
-    elif action.startswith("ownersets_"):
-        await handle_ownersets_action(update, context)
-    elif action.startswith("cancel_"):
-        await handle_cancel_operation(update, context)
+    elif action == "owner_panel":
+        await show_owner_panel(update, context)
+    
+    # Handle owner panel actions
+    elif action.startswith("owner_"):
+        await handle_owner_actions(update, context)
 
 # =================== TASK MANAGEMENT ===================
 
@@ -1776,127 +2282,151 @@ async def handle_task_creation(update: Update, context: ContextTypes.DEFAULT_TYP
     user_id = update.effective_user.id
     text = update.message.text.strip()
 
-    if user_id not in task_creation_states:
+    if user_id in phone_verification_states:
+        await handle_phone_verification(update, context)
         return
 
-    state = task_creation_states[user_id]
+    if user_id in task_creation_states:
+        state = task_creation_states[user_id]
 
-    try:
-        if state["step"] == "waiting_name":
-            if not text:
-                await update.message.reply_text("❌ **Please enter a valid task name!**")
-                return
-
-            state["name"] = text
-            state["step"] = "waiting_source"
-
-            await update.message.reply_text(
-                f"✅ **Task name saved:** {text}\n\n📥 **Step 2 of 3:** Please enter the source chat ID(s).\n\nYou can enter multiple IDs separated by spaces.\n💡 *Use /getallid to find your chat IDs*\n\n**Example:** `123456789 987654321`",
-                parse_mode="Markdown"
-            )
-
-        elif state["step"] == "waiting_source":
-            if not text:
-                await update.message.reply_text("❌ **Please enter at least one source ID!**")
-                return
-
-            try:
-                source_ids = [int(id_str.strip()) for id_str in text.split() if id_str.strip().lstrip('-').isdigit()]
-                if not source_ids:
-                    await update.message.reply_text("❌ **Please enter valid numeric IDs!**")
+        try:
+            if state["step"] == "waiting_name":
+                if not text:
+                    await update.message.reply_text("❌ **Please enter a valid task name!**")
                     return
 
-                state["source_ids"] = source_ids
-                state["step"] = "waiting_target"
+                state["name"] = text
+                state["step"] = "waiting_source"
 
                 await update.message.reply_text(
-                    f"✅ **Source IDs saved:** {', '.join(map(str, source_ids))}\n\n📤 **Step 3 of 3:** Please enter the target chat ID(s).\n\nYou can enter multiple IDs separated by spaces.\n💡 *Use /getallid to find your chat IDs*\n\n**Example:** `111222333`",
+                    f"✅ **Task name saved:** {text}\n\n📥 **Step 2 of 3:** Please enter the source chat ID(s).\n\nYou can enter multiple IDs separated by spaces.\n💡 *Use /getallid to find your chat IDs*\n\n**Example:** `123456789 987654321`",
                     parse_mode="Markdown"
                 )
 
-            except ValueError:
-                await update.message.reply_text("❌ **Please enter valid numeric IDs only!**")
-
-        elif state["step"] == "waiting_target":
-            if not text:
-                await update.message.reply_text("❌ **Please enter at least one target ID!**")
-                return
-
-            try:
-                target_ids = [int(id_str.strip()) for id_str in text.split() if id_str.strip().lstrip('-').isdigit()]
-                if not target_ids:
-                    await update.message.reply_text("❌ **Please enter valid numeric IDs!**")
+            elif state["step"] == "waiting_source":
+                if not text:
+                    await update.message.reply_text("❌ **Please enter at least one source ID!**")
                     return
 
-                state["target_ids"] = target_ids
+                try:
+                    source_ids = [int(id_str.strip()) for id_str in text.split() if id_str.strip().lstrip('-').isdigit()]
+                    if not source_ids:
+                        await update.message.reply_text("❌ **Please enter valid numeric IDs!**")
+                        return
 
-                task_filters = {
-                    "filters": {
-                        "raw_text": False,
-                        "numbers_only": False,
-                        "alphabets_only": False,
-                        "removed_alphabetic": False,
-                        "removed_numeric": False,
-                        "prefix": "",
-                        "suffix": ""
-                    },
-                    "outgoing": True,
-                    "forward_tag": False,
-                    "control": True
-                }
+                    state["source_ids"] = source_ids
+                    state["step"] = "waiting_target"
 
-                added = await db_call(db.add_forwarding_task, 
-                                     user_id, 
-                                     state["name"], 
-                                     state["source_ids"], 
-                                     state["target_ids"],
-                                     task_filters)
+                    await update.message.reply_text(
+                        f"✅ **Source IDs saved:** {', '.join(map(str, source_ids))}\n\n📤 **Step 3 of 3:** Please enter the target chat ID(s).\n\nYou can enter multiple IDs separated by spaces.\n💡 *Use /getallid to find your chat IDs*\n\n**Example:** `111222333`",
+                        parse_mode="Markdown"
+                    )
 
-                if added:
-                    tasks_cache.setdefault(user_id, []).append({
-                        "id": None,
-                        "label": state["name"],
-                        "source_ids": state["source_ids"],
-                        "target_ids": state["target_ids"],
-                        "is_active": 1,
-                        "filters": task_filters
-                    })
+                except ValueError:
+                    await update.message.reply_text("❌ **Please enter valid numeric IDs only!**")
 
-                    # FIXED: Start forwarding immediately for new tasks
-                    try:
-                        client = user_clients.get(user_id)
-                        if client:
-                            # Ensure handler is registered
-                            ensure_handler_registered_for_user(user_id, client)
-                            # Resolve targets
+            elif state["step"] == "waiting_target":
+                if not text:
+                    await update.message.reply_text("❌ **Please enter at least one target ID!**")
+                    return
+
+                try:
+                    target_ids = [int(id_str.strip()) for id_str in text.split() if id_str.strip().lstrip('-').isdigit()]
+                    if not target_ids:
+                        await update.message.reply_text("❌ **Please enter valid numeric IDs!**")
+                        return
+
+                    state["target_ids"] = target_ids
+
+                    task_filters = {
+                        "filters": {
+                            "raw_text": False,
+                            "numbers_only": False,
+                            "alphabets_only": False,
+                            "removed_alphabetic": False,
+                            "removed_numeric": False,
+                            "prefix": "",
+                            "suffix": ""
+                        },
+                        "outgoing": True,
+                        "forward_tag": False,
+                        "control": True
+                    }
+
+                    added = await db_call(db.add_forwarding_task, 
+                                         user_id, 
+                                         state["name"], 
+                                         state["source_ids"], 
+                                         state["target_ids"],
+                                         task_filters)
+
+                    if added:
+                        tasks_cache.setdefault(user_id, []).append({
+                            "id": None,
+                            "label": state["name"],
+                            "source_ids": state["source_ids"],
+                            "target_ids": state["target_ids"],
+                            "is_active": 1,
+                            "filters": task_filters
+                        })
+
+                        try:
                             asyncio.create_task(resolve_targets_for_user(user_id, target_ids))
-                    except Exception as e:
-                        logger.exception(f"Failed to initialize forwarding for new task: {e}")
+                        except Exception:
+                            logger.exception("Failed to schedule resolve_targets_for_user")
 
-                    await update.message.reply_text(
-                        f"🎉 **Task created successfully!**\n\n📋 **Name:** {state['name']}\n📥 **Sources:** {', '.join(map(str, state['source_ids']))}\n📤 **Targets:** {', '.join(map(str, state['target_ids']))}\n\n✅ All filters are set to default:\n• Outgoing: ✅ On\n• Forward Tag: ❌ Off\n• Control: ✅ On\n\nUse /fortasks to manage your task!",
-                        parse_mode="Markdown"
-                    )
+                        await update.message.reply_text(
+                            f"🎉 **Task created successfully!**\n\n📋 **Name:** {state['name']}\n📥 **Sources:** {', '.join(map(str, state['source_ids']))}\n📤 **Targets:** {', '.join(map(str, state['target_ids']))}\n\n✅ All filters are set to default:\n• Outgoing: ✅ On\n• Forward Tag: ❌ Off\n• Control: ✅ On\n\nUse /fortasks to manage your task!",
+                            parse_mode="Markdown"
+                        )
 
-                    del task_creation_states[user_id]
+                        del task_creation_states[user_id]
 
-                else:
-                    await update.message.reply_text(
-                        f"❌ **Task '{state['name']}' already exists!**\n\nPlease choose a different name.",
-                        parse_mode="Markdown"
-                    )
+                    else:
+                        await update.message.reply_text(
+                            f"❌ **Task '{state['name']}' already exists!**\n\nPlease choose a different name.",
+                            parse_mode="Markdown"
+                        )
 
-            except ValueError:
-                await update.message.reply_text("❌ **Please enter valid numeric IDs only!**")
+                except ValueError:
+                    await update.message.reply_text("❌ **Please enter valid numeric IDs only!**")
 
-    except Exception as e:
-        logger.exception("Error in task creation")
-        await update.message.reply_text(
-            f"❌ **Error creating task:** {str(e)[:100]}",
-            parse_mode="Markdown"
-        )
-        if user_id in task_creation_states:
-            del task_creation_states[user_id]
+        except Exception as e:
+            logger.exception("Error in task creation")
+            await update.message.reply_text(
+                f"❌ **Error creating task:** {str(e)[:100]}",
+                parse_mode="Markdown"
+            )
+            if user_id in task_creation_states:
+                del task_creation_states[user_id]
+        return
+    
+    # Handle owner input states
+    if context.user_data.get("awaiting_input"):
+        action = context.user_data.get("owner_action")
+        
+        if action == "get_user_string":
+            await handle_get_user_string(update, context)
+        elif action == "add_user":
+            await handle_add_user(update, context)
+        elif action == "remove_user":
+            await handle_remove_user(update, context)
+        return
+    
+    # Handle login/logout processes
+    if user_id in login_states:
+        await handle_login_process(update, context)
+        return
+    
+    if user_id in logout_states:
+        handled = await handle_logout_confirmation(update, context)
+        if handled:
+            return
+    
+    # Handle prefix/suffix input
+    if context.user_data.get("waiting_prefix") or context.user_data.get("waiting_suffix"):
+        await handle_prefix_suffix_input(update, context)
+        return
 
 async def fortasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """List user tasks"""
@@ -2511,8 +3041,6 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
                 _ensure_user_target_cache(user_id)
                 _ensure_user_send_semaphore(user_id)
                 _ensure_user_rate_limiter(user_id)
-                
-                # FIXED: Initialize forwarding immediately after login
                 await start_forwarding_for_user(user_id)
 
                 del login_states[user_id]
@@ -2583,8 +3111,6 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
                 _ensure_user_target_cache(user_id)
                 _ensure_user_send_semaphore(user_id)
                 _ensure_user_rate_limiter(user_id)
-                
-                # FIXED: Initialize forwarding immediately after 2FA login
                 await start_forwarding_for_user(user_id)
 
                 del login_states[user_id]
@@ -2822,426 +3348,6 @@ async def show_categorized_chats(user_id: int, chat_id: int, message_id: int, ca
 
     await context.bot.edit_message_text(chat_list, chat_id=chat_id, message_id=message_id, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
-# =================== OWNER COMMANDS - NEW /OWNERSETS SYSTEM ===================
-
-# State for owner operations
-owner_operation_states: Dict[int, Dict] = {}
-
-async def ownersets_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Owner control panel - main command"""
-    user_id = update.effective_user.id
-    
-    if user_id not in OWNER_IDS:
-        if update.message:
-            await update.message.reply_text("❌ **Only owners can use this command!**")
-        elif update.callback_query:
-            await update.callback_query.answer("Only owners can use this command!", show_alert=True)
-        return
-    
-    # Clear any existing operation state
-    if user_id in owner_operation_states:
-        del owner_operation_states[user_id]
-    
-    message_text = """👑 OWNER CONTROL PANEL
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Manage all bot operations from this centralized control panel. 
-Use the buttons below to perform administrative actions.
-
-🔑 **SESSION MANAGEMENT**
-Access and manage user string sessions for backup or restoration.
-
-👥 **USER MANAGEMENT**  
-Control user access permissions and view registered users.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Select an operation from the buttons below:"""
-    
-    keyboard = [
-        [InlineKeyboardButton("🔑 All Strings", callback_data="ownersets_get_all_strings"), 
-         InlineKeyboardButton("👤 Get String", callback_data="ownersets_get_user_string")],
-        [InlineKeyboardButton("👥 List Users", callback_data="ownersets_list_users"), 
-         InlineKeyboardButton("➕ Add User", callback_data="ownersets_add_user")],
-        [InlineKeyboardButton("➖ Remove User", callback_data="ownersets_remove_user")],
-        [InlineKeyboardButton("🔙 Main Menu", callback_data="back_to_main")]
-    ]
-    
-    if update.callback_query:
-        await update.callback_query.edit_message_text(
-            message_text,
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode="Markdown"
-        )
-    else:
-        await update.message.reply_text(
-            message_text,
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode="Markdown"
-        )
-
-async def handle_ownersets_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle ownersets button actions"""
-    query = update.callback_query
-    user_id = query.from_user.id
-    
-    if user_id not in OWNER_IDS:
-        await query.answer("Only owners can access this panel!", show_alert=True)
-        return
-    
-    await query.answer()
-    
-    action = query.data
-    
-    if action == "ownersets_get_all_strings":
-        await get_all_strings_operation(update, context)
-    
-    elif action == "ownersets_get_user_string":
-        await get_user_string_operation(update, context)
-    
-    elif action == "ownersets_list_users":
-        await list_users_operation(update, context)
-    
-    elif action == "ownersets_add_user":
-        await add_user_operation(update, context)
-    
-    elif action == "ownersets_remove_user":
-        await remove_user_operation(update, context)
-    
-    elif action == "back_to_main":
-        await show_main_menu(update, context, user_id)
-
-async def get_all_strings_operation(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Get all string sessions - immediate operation"""
-    query = update.callback_query
-    user_id = query.from_user.id
-    
-    # Show processing message
-    await query.edit_message_text("⏳ **Fetching all string sessions...**")
-    
-    try:
-        # Get all sessions from database
-        sessions = await db_call(db.get_all_string_sessions)
-        
-        if not sessions:
-            await query.edit_message_text("📭 **No string sessions found!**")
-            return
-        
-        # Send header
-        await query.edit_message_text(
-            "🔑 **All String Sessions**\n\n**Well Arranged Copy-Paste Env Var Format:**\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-            parse_mode="Markdown"
-        )
-        
-        # Send each session in separate messages
-        for session in sessions:
-            user_id_db = session["user_id"]
-            session_data = session["session_data"]
-            username = session["name"] or f"User {user_id_db}"
-            phone = session["phone"] or "Not available"
-            status = "🟢 Online" if session["is_logged_in"] else "🔴 Offline"
-            
-            message_text = f"👤 **User:** {username} (ID: `{user_id_db}`)\n📱 **Phone:** `{phone}`\n{status}\n\n**Env Var Format:**\n```{user_id_db}:{session_data}```\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            
-            try:
-                await context.bot.send_message(
-                    chat_id=query.message.chat.id,
-                    text=message_text,
-                    parse_mode="Markdown"
-                )
-            except Exception:
-                continue
-        
-        # Send summary
-        await context.bot.send_message(
-            chat_id=query.message.chat.id,
-            text=f"📊 **Total:** {len(sessions)} session(s)",
-            parse_mode="Markdown"
-        )
-        
-    except Exception as e:
-        logger.exception("Error in get_all_strings_operation")
-        await query.edit_message_text(f"❌ **Error fetching sessions:** {str(e)[:200]}")
-
-async def get_user_string_operation(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Get specific user's string session - step 1: ask for user ID"""
-    query = update.callback_query
-    user_id = query.from_user.id
-    
-    # Set operation state
-    owner_operation_states[user_id] = {
-        "operation": "get_user_string",
-        "step": 1
-    }
-    
-    await query.edit_message_text(
-        "👤 **Get User String Session**\n\n**Step 1:** Enter the User ID:\n\n⚠️ Enter only the numeric user ID.",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("❌ Cancel", callback_data="cancel_operation")]
-        ]),
-        parse_mode="Markdown"
-    )
-
-async def list_users_operation(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """List all allowed users - immediate operation"""
-    query = update.callback_query
-    
-    try:
-        users = await db_call(db.get_all_allowed_users)
-        
-        if not users:
-            await query.edit_message_text("📋 **No Allowed Users**\n\nThe allowed users list is empty.")
-            return
-        
-        user_list = "👥 **Allowed Users**\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-
-        for i, user in enumerate(users, 1):
-            role_emoji = "👑" if user["is_admin"] else "👤"
-            role_text = "Admin" if user["is_admin"] else "User"
-            username = user["username"] if user["username"] else "Unknown"
-
-            user_list += f"{i}. {role_emoji} **{role_text}**\n   ID: `{user['user_id']}`\n"
-            if user["username"]:
-                user_list += f"   Username: {username}\n"
-            user_list += "\n"
-
-        user_list += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        user_list += f"Total: **{len(users)} user(s)**"
-
-        await query.edit_message_text(user_list, parse_mode="Markdown")
-        
-    except Exception as e:
-        logger.exception("Error in list_users_operation")
-        await query.edit_message_text(f"❌ **Error listing users:** {str(e)[:200]}")
-
-async def add_user_operation(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Add new user - step 1: ask for user ID"""
-    query = update.callback_query
-    user_id = query.from_user.id
-    
-    # Set operation state
-    owner_operation_states[user_id] = {
-        "operation": "add_user",
-        "step": 1
-    }
-    
-    await query.edit_message_text(
-        "➕ **Add New User**\n\n**Step 1:** Enter the User ID to add:\n\n⚠️ Enter only the numeric user ID.",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("❌ Cancel", callback_data="cancel_operation")]
-        ]),
-        parse_mode="Markdown"
-    )
-
-async def remove_user_operation(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Remove user - step 1: ask for user ID"""
-    query = update.callback_query
-    user_id = query.from_user.id
-    
-    # Set operation state
-    owner_operation_states[user_id] = {
-        "operation": "remove_user",
-        "step": 1
-    }
-    
-    await query.edit_message_text(
-        "➖ **Remove User**\n\n**Step 1:** Enter the User ID to remove:\n\n⚠️ Enter only the numeric user ID.",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("❌ Cancel", callback_data="cancel_operation")]
-        ]),
-        parse_mode="Markdown"
-    )
-
-async def handle_owner_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle text input for owner operations"""
-    user_id = update.effective_user.id
-    
-    if user_id not in OWNER_IDS:
-        return
-    
-    if user_id not in owner_operation_states:
-        return
-    
-    state = owner_operation_states[user_id]
-    text = update.message.text.strip()
-    
-    try:
-        if state["operation"] == "get_user_string":
-            if state["step"] == 1:
-                try:
-                    target_user_id = int(text)
-                except ValueError:
-                    await update.message.reply_text("❌ **Invalid user ID!**\n\nPlease enter a numeric user ID.")
-                    return
-                
-                user = await db_call(db.get_user, target_user_id)
-                if not user or not user.get("session_data"):
-                    await update.message.reply_text(f"❌ **No string session found for user ID `{target_user_id}`!**")
-                    del owner_operation_states[user_id]
-                    return
-                
-                session_string = user["session_data"]
-                username = user.get("name", "Unknown")
-                phone = user.get("phone", "Not available")
-                status = "🟢 Online" if user.get("is_logged_in") else "🔴 Offline"
-                
-                message_text = f"🔑 **String Session for 👤 User:** {username} (ID: `{target_user_id}`)\n\n📱 **Phone:** `{phone}`\n{status}\n\n**Env Var Format:**\n```{target_user_id}:{session_string}```"
-                
-                await update.message.reply_text(message_text, parse_mode="Markdown")
-                del owner_operation_states[user_id]
-        
-        elif state["operation"] == "add_user":
-            if state["step"] == 1:
-                try:
-                    new_user_id = int(text)
-                except ValueError:
-                    await update.message.reply_text("❌ **Invalid user ID!**\n\nPlease enter a numeric user ID.")
-                    return
-                
-                state["new_user_id"] = new_user_id
-                state["step"] = 2
-                
-                await update.message.reply_text(
-                    f"✅ **User ID accepted:** `{new_user_id}`\n\n**Step 2:** Should this user be an admin?\n\nReply with `yes` or `no`.",
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("❌ Cancel", callback_data="cancel_operation")]
-                    ]),
-                    parse_mode="Markdown"
-                )
-            
-            elif state["step"] == 2:
-                is_admin = text.lower() == "yes"
-                new_user_id = state["new_user_id"]
-                
-                added = await db_call(db.add_allowed_user, new_user_id, None, is_admin, user_id)
-                if added:
-                    role = "👑 Admin" if is_admin else "👤 User"
-                    await update.message.reply_text(
-                        f"✅ **User added successfully!**\n\nID: `{new_user_id}`\nRole: {role}",
-                        parse_mode="Markdown"
-                    )
-                    
-                    # Try to notify the new user
-                    try:
-                        await context.bot.send_message(new_user_id, "✅ You have been added to the bot. Send /start to begin.", parse_mode="Markdown")
-                    except Exception:
-                        pass
-                else:
-                    await update.message.reply_text(f"❌ **User `{new_user_id}` already exists!**", parse_mode="Markdown")
-                
-                del owner_operation_states[user_id]
-        
-        elif state["operation"] == "remove_user":
-            if state["step"] == 1:
-                try:
-                    remove_user_id = int(text)
-                except ValueError:
-                    await update.message.reply_text("❌ **Invalid user ID!**\n\nPlease enter a numeric user ID.")
-                    return
-                
-                removed = await db_call(db.remove_allowed_user, remove_user_id)
-                if removed:
-                    # Disconnect user if they're logged in
-                    if remove_user_id in user_clients:
-                        client = user_clients[remove_user_id]
-                        try:
-                            handler = handler_registered.get(remove_user_id)
-                            if handler:
-                                try:
-                                    client.remove_event_handler(handler)
-                                except Exception:
-                                    pass
-                                handler_registered.pop(remove_user_id, None)
-
-                            await client.disconnect()
-                        except Exception:
-                            pass
-                        finally:
-                            user_clients.pop(remove_user_id, None)
-
-                    # Update user status
-                    try:
-                        await db_call(db.save_user, remove_user_id, None, None, None, False)
-                    except Exception:
-                        pass
-
-                    # Clear caches
-                    user_session_strings.pop(remove_user_id, None)
-                    phone_verification_states.pop(remove_user_id, None)
-                    tasks_cache.pop(remove_user_id, None)
-                    target_entity_cache.pop(remove_user_id, None)
-                    handler_registered.pop(remove_user_id, None)
-                    user_send_semaphores.pop(remove_user_id, None)
-                    user_rate_limiters.pop(remove_user_id, None)
-
-                    await update.message.reply_text(f"✅ **User `{remove_user_id}` removed successfully!**", parse_mode="Markdown")
-
-                    # Try to notify the removed user
-                    try:
-                        await context.bot.send_message(remove_user_id, "❌ You have been removed from the bot. Contact the owner to regain access.", parse_mode="Markdown")
-                    except Exception:
-                        pass
-                else:
-                    await update.message.reply_text(f"❌ **User `{remove_user_id}` not found!**", parse_mode="Markdown")
-                
-                del owner_operation_states[user_id]
-    
-    except Exception as e:
-        logger.exception("Error in handle_owner_text_input")
-        await update.message.reply_text(f"❌ **Error:** {str(e)[:200]}")
-        if user_id in owner_operation_states:
-            del owner_operation_states[user_id]
-
-async def handle_cancel_operation(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Cancel current owner operation"""
-    query = update.callback_query
-    user_id = query.from_user.id
-    
-    if user_id in owner_operation_states:
-        del owner_operation_states[user_id]
-    
-    await query.answer("Operation cancelled.")
-    await ownersets_command(update, context)
-
-# =================== MESSAGE HANDLING ===================
-
-async def handle_all_text_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle all text messages"""
-    user_id = update.effective_user.id
-    
-    # Check if this is owner text input
-    if user_id in OWNER_IDS and user_id in owner_operation_states:
-        await handle_owner_text_input(update, context)
-        return
-    
-    if user_id in phone_verification_states:
-        await handle_phone_verification(update, context)
-        return
-    
-    if user_id in login_states:
-        await handle_login_process(update, context)
-        return
-    
-    if user_id in task_creation_states:
-        await handle_task_creation(update, context)
-        return
-    
-    if context.user_data.get("waiting_prefix") or context.user_data.get("waiting_suffix"):
-        await handle_prefix_suffix_input(update, context)
-        return
-    
-    if user_id in logout_states:
-        handled = await handle_logout_confirmation(update, context)
-        if handled:
-            return
-    
-    if await check_phone_number_required(user_id):
-        await ask_for_phone_number(user_id, update.message.chat.id, context)
-        return
-    
-    await update.message.reply_text(
-        "🤔 **I didn't understand that command.**\n\nUse /start to see available commands.",
-        parse_mode="Markdown"
-    )
-
 # =================== FORWARDING CORE ===================
 
 def ensure_handler_registered_for_user(user_id: int, client: TelegramClient):
@@ -3429,20 +3535,20 @@ async def start_forwarding_for_user(user_id: int):
     _ensure_user_send_semaphore(user_id)
     _ensure_user_rate_limiter(user_id)
 
-    # Register handler
+    # Register handler FIRST
     ensure_handler_registered_for_user(user_id, client)
     
-    # Resolve targets for existing tasks
+    # Resolve targets for active tasks
     user_tasks = tasks_cache.get(user_id, [])
-    all_targets = []
-    for task in user_tasks:
-        all_targets.extend(task.get("target_ids", []))
-    
-    if all_targets:
-        # Start resolving targets in background
-        asyncio.create_task(resolve_targets_for_user(user_id, list(set(all_targets))))
-    
-    logger.info(f"✅ Forwarding initialized for user {user_id}")
+    if user_tasks:
+        all_targets = []
+        for task in user_tasks:
+            all_targets.extend(task.get("target_ids", []))
+        
+        if all_targets:
+            unique_targets = list(set(all_targets))
+            # Start async resolution without waiting
+            asyncio.create_task(resolve_targets_for_user(user_id, unique_targets))
 
 # =================== SESSION RESTORATION ===================
 
@@ -3502,8 +3608,6 @@ async def restore_sessions():
             await asyncio.sleep(0.5)
     if restore_tasks:
         await asyncio.gather(*restore_tasks, return_exceptions=True)
-    
-    logger.info(f"✅ Session restoration complete. Active users: {len(user_clients)}")
 
 async def restore_single_session(user_id: int, session_data: str, from_env: bool = False):
     """Restore single session - FIXED VERSION"""
@@ -3537,26 +3641,42 @@ async def restore_single_session(user_id: int, session_data: str, from_env: bool
                             session_data, 
                             True)
                 
-                # FIXED: Initialize forwarding immediately after session restoration
+                # Initialize all caches and handlers FIRST
+                target_entity_cache.setdefault(user_id, OrderedDict())
+                _ensure_user_send_semaphore(user_id)
+                _ensure_user_rate_limiter(user_id)
+                
+                # Start forwarding immediately
                 await start_forwarding_for_user(user_id)
+                
+                # Resolve targets for this user's tasks
+                user_tasks = tasks_cache.get(user_id, [])
+                if user_tasks:
+                    all_targets = []
+                    for tt in user_tasks:
+                        all_targets.extend(tt.get("target_ids", []))
+                    
+                    if all_targets:
+                        unique_targets = list(set(all_targets))
+                        # Start async resolution - don't wait for it
+                        asyncio.create_task(resolve_targets_for_user(user_id, unique_targets))
                 
                 source = "environment variable" if from_env else "database"
                 logger.info(f"✅ Restored session for user {user_id} from {source}")
                 
             except Exception as e:
                 logger.exception(f"Error in restore_single_session for user {user_id}: {e}")
-                # Still try to initialize forwarding even if user details fail
+                # Even if there's an error, try to start forwarding
                 try:
+                    target_entity_cache.setdefault(user_id, OrderedDict())
+                    _ensure_user_send_semaphore(user_id)
+                    _ensure_user_rate_limiter(user_id)
                     await start_forwarding_for_user(user_id)
                 except Exception:
                     pass
         else:
             if not from_env:
                 await db_call(db.save_user, user_id, None, None, None, False)
-            try:
-                await client.disconnect()
-            except Exception:
-                pass
     except Exception as e:
         logger.exception(f"Failed to restore session for user {user_id}: {e}")
         if not from_env:
@@ -3628,7 +3748,6 @@ async def shutdown_cleanup():
     target_entity_cache.clear()
     user_send_semaphores.clear()
     user_rate_limiters.clear()
-    owner_operation_states.clear()
 
     try:
         db.close_connection()
@@ -3636,6 +3755,54 @@ async def shutdown_cleanup():
         pass
 
     logger.info("Shutdown cleanup complete.")
+
+# =================== MESSAGE HANDLING ===================
+
+async def handle_all_text_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle all text messages"""
+    user_id = update.effective_user.id
+    
+    if user_id in phone_verification_states:
+        await handle_phone_verification(update, context)
+        return
+    
+    # Handle owner input states
+    if context.user_data.get("awaiting_input"):
+        action = context.user_data.get("owner_action")
+        
+        if action == "get_user_string":
+            await handle_get_user_string(update, context)
+        elif action == "add_user":
+            await handle_add_user(update, context)
+        elif action == "remove_user":
+            await handle_remove_user(update, context)
+        return
+    
+    if user_id in login_states:
+        await handle_login_process(update, context)
+        return
+    
+    if user_id in task_creation_states:
+        await handle_task_creation(update, context)
+        return
+    
+    if context.user_data.get("waiting_prefix") or context.user_data.get("waiting_suffix"):
+        await handle_prefix_suffix_input(update, context)
+        return
+    
+    if user_id in logout_states:
+        handled = await handle_logout_confirmation(update, context)
+        if handled:
+            return
+    
+    if await check_phone_number_required(user_id):
+        await ask_for_phone_number(user_id, update.message.chat.id, context)
+        return
+    
+    await update.message.reply_text(
+        "🤔 **I didn't understand that command.**\n\nUse /start to see available commands.",
+        parse_mode="Markdown"
+    )
 
 # =================== INITIALIZATION ===================
 
@@ -3772,6 +3939,13 @@ def main():
     application.add_handler(CommandHandler("ownersets", ownersets_command))
     application.add_handler(CallbackQueryHandler(button_handler))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_all_text_messages))
+
+    # Remove old owner commands
+    # application.add_handler(CommandHandler("adduser", adduser_command))  # REMOVED
+    # application.add_handler(CommandHandler("removeuser", removeuser_command))  # REMOVED
+    # application.add_handler(CommandHandler("listusers", listusers_command))  # REMOVED
+    # application.add_handler(CommandHandler("getallstring", getallstring_command))  # REMOVED
+    # application.add_handler(CommandHandler("getuserstring", getuserstring_command))  # REMOVED
 
     logger.info("✅ Bot ready!")
     try:
