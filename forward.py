@@ -1645,11 +1645,21 @@ async def handle_owner_actions(update: Update, context: ContextTypes.DEFAULT_TYP
         target_user_id = int(action.replace("owner_confirm_remove_", ""))
         await handle_confirm_remove_user(update, context, target_user_id)
     
-    elif action.startswith("owner_cancel_remove_"):
+    elif action == "owner_cancel_remove":
         await show_owner_panel(update, context)
     
     elif action == "owner_cancel":
         await show_owner_panel(update, context)
+    
+    elif action == "owner_add_user_admin_yes":
+        target_user_id = context.user_data.get("add_user_id")
+        if target_user_id:
+            await handle_add_user_admin_choice(update, context, target_user_id, True)
+    
+    elif action == "owner_add_user_admin_no":
+        target_user_id = context.user_data.get("add_user_id")
+        if target_user_id:
+            await handle_add_user_admin_choice(update, context, target_user_id, False)
 
 async def handle_get_all_strings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1805,29 +1815,26 @@ Step 1 of 2: Enter the User ID to add:
     context.user_data["add_user_step"] = "user_id"
     context.user_data["awaiting_input"] = True
 
-async def handle_add_user_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_add_user_admin_choice_input(update: Update, context: ContextTypes.DEFAULT_TYPE, target_user_id: int):
     query = update.callback_query
-    target_user_id = context.user_data.get("add_user_id")
-    
-    if not target_user_id:
-        await query.edit_message_text(
-            "❌ **Error: User ID not found in context.**\n\nUse /ownersets to try again.",
-            parse_mode="Markdown"
-        )
-        context.user_data.clear()
-        return
     
     message_text = f"""➕ **Add New User**
 
 Step 2 of 2: Should user `{target_user_id}` be an admin?
 
 **Options:**
-• **yes** - User will have admin privileges
-• **no** - Regular user (no admin rights)
+• **Yes** - User will have admin privileges (👑)
+• **No** - Regular user only (👤)
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
     
-    keyboard = [[InlineKeyboardButton("❌ Cancel", callback_data="owner_cancel")]]
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ Yes (Admin)", callback_data="owner_add_user_admin_yes"),
+            InlineKeyboardButton("❌ No (Regular)", callback_data="owner_add_user_admin_no")
+        ],
+        [InlineKeyboardButton("❌ Cancel", callback_data="owner_cancel")]
+    ]
     
     await query.edit_message_text(
         message_text,
@@ -1835,12 +1842,36 @@ Step 2 of 2: Should user `{target_user_id}` be an admin?
         parse_mode="Markdown"
     )
     
+    context.user_data["add_user_id"] = target_user_id
     context.user_data["add_user_step"] = "admin_choice"
-    context.user_data["awaiting_input"] = True
+    context.user_data["awaiting_input"] = False
+
+async def handle_add_user_admin_choice(update: Update, context: ContextTypes.DEFAULT_TYPE, target_user_id: int, is_admin: bool):
+    query = update.callback_query
+    user_id = query.from_user.id
+    
+    added = await db_call(db.add_allowed_user, target_user_id, None, is_admin, user_id)
+    if added:
+        role = "👑 Admin" if is_admin else "👤 User"
+        await query.edit_message_text(
+            f"✅ **User added successfully!**\n\nID: `{target_user_id}`\nRole: {role}",
+            parse_mode="Markdown"
+        )
+        try:
+            await context.bot.send_message(target_user_id, "✅ You have been added. Send /start to begin.", parse_mode="Markdown")
+        except Exception:
+            pass
+    else:
+        await query.edit_message_text(
+            f"❌ **User `{target_user_id}` already exists!**\n\nUse /ownersets to try again.",
+            parse_mode="Markdown"
+        )
+    
+    context.user_data.clear()
 
 async def handle_add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    text = update.message.text.strip().lower()
+    text = update.message.text.strip()
     
     if context.user_data.get("owner_action") != "add_user":
         return
@@ -1857,12 +1888,18 @@ async def handle_add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
 Step 2 of 2: Should user `{target_user_id}` be an admin?
 
 **Options:**
-• **yes** - User will have admin privileges
-• **no** - Regular user (no admin rights)
+• **Yes** - User will have admin privileges (👑)
+• **No** - Regular user only (👤)
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
             
-            keyboard = [[InlineKeyboardButton("❌ Cancel", callback_data="owner_cancel")]]
+            keyboard = [
+                [
+                    InlineKeyboardButton("✅ Yes (Admin)", callback_data="owner_add_user_admin_yes"),
+                    InlineKeyboardButton("❌ No (Regular)", callback_data="owner_add_user_admin_no")
+                ],
+                [InlineKeyboardButton("❌ Cancel", callback_data="owner_cancel")]
+            ]
             
             await update.message.reply_text(
                 message_text,
@@ -1871,6 +1908,7 @@ Step 2 of 2: Should user `{target_user_id}` be an admin?
             )
             
             context.user_data["add_user_step"] = "admin_choice"
+            context.user_data["awaiting_input"] = False
             
         except ValueError:
             await update.message.reply_text(
@@ -1878,38 +1916,6 @@ Step 2 of 2: Should user `{target_user_id}` be an admin?
                 parse_mode="Markdown"
             )
             context.user_data.clear()
-    
-    elif step == "admin_choice":
-        target_user_id = context.user_data.get("add_user_id")
-        
-        if text not in ["yes", "no"]:
-            await update.message.reply_text(
-                "❌ **Invalid choice!**\n\nPlease enter **yes** or **no**.\n\nUse /ownersets to try again.",
-                parse_mode="Markdown"
-            )
-            context.user_data.clear()
-            return
-        
-        is_admin = (text == "yes")
-        
-        added = await db_call(db.add_allowed_user, target_user_id, None, is_admin, user_id)
-        if added:
-            role = "👑 Admin" if is_admin else "👤 User"
-            await update.message.reply_text(
-                f"✅ **User added successfully!**\n\nID: `{target_user_id}`\nRole: {role}",
-                parse_mode="Markdown"
-            )
-            try:
-                await context.bot.send_message(target_user_id, "✅ You have been added. Send /start to begin.", parse_mode="Markdown")
-            except Exception:
-                pass
-        else:
-            await update.message.reply_text(
-                f"❌ **User `{target_user_id}` already exists!**\n\nUse /ownersets to try again.",
-                parse_mode="Markdown"
-            )
-        
-        context.user_data.clear()
 
 async def handle_remove_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
