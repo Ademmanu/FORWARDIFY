@@ -166,7 +166,7 @@ class Database:
             conn.execute("PRAGMA cache_size=-1000;")
             conn.execute("PRAGMA mmap_size=268435456;")
         except Exception:
-        pass
+            pass
     
     def get_connection(self):
         conn = getattr(self._thread_local, "conn", None)
