@@ -98,13 +98,13 @@ allowed_env = os.getenv("ALLOWED_USERS", "").strip()
 if allowed_env:
     ALLOWED_USERS.update(int(part) for part in allowed_env.split(",") if part.strip().isdigit())
 
-SEND_WORKER_COUNT = int(os.getenv("SEND_WORKER_COUNT", "20"))
-SEND_QUEUE_MAXSIZE = int(os.getenv("SEND_QUEUE_MAXSIZE", "2000"))
+SEND_WORKER_COUNT = int(os.getenv("SEND_WORKER_COUNT", "50"))
+SEND_QUEUE_MAXSIZE = int(os.getenv("SEND_QUEUE_MAXSIZE", "10000"))
 TARGET_RESOLVE_RETRY_SECONDS = int(os.getenv("TARGET_RESOLVE_RETRY_SECONDS", "3"))
-MAX_CONCURRENT_USERS = max(50, int(os.getenv("MAX_CONCURRENT_USERS", "100")))
-SEND_CONCURRENCY_PER_USER = int(os.getenv("SEND_CONCURRENCY_PER_USER", "15"))
-SEND_RATE_PER_USER = float(os.getenv("SEND_RATE_PER_USER", "10.0"))
-TARGET_ENTITY_CACHE_SIZE = int(os.getenv("TARGET_ENTITY_CACHE_SIZE", "50"))
+MAX_CONCURRENT_USERS = max(50, int(os.getenv("MAX_CONCURRENT_USERS", "200")))
+SEND_CONCURRENCY_PER_USER = int(os.getenv("SEND_CONCURRENCY_PER_USER", "30"))
+SEND_RATE_PER_USER = float(os.getenv("SEND_RATE_PER_USER", "30.0"))
+TARGET_ENTITY_CACHE_SIZE = int(os.getenv("TARGET_ENTITY_CACHE_SIZE", "100"))
 
 WEB_SERVER_PORT = int(os.getenv("WEB_SERVER_PORT", "5000"))
 DEFAULT_CONTAINER_MAX_RAM_MB = int(os.getenv("CONTAINER_MAX_RAM_MB", "512"))
@@ -1163,7 +1163,7 @@ tasks_cache: Dict[int, List[Dict]] = {}
 target_entity_cache: Dict[int, OrderedDict] = {}
 handler_registered: Dict[int, Callable] = {}
 user_send_semaphores: Dict[int, asyncio.Semaphore] = {}
-user_rate_limiters: Dict[int, Tuple[float, float]] = {}
+user_rate_limiters: Dict[int, Tuple[float, float, float]] = {}  # (tokens, last_refill_time, burst_tokens)
 
 send_queue: Optional[asyncio.Queue] = None
 worker_tasks: List[asyncio.Task] = []
@@ -1240,22 +1240,35 @@ def _ensure_user_send_semaphore(user_id: int):
 
 def _ensure_user_rate_limiter(user_id: int):
     if user_id not in user_rate_limiters:
-        user_rate_limiters[user_id] = (SEND_RATE_PER_USER, time.time())
+        # Format: (tokens, last_refill_time, burst_tokens)
+        user_rate_limiters[user_id] = (SEND_RATE_PER_USER, time.time(), SEND_RATE_PER_USER * 5)
 
 async def _consume_token(user_id: int, amount: float = 1.0):
     _ensure_user_rate_limiter(user_id)
+    
     while True:
-        tokens, last = user_rate_limiters[user_id]
+        tokens, last_refill, burst = user_rate_limiters[user_id]
         now = time.time()
-        elapsed = max(0.0, now - last)
+        elapsed = max(0.0, now - last_refill)
+        
+        # Calculate refill based on elapsed time
         refill = elapsed * SEND_RATE_PER_USER
-        tokens = min(tokens + refill, SEND_RATE_PER_USER * 5)
+        tokens = min(tokens + refill, burst)
+        
         if tokens >= amount:
             tokens -= amount
-            user_rate_limiters[user_id] = (tokens, now)
+            user_rate_limiters[user_id] = (tokens, now, burst)
             return
-        user_rate_limiters[user_id] = (tokens, now)
-        await asyncio.sleep(0.05)
+        
+        # If we can't send now, update tokens and sleep minimal time
+        user_rate_limiters[user_id] = (tokens, now, burst)
+        
+        # Calculate exact wait time needed
+        needed = amount - tokens
+        wait_time = needed / SEND_RATE_PER_USER
+        
+        # Small sleep but don't block completely
+        await asyncio.sleep(min(wait_time, 0.1))
 
 def extract_words(text: str) -> List[str]:
     return WORD_PATTERN.findall(text)
@@ -3254,74 +3267,78 @@ async def send_worker_loop(worker_id: int):
     global send_queue
     if send_queue is None:
         return
-
+    
+    # Track performance
+    processed_count = 0
+    last_log_time = time.time()
+    
     while True:
         try:
-            job = await send_queue.get()
+            # Use get_nowait to avoid blocking if queue is empty
+            try:
+                job = send_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                await asyncio.sleep(0.01)
+                continue
+                
+            # Process job immediately
+            user_id, target_id, message_text, task_filters, forward_tag, source_chat_id, message_id = job
+            
+            client = user_clients.get(user_id)
+            if not client:
+                send_queue.task_done()
+                continue
+            
+            # Use the rate limiter
+            await _consume_token(user_id, 1.0)
+            
+            # Process without semaphore for faster throughput
+            try:
+                entity = _get_cached_target(user_id, target_id)
+                if not entity:
+                    entity = await resolve_target_entity_once(user_id, client, target_id)
+                
+                if not entity:
+                    send_queue.task_done()
+                    continue
+                
+                try:
+                    if forward_tag and source_chat_id and message_id:
+                        try:
+                            source_entity = await client.get_input_entity(int(source_chat_id))
+                            await client.forward_messages(entity, message_id, source_entity)
+                        except Exception:
+                            await client.send_message(entity, message_text)
+                    else:
+                        await client.send_message(entity, message_text)
+                        
+                except FloodWaitError as fwe:
+                    wait = int(getattr(fwe, "seconds", 10))
+                    logger.warning(f"Worker {worker_id}: Flood wait {wait}s")
+                    # Don't requeue, just drop and continue
+                    
+                except Exception as e:
+                    logger.debug(f"Send failed: {e}")
+                    
+            except Exception as e:
+                logger.debug(f"Entity resolution failed: {e}")
+            
+            finally:
+                send_queue.task_done()
+                processed_count += 1
+                
+                # Log performance periodically
+                current_time = time.time()
+                if current_time - last_log_time > 30:  # Every 30 seconds
+                    qsize = send_queue.qsize() if send_queue else 0
+                    logger.info(f"Worker {worker_id}: Processed {processed_count} messages, Queue: {qsize}")
+                    processed_count = 0
+                    last_log_time = current_time
+                    
         except asyncio.CancelledError:
             break
         except Exception:
-            await asyncio.sleep(0.1)
-            continue
-
-        try:
-            user_id, target_id, message_text, task_filters, forward_tag, source_chat_id, message_id = job
-
-            client = user_clients.get(user_id)
-            if not client:
-                continue
-
-            _ensure_user_send_semaphore(user_id)
-            await _consume_token(user_id, 1.0)
-            sem = user_send_semaphores[user_id]
-
-            async with sem:
-                try:
-                    entity = None
-                    ent = _get_cached_target(user_id, target_id)
-                    if ent:
-                        entity = ent
-                    else:
-                        entity = await resolve_target_entity_once(user_id, client, target_id)
-
-                    if not entity:
-                        continue
-
-                    try:
-                        if forward_tag and source_chat_id and message_id:
-                            try:
-                                source_entity = await client.get_input_entity(int(source_chat_id))
-                                await client.forward_messages(entity, message_id, source_entity)
-                            except Exception:
-                                await client.send_message(entity, message_text)
-                        else:
-                            await client.send_message(entity, message_text)
-                            
-                    except FloodWaitError as fwe:
-                        wait = int(getattr(fwe, "seconds", 10))
-                        async def _requeue_later(delay, job_item):
-                            try:
-                                await asyncio.sleep(delay)
-                                try:
-                                    await send_queue.put(job_item)
-                                except asyncio.QueueFull:
-                                    pass
-                            except Exception:
-                                pass
-                        asyncio.create_task(_requeue_later(wait + 1, job))
-                    except Exception:
-                        pass
-
-                except Exception:
-                    pass
-
-        except Exception:
-            pass
-        finally:
-            try:
-                send_queue.task_done()
-            except Exception:
-                pass
+            await asyncio.sleep(0.01)
 
 async def start_send_workers():
     global _send_workers_started, send_queue, worker_tasks
@@ -3337,6 +3354,54 @@ async def start_send_workers():
 
     _send_workers_started = True
     logger.info(f"Spawned {SEND_WORKER_COUNT} send workers")
+
+async def monitor_queue_health():
+    """Monitor queue health and adjust processing"""
+    global send_queue
+    
+    while True:
+        try:
+            if send_queue:
+                qsize = send_queue.qsize()
+                maxsize = send_queue.maxsize if hasattr(send_queue, 'maxsize') else SEND_QUEUE_MAXSIZE
+                
+                # Log queue status
+                if qsize > maxsize * 0.8:
+                    logger.warning(f"Queue nearly full: {qsize}/{maxsize}")
+                
+                # If queue is too full, skip some messages to avoid memory issues
+                if qsize > maxsize * 0.9:
+                    # Clear some old messages if queue is too full
+                    try:
+                        for _ in range(min(10, qsize // 10)):
+                            send_queue.get_nowait()
+                            send_queue.task_done()
+                    except asyncio.QueueEmpty:
+                        pass
+                    
+            await asyncio.sleep(5)  # Check every 5 seconds
+            
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            await asyncio.sleep(5)
+
+async def performance_logger():
+    """Log performance metrics periodically"""
+    while True:
+        try:
+            qsize = send_queue.qsize() if send_queue else 0
+            active_users = len(user_clients)
+            active_tasks = sum(len(tasks) for tasks in tasks_cache.values())
+            
+            logger.info(f"📊 Performance: Queue={qsize}, Users={active_users}, Tasks={active_tasks}")
+            
+            await asyncio.sleep(60)  # Log every minute
+            
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            await asyncio.sleep(60)
 
 async def start_forwarding_for_user(user_id: int):
     if user_id not in user_clients:
@@ -3636,6 +3701,13 @@ async def post_init(application: Application):
                 pass
 
     await start_send_workers()
+    
+    # Start queue monitor
+    asyncio.create_task(monitor_queue_health())
+    
+    # Start performance logger
+    asyncio.create_task(performance_logger())
+    
     await restore_sessions()
 
     async def _collect_metrics():
