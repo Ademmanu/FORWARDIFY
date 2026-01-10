@@ -166,7 +166,7 @@ class Database:
             conn.execute("PRAGMA cache_size=-1000;")
             conn.execute("PRAGMA mmap_size=268435456;")
         except Exception:
-            pass
+        pass
     
     def get_connection(self):
         conn = getattr(self._thread_local, "conn", None)
@@ -1195,11 +1195,11 @@ class FloodWaitManager:
         self.user_flood_wait_until = {}
         self.start_notifications_sent = set()  # Track start notifications
         self.end_notifications_pending = set()  # Track users who need end notifications
-        self.lock = asyncio.Lock()
+        self.lock = threading.Lock()  # Regular threading lock
     
     def set_flood_wait(self, user_id: int, wait_seconds: int):
         """Set a flood wait for a user"""
-        async with self.lock:
+        with self.lock:
             wait_until = time.time() + wait_seconds + 5  # Add buffer
             self.user_flood_wait_until[user_id] = wait_until
             
@@ -1218,7 +1218,7 @@ class FloodWaitManager:
     
     def is_in_flood_wait(self, user_id: int):
         """Check if user is in flood wait and return (in_wait, remaining_time, should_notify_end)"""
-        async with self.lock:
+        with self.lock:
             if user_id not in self.user_flood_wait_until:
                 # Not in flood wait - check if we need to send end notification
                 should_notify_end = user_id in self.end_notifications_pending
@@ -1257,7 +1257,7 @@ class FloodWaitManager:
     
     def clear_flood_wait(self, user_id: int):
         """Clear flood wait for a user"""
-        async with self.lock:
+        with self.lock:
             self.user_flood_wait_until.pop(user_id, None)
             self._cleanup_old_notifications(user_id)
             self.end_notifications_pending.discard(user_id)
@@ -3136,7 +3136,6 @@ async def handle_logout_confirmation(update: Update, context: ContextTypes.DEFAU
     phone_verification_states.pop(user_id, None)
     tasks_cache.pop(user_id, None)
     target_entity_cache.pop(user_id, None)
-    handler_registered.pop(user_id, None)
     user_send_semaphores.pop(user_id, None)
     user_rate_limiters.pop(user_id, None)
     logout_states.pop(user_id, None)
@@ -3417,7 +3416,7 @@ async def send_worker_loop(worker_id: int):
             user_id, target_id, message_text, task_filters, forward_tag, source_chat_id, message_id = job
             
             # Check flood wait
-            in_flood_wait, wait_left, should_notify_end = await flood_wait_manager.is_in_flood_wait(user_id)
+            in_flood_wait, wait_left, should_notify_end = flood_wait_manager.is_in_flood_wait(user_id)
             
             # Send end notification if flood wait just ended
             if should_notify_end:
@@ -3464,14 +3463,14 @@ async def send_worker_loop(worker_id: int):
                         await client.send_message(entity, message_text)
                         
                     # Clear any flood wait on success
-                    await flood_wait_manager.clear_flood_wait(user_id)
+                    flood_wait_manager.clear_flood_wait(user_id)
                     
                 except FloodWaitError as fwe:
                     wait = int(getattr(fwe, "seconds", 10))
                     logger.warning(f"Worker {worker_id}: Flood wait {wait}s for user {user_id}")
                     
                     # Set flood wait and check if we should notify
-                    should_notify_start, wait_time = await flood_wait_manager.set_flood_wait(user_id, wait)
+                    should_notify_start, wait_time = flood_wait_manager.set_flood_wait(user_id, wait)
                     
                     # Requeue the job
                     try:
