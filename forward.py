@@ -1188,6 +1188,83 @@ Or
 🗨️ **Message Developer:** [HEMMY](https://t.me/justmemmy)
 """
 
+class FloodWaitManager:
+    """Manages flood wait states for users"""
+    
+    def __init__(self):
+        self.user_flood_wait_until = {}
+        self.start_notifications_sent = set()  # Track start notifications
+        self.end_notifications_pending = set()  # Track users who need end notifications
+        self.lock = asyncio.Lock()
+    
+    def set_flood_wait(self, user_id: int, wait_seconds: int):
+        """Set a flood wait for a user"""
+        async with self.lock:
+            wait_until = time.time() + wait_seconds + 5  # Add buffer
+            self.user_flood_wait_until[user_id] = wait_until
+            
+            # Check if we should send start notification
+            should_notify_start = False
+            
+            if wait_seconds > 60:  # Only notify for long waits
+                flood_wait_key = f"{user_id}_start_{int(wait_until)}"
+                if flood_wait_key not in self.start_notifications_sent:
+                    self.start_notifications_sent.add(flood_wait_key)
+                    # Mark that we need to send end notification
+                    self.end_notifications_pending.add(user_id)
+                    should_notify_start = True
+            
+            return should_notify_start, wait_seconds
+    
+    def is_in_flood_wait(self, user_id: int):
+        """Check if user is in flood wait and return (in_wait, remaining_time, should_notify_end)"""
+        async with self.lock:
+            if user_id not in self.user_flood_wait_until:
+                # Not in flood wait - check if we need to send end notification
+                should_notify_end = user_id in self.end_notifications_pending
+                if should_notify_end:
+                    self.end_notifications_pending.discard(user_id)
+                    # Clean up old start notifications
+                    self._cleanup_old_notifications(user_id)
+                return False, 0, should_notify_end
+            
+            wait_until = self.user_flood_wait_until[user_id]
+            current_time = time.time()
+            
+            if current_time >= wait_until:
+                # Flood wait expired
+                del self.user_flood_wait_until[user_id]
+                # Check if we need to send end notification
+                should_notify_end = user_id in self.end_notifications_pending
+                if should_notify_end:
+                    self.end_notifications_pending.discard(user_id)
+                    self._cleanup_old_notifications(user_id)
+                return False, 0, should_notify_end
+            
+            return True, wait_until - current_time, False
+    
+    def _cleanup_old_notifications(self, user_id: int):
+        """Clean up old notification tracking for a user"""
+        current_time = time.time()
+        keys_to_remove = []
+        
+        for key in self.start_notifications_sent:
+            if key.startswith(f"{user_id}_"):
+                keys_to_remove.append(key)
+        
+        for key in keys_to_remove:
+            self.start_notifications_sent.discard(key)
+    
+    def clear_flood_wait(self, user_id: int):
+        """Clear flood wait for a user"""
+        async with self.lock:
+            self.user_flood_wait_until.pop(user_id, None)
+            self._cleanup_old_notifications(user_id)
+            self.end_notifications_pending.discard(user_id)
+
+# Initialize flood wait manager
+flood_wait_manager = FloodWaitManager()
+
 def _clean_phone_number(text: str) -> str:
     return '+' + ''.join(c for c in text if c.isdigit())
 
@@ -3059,6 +3136,7 @@ async def handle_logout_confirmation(update: Update, context: ContextTypes.DEFAU
     phone_verification_states.pop(user_id, None)
     tasks_cache.pop(user_id, None)
     target_entity_cache.pop(user_id, None)
+    handler_registered.pop(user_id, None)
     user_send_semaphores.pop(user_id, None)
     user_rate_limiters.pop(user_id, None)
     logout_states.pop(user_id, None)
@@ -3262,6 +3340,60 @@ async def resolve_targets_for_user(user_id: int, target_ids: List[int]):
                 break
             await asyncio.sleep(TARGET_RESOLVE_RETRY_SECONDS)
 
+async def notify_user_flood_wait(user_id: int, wait_seconds: int):
+    """Notify user about flood wait start (only once)"""
+    try:
+        from telegram import Bot
+        bot = Bot(token=BOT_TOKEN)
+        
+        wait_minutes = wait_seconds // 60
+        if wait_seconds % 60 > 0:
+            wait_minutes += 1  # Round up
+        
+        resume_time = datetime.fromtimestamp(time.time() + wait_seconds).strftime('%H:%M:%S')
+        
+        message = f"""⏰ **Flood Wait Alert**
+
+Your account is temporarily limited by Telegram.
+
+📋 **Details:**
+• Wait time: {wait_minutes} minutes
+• Resumes at: {resume_time}
+
+⚠️ **Please note:**
+• This is a Telegram restriction, not the bot
+• Bot will automatically resume when the wait ends
+• No action is needed on your part
+
+🔄 **Status:** ⏳ Waiting for Telegram to lift restriction..."""
+        
+        await bot.send_message(user_id, message, parse_mode="Markdown")
+        
+    except Exception:
+        pass  # Silently fail if we can't notify user
+
+async def notify_user_flood_wait_ended(user_id: int):
+    """Notify user that flood wait has ended"""
+    try:
+        from telegram import Bot
+        bot = Bot(token=BOT_TOKEN)
+        
+        message = f"""✅ **Flood Wait Ended**
+
+Your account restriction has been lifted!
+
+📋 **Status:**
+• Forwarding has resumed automatically
+• All queued messages are being sent
+• You can now send messages normally
+
+🔄 **Status:** ✅ Active and forwarding..."""
+        
+        await bot.send_message(user_id, message, parse_mode="Markdown")
+        
+    except Exception:
+        pass
+
 async def send_worker_loop(worker_id: int):
     logger.info(f"Send worker {worker_id} started")
     global send_queue
@@ -3284,15 +3416,34 @@ async def send_worker_loop(worker_id: int):
             # Process job immediately
             user_id, target_id, message_text, task_filters, forward_tag, source_chat_id, message_id = job
             
+            # Check flood wait
+            in_flood_wait, wait_left, should_notify_end = await flood_wait_manager.is_in_flood_wait(user_id)
+            
+            # Send end notification if flood wait just ended
+            if should_notify_end:
+                asyncio.create_task(notify_user_flood_wait_ended(user_id))
+            
+            if in_flood_wait:
+                # Requeue the job for later
+                try:
+                    send_queue.put_nowait(job)
+                except asyncio.QueueFull:
+                    logger.warning(f"Queue full while requeueing flood wait message")
+                finally:
+                    send_queue.task_done()
+                
+                # Sleep a bit before checking next job
+                await asyncio.sleep(min(wait_left, 1.0))
+                continue
+            
             client = user_clients.get(user_id)
             if not client:
                 send_queue.task_done()
                 continue
             
-            # Use the rate limiter
+            # Check rate limiter
             await _consume_token(user_id, 1.0)
             
-            # Process without semaphore for faster throughput
             try:
                 entity = _get_cached_target(user_id, target_id)
                 if not entity:
@@ -3312,11 +3463,26 @@ async def send_worker_loop(worker_id: int):
                     else:
                         await client.send_message(entity, message_text)
                         
+                    # Clear any flood wait on success
+                    await flood_wait_manager.clear_flood_wait(user_id)
+                    
                 except FloodWaitError as fwe:
                     wait = int(getattr(fwe, "seconds", 10))
-                    logger.warning(f"Worker {worker_id}: Flood wait {wait}s")
-                    # Don't requeue, just drop and continue
+                    logger.warning(f"Worker {worker_id}: Flood wait {wait}s for user {user_id}")
                     
+                    # Set flood wait and check if we should notify
+                    should_notify_start, wait_time = await flood_wait_manager.set_flood_wait(user_id, wait)
+                    
+                    # Requeue the job
+                    try:
+                        send_queue.put_nowait(job)
+                    except asyncio.QueueFull:
+                        logger.warning(f"Queue full while requeueing flood wait")
+                    
+                    # Notify user if it's the first major flood wait
+                    if should_notify_start and wait_time > 60:
+                        asyncio.create_task(notify_user_flood_wait(user_id, wait_time))
+                        
                 except Exception as e:
                     logger.debug(f"Send failed: {e}")
                     
@@ -3327,11 +3493,11 @@ async def send_worker_loop(worker_id: int):
                 send_queue.task_done()
                 processed_count += 1
                 
-                # Log performance periodically
+                # Log performance
                 current_time = time.time()
-                if current_time - last_log_time > 30:  # Every 30 seconds
+                if current_time - last_log_time > 30:
                     qsize = send_queue.qsize() if send_queue else 0
-                    logger.info(f"Worker {worker_id}: Processed {processed_count} messages, Queue: {qsize}")
+                    logger.info(f"Worker {worker_id}: Processed {processed_count}, Queue: {qsize}")
                     processed_count = 0
                     last_log_time = current_time
                     
